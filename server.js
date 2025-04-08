@@ -289,31 +289,37 @@ const evaluatePokerHand = (hand) => {
 
 // Funzione per aggiornare la classifica
 const updateLeaderboard = async (playerAddress, winnings) => {
-  try {
-    let player = await Player.findOne({ address: playerAddress });
-    if (!player) {
-      player = new Player({ address: playerAddress, totalWinnings: winnings });
-    } else {
-      player.totalWinnings += winnings;
+    try {
+      let player = await Player.findOne({ address: playerAddress });
+      if (!player) {
+        console.log(`Creating new player in leaderboard: ${playerAddress} with winnings: ${winnings}`);
+        player = new Player({ address: playerAddress, totalWinnings: winnings });
+      } else {
+        console.log(`Updating player ${playerAddress}: adding ${winnings} to totalWinnings (${player.totalWinnings})`);
+        player.totalWinnings += winnings;
+      }
+      await player.save();
+      console.log(`Leaderboard updated for ${playerAddress}: totalWinnings now ${player.totalWinnings}`);
+    } catch (err) {
+      console.error('Error updating leaderboard:', err);
     }
-    await player.save();
-  } catch (err) {
-    console.error('Error updating leaderboard:', err);
-  }
-};
-
-// API per ottenere la classifica
-app.get('/leaderboard', async (req, res) => {
-  try {
-    const leaderboard = await Player.find().sort({ totalWinnings: -1 }).limit(10);
-    res.json(leaderboard);
-  } catch (err) {
-    res.status(500).json({ error: 'Error fetching leaderboard' });
-  }
-});
+  };
+  
+  // API per ottenere la classifica
+  app.get('/leaderboard', async (req, res) => {
+    try {
+      const leaderboard = await Player.find().sort({ totalWinnings: -1 }).limit(10);
+      console.log('Leaderboard fetched:', leaderboard);
+      res.json(leaderboard);
+    } catch (err) {
+      console.error('Error fetching leaderboard:', err);
+      res.status(500).json({ error: 'Error fetching leaderboard' });
+    }
+  });
 
 // Avvia il server
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
