@@ -250,17 +250,23 @@ const endGame = async (gameId) => {
       game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
       game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
     } else {
-      const player1HighCard = player1Evaluation.highCard;
-      const player2HighCard = player2Evaluation.highCard;
-      if (player1HighCard > player2HighCard) {
-        winner = player1;
-        game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a higher card (${player1HighCard})!`;
-        game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a higher card (${player1HighCard})!`;
-      } else if (player2HighCard > player1HighCard) {
-        winner = player2;
-        game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a higher card (${player2HighCard})!`;
-        game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a higher card (${player2HighCard})!`;
-      } else {
+      let tieBreaker = false;
+      for (let i = 0; i < player1Evaluation.highCards.length; i++) {
+        if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
+          winner = player1;
+          game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+          game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+          tieBreaker = true;
+          break;
+        } else if (player2Evaluation.highCards[i] > player1Evaluation.highCards[i]) {
+          winner = player2;
+          game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+          game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+          tieBreaker = true;
+          break;
+        }
+      }
+      if (!tieBreaker) {
         game.message = 'It\'s a tie! The pot is split.';
         game.dealerMessage = 'The dealer declares: It\'s a tie! The pot is split.';
         winner = player1; // Per semplicità
@@ -277,85 +283,160 @@ const endGame = async (gameId) => {
 
 // Funzione per valutare le mani
 const evaluatePokerHand = (hand) => {
-    const values = hand.map(card => card.value).sort((a, b) => b - a);
-    const suits = hand.map(card => card.suit);
-    const isFlush = suits.every(suit => suit === suits[0]);
-    const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
-    const valueCounts = {};
-    values.forEach(val => {
-      valueCounts[val] = (valueCounts[val] || 0) + 1;
-    });
-    const counts = Object.values(valueCounts).sort((a, b) => b - a);
+    // Genera tutte le possibili combinazioni di 5 carte dalle 7 disponibili
+    const combinations = getCombinations(hand, 5);
   
-    // Log per debug
-    console.log('Evaluating hand:', hand);
-    console.log('Values:', values);
-    console.log('Suits:', suits);
-    console.log('Value counts:', valueCounts);
-    console.log('Counts:', counts);
+    let bestRank = -1;
+    let bestDescription = '';
+    let bestHighCards = [];
+    let bestHand = null;
   
-    if (isFlush && isStraight) {
-      console.log('Hand evaluation: Straight Flush');
-      return { rank: 8, description: 'Straight Flush', highCard: values[0] };
+    // Valuta ogni combinazione
+    for (const combo of combinations) {
+      const values = combo.map(card => card.value).sort((a, b) => b - a);
+      const suits = combo.map(card => card.suit);
+      const isFlush = suits.every(suit => suit === suits[0]);
+      const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
+      // Gestisci il caso speciale dell'Asso basso (A, 2, 3, 4, 5)
+      const isLowStraight = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
+      const valueCounts = {};
+      values.forEach(val => {
+        valueCounts[val] = (valueCounts[val] || 0) + 1;
+      });
+      const counts = Object.values(valueCounts).sort((a, b) => b - a);
+  
+      let rank = -1;
+      let description = '';
+      let highCards = [];
+  
+      if (isFlush && (isStraight || isLowStraight)) {
+        rank = 8;
+        description = 'Straight Flush';
+        highCards = isLowStraight ? [5] : [values[0]]; // Se è uno straight basso, la carta alta è 5
+      } else if (counts[0] === 4) {
+        rank = 7;
+        description = 'Four of a Kind';
+        highCards = [parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 4))];
+      } else if (counts[0] === 3 && counts[1] === 2) {
+        rank = 6;
+        description = 'Full House';
+        highCards = [
+          parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
+          parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2))
+        ];
+      } else if (isFlush) {
+        rank = 5;
+        description = 'Flush';
+        highCards = values;
+      } else if (isStraight || isLowStraight) {
+        rank = 4;
+        description = 'Straight';
+        highCards = isLowStraight ? [5] : [values[0]];
+      } else if (counts[0] === 3) {
+        rank = 3;
+        description = 'Three of a Kind';
+        highCards = [
+          parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
+          ...values.filter(val => val !== parseInt(Object.keys(valueCounts).find(v => valueCounts[v] === 3)))
+        ];
+      } else if (counts[0] === 2 && counts[1] === 2) {
+        rank = 2;
+        description = 'Two Pair';
+        const pairs = Object.keys(valueCounts).filter(val => valueCounts[val] === 2).map(Number).sort((a, b) => b - a);
+        const kicker = values.find(val => !pairs.includes(val));
+        highCards = [...pairs, kicker];
+      } else if (counts[0] === 2) {
+        rank = 1;
+        description = 'One Pair';
+        const pairValue = parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2));
+        highCards = [
+          pairValue,
+          ...values.filter(val => val !== pairValue)
+        ];
+      } else {
+        rank = 0;
+        description = 'High Card';
+        highCards = values;
+      }
+  
+      // Confronta con la migliore combinazione trovata finora
+      if (rank > bestRank) {
+        bestRank = rank;
+        bestDescription = description;
+        bestHighCards = highCards;
+        bestHand = combo;
+      } else if (rank === bestRank) {
+        for (let i = 0; i < bestHighCards.length; i++) {
+          if (bestHighCards[i] < highCards[i]) {
+            bestRank = rank;
+            bestDescription = description;
+            bestHighCards = highCards;
+            bestHand = combo;
+            break;
+          } else if (bestHighCards[i] > highCards[i]) {
+            break;
+          }
+        }
+      }
     }
-    if (counts[0] === 4) {
-      console.log('Hand evaluation: Four of a Kind');
-      return { rank: 7, description: 'Four of a Kind', highCard: values[0] };
-    }
-    if (counts[0] === 3 && counts[1] === 2) {
-      console.log('Hand evaluation: Full House');
-      return { rank: 6, description: 'Full House', highCard: values[0] };
-    }
-    if (isFlush) {
-      console.log('Hand evaluation: Flush');
-      return { rank: 5, description: 'Flush', highCard: values[0] };
-    }
-    if (isStraight) {
-      console.log('Hand evaluation: Straight');
-      return { rank: 4, description: 'Straight', highCard: values[0] };
-    }
-    if (counts[0] === 3) {
-      console.log('Hand evaluation: Three of a Kind');
-      return { rank: 3, description: 'Three of a Kind', highCard: values[0] };
-    }
-    if (counts[0] === 2 && counts[1] === 2) {
-      console.log('Hand evaluation: Two Pair');
-      return { rank: 2, description: 'Two Pair', highCard: values[0] };
-    }
-    if (counts[0] === 2) {
-      console.log('Hand evaluation: One Pair');
-      return { rank: 1, description: 'One Pair', highCard: values[0] };
-    }
-    console.log('Hand evaluation: High Card');
-    return { rank: 0, description: 'High Card', highCard: values[0] };
+  
+    console.log('Best hand:', bestHand);
+    console.log('Best evaluation:', { rank: bestRank, description: bestDescription, highCards: bestHighCards });
+  
+    return { rank: bestRank, description: bestDescription, highCards: bestHighCards };
+  };
+  
+  // Funzione per generare tutte le combinazioni di k elementi da un array
+  const getCombinations = (array, k) => {
+    const result = [];
+    const combine = (start, combo) => {
+      if (combo.length === k) {
+        result.push([...combo]);
+        return;
+      }
+      for (let i = start; i < array.length; i++) {
+        combine(i + 1, [...combo, array[i]]);
+      }
+    };
+    combine(0, []);
+    return result;
   };
 
 // Funzione per aggiornare la classifica
 const updateLeaderboard = async (playerAddress, winnings) => {
     try {
+      console.log(`Attempting to update leaderboard for ${playerAddress} with winnings: ${winnings}`);
       let player = await Player.findOne({ address: playerAddress });
       if (!player) {
-        console.log(`Creating new player in leaderboard: ${playerAddress} with winnings: ${winnings}`);
+        console.log(`Player ${playerAddress} not found, creating new entry with winnings: ${winnings}`);
         player = new Player({ address: playerAddress, totalWinnings: winnings });
       } else {
-        console.log(`Updating player ${playerAddress}: adding ${winnings} to totalWinnings (${player.totalWinnings})`);
+        console.log(`Player ${playerAddress} found, current totalWinnings: ${player.totalWinnings}, adding: ${winnings}`);
         player.totalWinnings += winnings;
       }
       await player.save();
-      console.log(`Leaderboard updated for ${playerAddress}: totalWinnings now ${player.totalWinnings}`);
+      console.log(`Leaderboard successfully updated for ${playerAddress}: totalWinnings now ${player.totalWinnings}`);
     } catch (err) {
-      console.error('Error updating leaderboard:', err);
+      console.error(`Error updating leaderboard for ${playerAddress}:`, err.message);
+      console.error('Error stack:', err.stack);
     }
   };
   
   // API per ottenere la classifica
   app.get('/leaderboard', async (req, res) => {
     try {
+      console.log('Fetching leaderboard...');
       const leaderboard = await Player.find().sort({ totalWinnings: -1 }).limit(10);
       console.log('Leaderboard fetched:', leaderboard);
-      res.json(leaderboard);
+      if (!leaderboard || leaderboard.length === 0) {
+        console.log('Leaderboard is empty');
+        res.json([]);
+      } else {
+        res.json(leaderboard);
+      }
     } catch (err) {
-      console.error('Error fetching leaderboard:', err);
+      console.error('Error fetching leaderboard:', err.message);
+      console.error('Error stack:', err.stack);
       res.status(500).json({ error: 'Error fetching leaderboard' });
     }
   });
