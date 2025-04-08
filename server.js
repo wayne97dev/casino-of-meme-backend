@@ -60,6 +60,8 @@ io.on('connection', (socket) => {
         gameId,
         dealerMessage: '',
         bettingRoundComplete: false, // Flag per controllare se il round di scommesse è completo
+        turnTimer: null, // Timer per il turno del giocatore
+        timeLeft: 30, // Tempo rimanente per il turno (in secondi)
       };
 
       // Unisci i giocatori alla stanza del gioco
@@ -79,6 +81,10 @@ io.on('connection', (socket) => {
   socket.on('makeMove', async ({ gameId, move, amount }) => {
     const game = games[gameId];
     if (!game || game.currentTurn !== socket.id) return;
+
+    // Ferma il timer del turno corrente
+    clearTimeout(game.turnTimer);
+    game.timeLeft = 30; // Resetta il timer
 
     const playerAddress = game.players.find(p => p.id === socket.id).address;
     const opponent = game.players.find(p => p.id !== socket.id);
@@ -105,9 +111,12 @@ io.on('connection', (socket) => {
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
           advanceGamePhase(gameId);
+        } else {
+          // Avvia il timer per il turno dell'avversario
+          startTurnTimer(gameId, opponent.id);
         }
       }
-      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     } else if (move === 'call') {
       const amountToCall = game.currentBet - currentPlayerBet;
       game.pot += amountToCall;
@@ -119,14 +128,17 @@ io.on('connection', (socket) => {
       if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         advanceGamePhase(gameId);
+      } else {
+        // Avvia il timer per il turno dell'avversario
+        startTurnTimer(gameId, opponent.id);
       }
-      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     } else if (move === 'bet' || move === 'raise') {
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
       if (newBet <= game.currentBet) {
         game.message = 'The bet must be higher than the current bet!';
         game.dealerMessage = 'The dealer warns: Bet must be higher than the current bet!';
-        io.to(gameId).emit('gameState', game);
+        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
         return;
       }
       const additionalBet = newBet - currentPlayerBet;
@@ -137,7 +149,9 @@ io.on('connection', (socket) => {
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.currentTurn = opponent.id;
       game.bettingRoundComplete = false; // Il round di scommesse non è completo finché l'avversario non risponde
-      io.to(gameId).emit('gameState', game);
+      // Avvia il timer per il turno dell'avversario
+      startTurnTimer(gameId, opponent.id);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     }
   });
 
@@ -159,6 +173,8 @@ io.on('connection', (socket) => {
       if (playerIndex !== -1) {
         const opponent = game.players.find(p => p.id !== socket.id);
         if (opponent) {
+          // Ferma il timer del turno corrente
+          clearTimeout(game.turnTimer);
           game.status = 'finished';
           game.opponentCardsVisible = true;
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
@@ -172,6 +188,42 @@ io.on('connection', (socket) => {
     }
   });
 });
+
+// Funzione per avviare il timer del turno
+const startTurnTimer = (gameId, playerId) => {
+  const game = games[gameId];
+  if (!game) return;
+
+  game.currentTurn = playerId;
+  game.timeLeft = 30; // Imposta il timer a 30 secondi
+
+  // Invia lo stato iniziale con il tempo rimanente
+  io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+
+  // Avvia il timer
+  const interval = setInterval(() => {
+    game.timeLeft -= 1;
+    io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+
+    if (game.timeLeft <= 0) {
+      clearInterval(interval);
+      // Timeout: esegui un fold automatico per il giocatore
+      const playerAddress = game.players.find(p => p.id === playerId).address;
+      const opponent = game.players.find(p => p.id !== playerId);
+      game.status = 'finished';
+      game.opponentCardsVisible = true;
+      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
+      game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+      updateLeaderboard(opponent.address, game.pot).then(() => {
+        delete games[gameId];
+      });
+    }
+  }, 1000);
+
+  game.turnTimer = interval;
+};
 
 // Funzione per avviare la partita
 const startGame = (gameId) => {
@@ -193,7 +245,9 @@ const startGame = (gameId) => {
     game.status = 'playing';
     game.message = 'Pre-Flop: Place your bets.';
     game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
-    io.to(gameId).emit('gameState', game);
+    // Avvia il timer per il primo giocatore
+    startTurnTimer(gameId, game.players[0].id);
+    io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
   }, 1000);
 };
 
@@ -236,7 +290,8 @@ const advanceGamePhase = (gameId) => {
       game.currentBet = 0;
       game.playerBets[game.players[0].address] = 0;
       game.playerBets[game.players[1].address] = 0;
-      io.to(gameId).emit('gameState', game);
+      startTurnTimer(gameId, game.players[0].id);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     }, 1000);
   } else if (game.gamePhase === 'flop') {
     game.message = 'The dealer is dealing the Turn...';
@@ -253,7 +308,8 @@ const advanceGamePhase = (gameId) => {
       game.currentBet = 0;
       game.playerBets[game.players[0].address] = 0;
       game.playerBets[game.players[1].address] = 0;
-      io.to(gameId).emit('gameState', game);
+      startTurnTimer(gameId, game.players[0].id);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     }, 1000);
   } else if (game.gamePhase === 'turn') {
     game.message = 'The dealer is dealing the River...';
@@ -270,7 +326,8 @@ const advanceGamePhase = (gameId) => {
       game.currentBet = 0;
       game.playerBets[game.players[0].address] = 0;
       game.playerBets[game.players[1].address] = 0;
-      io.to(gameId).emit('gameState', game);
+      startTurnTimer(gameId, game.players[0].id);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     }, 1000);
   } else if (game.gamePhase === 'river') {
     game.gamePhase = 'showdown';
@@ -403,6 +460,9 @@ const evaluatePokerHand = (hand) => {
 const endGame = async (gameId) => {
   const game = games[gameId];
   if (!game) return;
+
+  // Ferma il timer del turno corrente
+  clearTimeout(game.turnTimer);
 
   const player1 = game.players[0];
   const player2 = game.players[1];
