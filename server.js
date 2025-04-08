@@ -9,7 +9,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: 'https://casino-of-meme.vercel.app', // URL del frontend
+    origin: 'https://casino-of-meme.vercel.app', // Aggiorna con l'URL del tuo frontend
     methods: ['GET', 'POST'],
   },
 });
@@ -20,14 +20,11 @@ app.use(express.json());
 
 // Connessione a MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://Cluster24283:Wkh1UXlmUnNf@cluster24283.ri0qrdr.mongodb.net/casino-of-meme?retryWrites=true&w=majority';
-mongoose.connect(MONGODB_URI, {
-}).then(() => {
-  console.log('Connected to MongoDB');
-}).catch(err => {
-  console.error('MongoDB connection error:', err);
-});
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-// Stato del gioco
+// Stato dei giochi
 const games = {};
 
 // Gestione delle connessioni WebSocket
@@ -37,7 +34,6 @@ io.on('connection', (socket) => {
   // Unisciti a una partita
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
     let gameId = null;
-    // Cerca una partita in attesa
     for (const id in games) {
       if (games[id].players.length === 1) {
         gameId = id;
@@ -46,7 +42,6 @@ io.on('connection', (socket) => {
     }
 
     if (!gameId) {
-      // Crea una nuova partita
       gameId = Date.now().toString();
       games[gameId] = {
         players: [],
@@ -64,19 +59,15 @@ io.on('connection', (socket) => {
       };
     }
 
-    // Aggiungi il giocatore alla partita
     games[gameId].players.push({ id: socket.id, address: playerAddress, bet: betAmount });
     socket.join(gameId);
 
-    // Aggiorna la classifica con il nuovo giocatore (se non esiste)
     await updateLeaderboard(playerAddress, 0);
 
-    // Se ci sono 2 giocatori, avvia la partita
     if (games[gameId].players.length === 2) {
       startGame(gameId);
     }
 
-    // Invia lo stato iniziale al giocatore
     io.to(gameId).emit('gameState', games[gameId]);
   });
 
@@ -94,22 +85,24 @@ io.on('connection', (socket) => {
       game.opponentCardsVisible = true;
       game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
       io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
       await updateLeaderboard(opponent.address, game.pot);
       delete games[gameId];
     } else if (move === 'check') {
       if (game.currentBet > currentPlayerBet) {
         game.message = 'You cannot check, you must call or raise!';
-        io.to(gameId).emit('gameState', game);
       } else {
         game.message = 'You checked.';
         advanceGamePhase(gameId, opponent.id);
       }
+      io.to(gameId).emit('gameState', game);
     } else if (move === 'call') {
       const amountToCall = game.currentBet - currentPlayerBet;
       game.pot += amountToCall;
       game.playerBets[playerAddress] = game.currentBet;
       game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
       advanceGamePhase(gameId, opponent.id);
+      io.to(gameId).emit('gameState', game);
     } else if (move === 'bet' || move === 'raise') {
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
       if (newBet <= game.currentBet) {
@@ -128,7 +121,7 @@ io.on('connection', (socket) => {
   });
 
   // Disconnessione
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
     for (const gameId in games) {
       const game = games[gameId];
@@ -140,7 +133,8 @@ io.on('connection', (socket) => {
           game.opponentCardsVisible = true;
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
           io.to(gameId).emit('gameState', game);
-          updateLeaderboard(opponent.address, game.pot);
+          io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+          await updateLeaderboard(opponent.address, game.pot);
         }
         delete games[gameId];
       }
@@ -266,6 +260,7 @@ const endGame = async (gameId) => {
   game.status = 'finished';
   game.opponentCardsVisible = true;
   io.to(gameId).emit('gameState', game);
+  io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
   await updateLeaderboard(winner.address, game.pot);
   delete games[gameId];
 };
@@ -314,17 +309,6 @@ app.get('/leaderboard', async (req, res) => {
     res.json(leaderboard);
   } catch (err) {
     res.status(500).json({ error: 'Error fetching leaderboard' });
-  }
-});
-
-// API per aggiornare la classifica dai minigiochi
-app.post('/updateLeaderboard', async (req, res) => {
-  const { playerAddress, winnings } = req.body;
-  try {
-    await updateLeaderboard(playerAddress, winnings);
-    res.status(200).json({ message: 'Leaderboard updated' });
-  } catch (err) {
-    res.status(500).json({ error: 'Error updating leaderboard' });
   }
 });
 
