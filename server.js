@@ -227,65 +227,108 @@ const advanceGamePhase = (gameId, nextTurn) => {
 
 // Funzione per terminare la partita
 const endGame = async (gameId) => {
-  const game = games[gameId];
-  const player1 = game.players[0];
-  const player2 = game.players[1];
-  const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
-  const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
-  const player1Evaluation = evaluatePokerHand(player1Hand);
-  const player2Evaluation = evaluatePokerHand(player2Hand);
-
-  let winner;
-  if (player1Evaluation.rank > player2Evaluation.rank) {
-    winner = player1;
-    game.message = `${player1.address.slice(0, 8)}... wins with a ${player1Evaluation.description}!`;
-  } else if (player2Evaluation.rank > player1Evaluation.rank) {
-    winner = player2;
-    game.message = `${player2.address.slice(0, 8)}... wins with a ${player2Evaluation.description}!`;
-  } else {
-    const player1HighCard = Math.max(...player1Hand.map(card => card.value));
-    const player2HighCard = Math.max(...player2Hand.map(card => card.value));
-    if (player1HighCard > player2HighCard) {
+    const game = games[gameId];
+    const player1 = game.players[0];
+    const player2 = game.players[1];
+    const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
+    const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
+    const player1Evaluation = evaluatePokerHand(player1Hand);
+    const player2Evaluation = evaluatePokerHand(player2Hand);
+  
+    console.log(`Player 1 (${player1.address}) hand:`, player1Hand);
+    console.log(`Player 1 evaluation:`, player1Evaluation);
+    console.log(`Player 2 (${player2.address}) hand:`, player2Hand);
+    console.log(`Player 2 evaluation:`, player2Evaluation);
+  
+    let winner;
+    if (player1Evaluation.rank > player2Evaluation.rank) {
       winner = player1;
-      game.message = `${player1.address.slice(0, 8)}... wins with a higher card (${player1HighCard})!`;
-    } else if (player2HighCard > player1HighCard) {
+      game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+      game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+    } else if (player2Evaluation.rank > player1Evaluation.rank) {
       winner = player2;
-      game.message = `${player2.address.slice(0, 8)}... wins with a higher card (${player2HighCard})!`;
+      game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+      game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
     } else {
-      game.message = 'It\'s a tie! The pot is split.';
-      winner = player1; // Per semplicità
+      const player1HighCard = player1Evaluation.highCard;
+      const player2HighCard = player2Evaluation.highCard;
+      if (player1HighCard > player2HighCard) {
+        winner = player1;
+        game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a higher card (${player1HighCard})!`;
+        game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a higher card (${player1HighCard})!`;
+      } else if (player2HighCard > player1HighCard) {
+        winner = player2;
+        game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a higher card (${player2HighCard})!`;
+        game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a higher card (${player2HighCard})!`;
+      } else {
+        game.message = 'It\'s a tie! The pot is split.';
+        game.dealerMessage = 'The dealer declares: It\'s a tie! The pot is split.';
+        winner = player1; // Per semplicità
+      }
     }
-  }
-
-  game.status = 'finished';
-  game.opponentCardsVisible = true;
-  io.to(gameId).emit('gameState', game);
-  io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
-  await updateLeaderboard(winner.address, game.pot);
-  delete games[gameId];
-};
+  
+    game.status = 'finished';
+    game.opponentCardsVisible = true;
+    io.to(gameId).emit('gameState', game);
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
+    await updateLeaderboard(winner.address, game.pot);
+    delete games[gameId];
+  };
 
 // Funzione per valutare le mani
 const evaluatePokerHand = (hand) => {
-  const values = hand.map(card => card.value).sort((a, b) => b - a);
-  const suits = hand.map(card => card.suit);
-  const isFlush = suits.every(suit => suit === suits[0]);
-  const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
-  const valueCounts = {};
-  values.forEach(val => {
-    valueCounts[val] = (valueCounts[val] || 0) + 1;
-  });
-  const counts = Object.values(valueCounts).sort((a, b) => b - a);
-  if (isFlush && isStraight) return { rank: 8, description: 'Straight Flush' };
-  if (counts[0] === 4) return { rank: 7, description: 'Four of a Kind' };
-  if (counts[0] === 3 && counts[1] === 2) return { rank: 6, description: 'Full House' };
-  if (isFlush) return { rank: 5, description: 'Flush' };
-  if (isStraight) return { rank: 4, description: 'Straight' };
-  if (counts[0] === 3) return { rank: 3, description: 'Three of a Kind' };
-  if (counts[0] === 2 && counts[1] === 2) return { rank: 2, description: 'Two Pair' };
-  if (counts[0] === 2) return { rank: 1, description: 'One Pair' };
-  return { rank: 0, description: 'High Card', highCard: values[0] };
-};
+    const values = hand.map(card => card.value).sort((a, b) => b - a);
+    const suits = hand.map(card => card.suit);
+    const isFlush = suits.every(suit => suit === suits[0]);
+    const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
+    const valueCounts = {};
+    values.forEach(val => {
+      valueCounts[val] = (valueCounts[val] || 0) + 1;
+    });
+    const counts = Object.values(valueCounts).sort((a, b) => b - a);
+  
+    // Log per debug
+    console.log('Evaluating hand:', hand);
+    console.log('Values:', values);
+    console.log('Suits:', suits);
+    console.log('Value counts:', valueCounts);
+    console.log('Counts:', counts);
+  
+    if (isFlush && isStraight) {
+      console.log('Hand evaluation: Straight Flush');
+      return { rank: 8, description: 'Straight Flush', highCard: values[0] };
+    }
+    if (counts[0] === 4) {
+      console.log('Hand evaluation: Four of a Kind');
+      return { rank: 7, description: 'Four of a Kind', highCard: values[0] };
+    }
+    if (counts[0] === 3 && counts[1] === 2) {
+      console.log('Hand evaluation: Full House');
+      return { rank: 6, description: 'Full House', highCard: values[0] };
+    }
+    if (isFlush) {
+      console.log('Hand evaluation: Flush');
+      return { rank: 5, description: 'Flush', highCard: values[0] };
+    }
+    if (isStraight) {
+      console.log('Hand evaluation: Straight');
+      return { rank: 4, description: 'Straight', highCard: values[0] };
+    }
+    if (counts[0] === 3) {
+      console.log('Hand evaluation: Three of a Kind');
+      return { rank: 3, description: 'Three of a Kind', highCard: values[0] };
+    }
+    if (counts[0] === 2 && counts[1] === 2) {
+      console.log('Hand evaluation: Two Pair');
+      return { rank: 2, description: 'Two Pair', highCard: values[0] };
+    }
+    if (counts[0] === 2) {
+      console.log('Hand evaluation: One Pair');
+      return { rank: 1, description: 'One Pair', highCard: values[0] };
+    }
+    console.log('Hand evaluation: High Card');
+    return { rank: 0, description: 'High Card', highCard: values[0] };
+  };
 
 // Funzione per aggiornare la classifica
 const updateLeaderboard = async (playerAddress, winnings) => {
