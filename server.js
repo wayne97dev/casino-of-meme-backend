@@ -26,6 +26,7 @@ mongoose.connect(MONGODB_URI)
 
 // Stato dei giochi
 const games = {};
+const waitingPlayers = []; // Lista di attesa per i giocatori
 
 // Gestione delle connessioni WebSocket
 io.on('connection', (socket) => {
@@ -33,18 +34,19 @@ io.on('connection', (socket) => {
 
   // Unisciti a una partita
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
-    let gameId = null;
-    for (const id in games) {
-      if (games[id].players.length === 1) {
-        gameId = id;
-        break;
-      }
-    }
+    // Aggiungi il giocatore alla lista di attesa
+    waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
+    socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
 
-    if (!gameId) {
-      gameId = Date.now().toString();
+    // Invia a tutti i giocatori in attesa la lista aggiornata
+    io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+
+    // Se ci sono almeno 2 giocatori, avvia una partita
+    if (waitingPlayers.length >= 2) {
+      const gameId = Date.now().toString();
+      const players = waitingPlayers.splice(0, 2); // Prendi i primi 2 giocatori
       games[gameId] = {
-        players: [],
+        players,
         tableCards: [],
         playerCards: {},
         currentTurn: null,
@@ -53,20 +55,24 @@ io.on('connection', (socket) => {
         playerBets: {},
         gamePhase: 'pre-flop',
         status: 'waiting',
-        message: 'Waiting for another player...',
+        message: 'The dealer is preparing the game...',
         opponentCardsVisible: false,
         gameId,
+        dealerMessage: '',
+        bettingRoundComplete: false, // Flag per controllare se il round di scommesse è completo
       };
-    }
 
-    games[gameId].players.push({ id: socket.id, address: playerAddress, bet: betAmount });
-    socket.join(gameId);
+      // Unisci i giocatori alla stanza del gioco
+      players.forEach(player => {
+        io.sockets.sockets.get(player.id)?.join(gameId);
+      });
 
-    if (games[gameId].players.length === 2) {
+      // Aggiorna la lista dei giocatori in attesa per tutti
+      io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+
+      // Avvia il gioco
       startGame(gameId);
     }
-
-    io.to(gameId).emit('gameState', games[gameId]);
   });
 
   // Gestione delle mosse dei giocatori
@@ -82,6 +88,7 @@ io.on('connection', (socket) => {
       game.status = 'finished';
       game.opponentCardsVisible = true;
       game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
+      game.dealerMessage = 'The dealer announces the winner!';
       io.to(gameId).emit('gameState', game);
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
       await updateLeaderboard(opponent.address, game.pot);
@@ -89,9 +96,16 @@ io.on('connection', (socket) => {
     } else if (move === 'check') {
       if (game.currentBet > currentPlayerBet) {
         game.message = 'You cannot check, you must call or raise!';
+        game.dealerMessage = 'The dealer reminds: You must call or raise!';
       } else {
         game.message = 'You checked.';
-        advanceGamePhase(gameId, opponent.id);
+        game.dealerMessage = 'The dealer says: Player checked.';
+        game.currentTurn = opponent.id;
+        // Verifica se entrambi i giocatori hanno checkato
+        if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+          game.bettingRoundComplete = true;
+          advanceGamePhase(gameId);
+        }
       }
       io.to(gameId).emit('gameState', game);
     } else if (move === 'call') {
@@ -99,12 +113,19 @@ io.on('connection', (socket) => {
       game.pot += amountToCall;
       game.playerBets[playerAddress] = game.currentBet;
       game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
-      advanceGamePhase(gameId, opponent.id);
+      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} SOL.`;
+      game.currentTurn = opponent.id;
+      // Verifica se le scommesse sono pareggiate
+      if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+        game.bettingRoundComplete = true;
+        advanceGamePhase(gameId);
+      }
       io.to(gameId).emit('gameState', game);
     } else if (move === 'bet' || move === 'raise') {
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
       if (newBet <= game.currentBet) {
         game.message = 'The bet must be higher than the current bet!';
+        game.dealerMessage = 'The dealer warns: Bet must be higher than the current bet!';
         io.to(gameId).emit('gameState', game);
         return;
       }
@@ -113,7 +134,9 @@ io.on('connection', (socket) => {
       game.playerBets[playerAddress] = newBet;
       game.currentBet = newBet;
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
+      game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.currentTurn = opponent.id;
+      game.bettingRoundComplete = false; // Il round di scommesse non è completo finché l'avversario non risponde
       io.to(gameId).emit('gameState', game);
     }
   });
@@ -121,6 +144,15 @@ io.on('connection', (socket) => {
   // Disconnessione
   socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
+
+    // Rimuovi il giocatore dalla lista di attesa, se presente
+    const waitingIndex = waitingPlayers.findIndex(p => p.id === socket.id);
+    if (waitingIndex !== -1) {
+      waitingPlayers.splice(waitingIndex, 1);
+      io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+    }
+
+    // Gestisci la disconnessione durante una partita
     for (const gameId in games) {
       const game = games[gameId];
       const playerIndex = game.players.findIndex(p => p.id === socket.id);
@@ -130,6 +162,7 @@ io.on('connection', (socket) => {
           game.status = 'finished';
           game.opponentCardsVisible = true;
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
+          game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
           io.to(gameId).emit('gameState', game);
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
           await updateLeaderboard(opponent.address, game.pot);
@@ -144,6 +177,7 @@ io.on('connection', (socket) => {
 const startGame = (gameId) => {
   const game = games[gameId];
   game.message = 'The dealer is dealing the cards...';
+  game.dealerMessage = 'The dealer is dealing the cards to the players.';
   io.to(gameId).emit('gameState', game);
 
   setTimeout(() => {
@@ -158,6 +192,7 @@ const startGame = (gameId) => {
     game.currentBet = game.players[0].bet;
     game.status = 'playing';
     game.message = 'Pre-Flop: Place your bets.';
+    game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
     io.to(gameId).emit('gameState', game);
   }, 1000);
 };
@@ -175,48 +210,66 @@ const drawCard = () => {
   else if (cardNumber === 13) cardName = 'K';
   else cardName = cardNumber;
   return {
-    value: cardNumber === 1 ? 14 : Math.min(cardNumber, 10), // Asso vale 14 per il poker
+    value: cardNumber === 1 ? 14 : cardNumber, // Asso vale 14 per il poker
     suit: suit,
     image: `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`,
   };
 };
 
 // Funzione per avanzare alla fase successiva
-const advanceGamePhase = (gameId, nextTurn) => {
+const advanceGamePhase = (gameId) => {
   const game = games[gameId];
   if (!game) return;
 
   if (game.gamePhase === 'pre-flop') {
     game.message = 'The dealer is dealing the Flop...';
+    game.dealerMessage = 'The dealer is dealing the Flop cards.';
     io.to(gameId).emit('gameState', game);
     setTimeout(() => {
       const newCards = Array(3).fill().map(() => drawCard());
       game.tableCards = newCards;
       game.gamePhase = 'flop';
       game.message = 'Flop: Place your bets.';
-      game.currentTurn = nextTurn;
+      game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${game.players[0].address.slice(0, 8)}... is up.`;
+      game.currentTurn = game.players[0].id;
+      game.bettingRoundComplete = false;
+      game.currentBet = 0;
+      game.playerBets[game.players[0].address] = 0;
+      game.playerBets[game.players[1].address] = 0;
       io.to(gameId).emit('gameState', game);
     }, 1000);
   } else if (game.gamePhase === 'flop') {
     game.message = 'The dealer is dealing the Turn...';
+    game.dealerMessage = 'The dealer is dealing the Turn card.';
     io.to(gameId).emit('gameState', game);
     setTimeout(() => {
       const newCard = drawCard();
       game.tableCards.push(newCard);
       game.gamePhase = 'turn';
       game.message = 'Turn: Place your bets.';
-      game.currentTurn = nextTurn;
+      game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${game.players[0].address.slice(0, 8)}... is up.`;
+      game.currentTurn = game.players[0].id;
+      game.bettingRoundComplete = false;
+      game.currentBet = 0;
+      game.playerBets[game.players[0].address] = 0;
+      game.playerBets[game.players[1].address] = 0;
       io.to(gameId).emit('gameState', game);
     }, 1000);
   } else if (game.gamePhase === 'turn') {
     game.message = 'The dealer is dealing the River...';
+    game.dealerMessage = 'The dealer is dealing the River card.';
     io.to(gameId).emit('gameState', game);
     setTimeout(() => {
       const newCard = drawCard();
       game.tableCards.push(newCard);
       game.gamePhase = 'river';
       game.message = 'River: Place your bets.';
-      game.currentTurn = nextTurn;
+      game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${game.players[0].address.slice(0, 8)}... is up.`;
+      game.currentTurn = game.players[0].id;
+      game.bettingRoundComplete = false;
+      game.currentBet = 0;
+      game.playerBets[game.players[0].address] = 0;
+      game.playerBets[game.players[1].address] = 0;
       io.to(gameId).emit('gameState', game);
     }, 1000);
   } else if (game.gamePhase === 'river') {
