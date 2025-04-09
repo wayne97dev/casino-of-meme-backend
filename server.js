@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const bs58 = require('bs58'); // Aggiungi questa riga
+const bs58 = require('bs58'); // Deve essere qui
 const Player = require('./models/Player');
 
 const app = express();
@@ -16,6 +16,7 @@ const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 const TAX_WALLET_PRIVATE_KEY = process.env.TAX_WALLET_PRIVATE_KEY || "33MaqBRfUkFeeh8p4BSDDM9gzEcbYbWvQ33yVPXBJ2xALcQmMGSLDJvRXj7coZCCXz7vNnW4nqhQVdPEGayZBoZj";
 const TAX_WALLET_ADDRESS = process.env.TAX_WALLET_ADDRESS || "24Sj4G8RfRoHKVvaXsdqLtkHB47mW4caKaqTDens9Bgu";
 const taxWalletKeypair = Keypair.fromSecretKey(bs58.decode(TAX_WALLET_PRIVATE_KEY));
+
 
 // Definisci le origini consentite
 const allowedOrigins = [
