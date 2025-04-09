@@ -120,18 +120,21 @@ io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
+    console.log(`Player ${playerAddress} joined with bet ${betAmount}`);
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
       console.log(`Updated socket.id for player ${playerAddress} to ${socket.id}`);
     } else {
       waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
+      console.log(`Added player ${playerAddress} to waiting list. Total waiting: ${waitingPlayers.length}`);
     }
-
+  
     socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
     io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
-
+  
     if (waitingPlayers.length >= 2) {
+      console.log('Starting game with players:', waitingPlayers);
       const gameId = Date.now().toString();
       const players = waitingPlayers.splice(0, 2);
       games[gameId] = {
@@ -152,8 +155,7 @@ io.on('connection', (socket) => {
         turnTimer: null,
         timeLeft: 30,
       };
-
-      // Trasferisci le puntate al tax wallet
+  
       for (const player of players) {
         const betAmountInLamports = player.bet * LAMPORTS_PER_SOL;
         const transaction = new Transaction().add(
@@ -163,12 +165,12 @@ io.on('connection', (socket) => {
             lamports: betAmountInLamports,
           })
         );
-
+  
         const { blockhash } = await connection.getLatestBlockhash();
         transaction.recentBlockhash = blockhash;
         transaction.feePayer = taxWalletKeypair.publicKey;
         transaction.sign(taxWalletKeypair);
-
+  
         try {
           const signature = await connection.sendRawTransaction(transaction.serialize());
           await connection.confirmTransaction(signature);
@@ -180,7 +182,7 @@ io.on('connection', (socket) => {
           return;
         }
       }
-
+  
       players.forEach(player => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
@@ -190,31 +192,9 @@ io.on('connection', (socket) => {
           console.error(`Socket for player ${player.id} not found`);
         }
       });
-
+  
       io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
       startGame(gameId);
-    }
-  });
-
-  socket.on('reconnectPlayer', ({ playerAddress, gameId }) => {
-    const game = games[gameId];
-    if (game) {
-      const player = game.players.find(p => p.address === playerAddress);
-      if (player) {
-        const oldSocketId = player.id;
-        player.id = socket.id;
-        console.log(`Player ${playerAddress} reconnected. Updated socket.id from ${oldSocketId} to ${socket.id}`);
-        socket.join(gameId);
-        if (game.currentTurn === oldSocketId) {
-          game.currentTurn = socket.id;
-          console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
-        }
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } else {
-        console.error(`Player ${playerAddress} not found in game ${gameId}`);
-      }
-    } else {
-      console.error(`Game ${gameId} not found during reconnection`);
     }
   });
 
