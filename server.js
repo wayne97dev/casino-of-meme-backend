@@ -487,7 +487,7 @@ const advanceGamePhase = (gameId) => {
   const game = games[gameId];
   if (!game) return;
 
-  // Determine who made the last move (the player who checked)
+  // Determina chi ha fatto l'ultima mossa (il giocatore che ha fatto "Check")
   const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
   const nextPlayer = game.players.find(p => p.id === game.currentTurn);
 
@@ -500,14 +500,14 @@ const advanceGamePhase = (gameId) => {
       game.tableCards = newCards;
       game.gamePhase = 'flop';
       game.message = 'Flop: Place your bets.';
-      game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${nextPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = nextPlayer.id; // Pass the turn to the other player
+      game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+      game.currentTurn = lastPlayer.id; // Passa il turno all'altro giocatore
       game.bettingRoundComplete = false;
       game.currentBet = 0;
       game.playerBets[lastPlayer.address] = 0;
       game.playerBets[nextPlayer.address] = 0;
-      console.log(`Advancing to Flop, turn passed to: ${nextPlayer.id}`);
-      startTurnTimer(gameId, nextPlayer.id);
+      console.log(`Advancing to Flop, turn passed to: ${lastPlayer.id}`);
+      startTurnTimer(gameId, lastPlayer.id);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }, 1000);
   } else if (game.gamePhase === 'flop') {
@@ -519,14 +519,14 @@ const advanceGamePhase = (gameId) => {
       game.tableCards.push(newCard);
       game.gamePhase = 'turn';
       game.message = 'Turn: Place your bets.';
-      game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${nextPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = nextPlayer.id; // Pass the turn to the other player
+      game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+      game.currentTurn = lastPlayer.id; // Passa il turno all'altro giocatore
       game.bettingRoundComplete = false;
       game.currentBet = 0;
       game.playerBets[lastPlayer.address] = 0;
       game.playerBets[nextPlayer.address] = 0;
-      console.log(`Advancing to Turn, turn passed to: ${nextPlayer.id}`);
-      startTurnTimer(gameId, nextPlayer.id);
+      console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
+      startTurnTimer(gameId, lastPlayer.id);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }, 1000);
   } else if (game.gamePhase === 'turn') {
@@ -538,14 +538,14 @@ const advanceGamePhase = (gameId) => {
       game.tableCards.push(newCard);
       game.gamePhase = 'river';
       game.message = 'River: Place your bets.';
-      game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${nextPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = nextPlayer.id; // Pass the turn to the other player
+      game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+      game.currentTurn = lastPlayer.id; // Passa il turno all'altro giocatore
       game.bettingRoundComplete = false;
       game.currentBet = 0;
       game.playerBets[lastPlayer.address] = 0;
       game.playerBets[nextPlayer.address] = 0;
-      console.log(`Advancing to River, turn passed to: ${nextPlayer.id}`);
-      startTurnTimer(gameId, nextPlayer.id);
+      console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
+      startTurnTimer(gameId, lastPlayer.id);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }, 1000);
   } else if (game.gamePhase === 'river') {
