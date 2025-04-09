@@ -708,7 +708,9 @@ const updateLeaderboard = async (playerAddress, winnings) => {
   }
 };
 
+
 app.get('/leaderboard', async (req, res) => {
+  console.log('Received request for /leaderboard');
   try {
     console.log('Fetching leaderboard...');
     const leaderboard = await Player.find().sort({ totalWinnings: -1 }).limit(10);
