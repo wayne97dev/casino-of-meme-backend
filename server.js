@@ -28,16 +28,12 @@ mongoose.connect(MONGODB_URI)
 const games = {};
 const waitingPlayers = [];
 
-// Gestione delle connessioni WebSocket
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
 
-  // Unisciti a una partita
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
-    // Cerca se il giocatore è già in lista con lo stesso indirizzo
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
-      // Aggiorna il socket.id del giocatore esistente
       waitingPlayers[existingPlayerIndex].id = socket.id;
       console.log(`Updated socket.id for player ${playerAddress} to ${socket.id}`);
     } else {
@@ -84,7 +80,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Riconnessione di un giocatore
   socket.on('reconnectPlayer', ({ playerAddress, gameId }) => {
     const game = games[gameId];
     if (game) {
@@ -107,7 +102,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Gestione delle mosse dei giocatori
   socket.on('makeMove', async ({ gameId, move, amount }) => {
     const game = games[gameId];
     if (!game || game.currentTurn !== socket.id) {
@@ -115,7 +109,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Ferma il timer del turno corrente
     if (game.turnTimer) {
       clearInterval(game.turnTimer);
     }
@@ -190,18 +183,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Disconnessione
   socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
 
-    // Rimuovi il giocatore dalla lista di attesa
     const waitingIndex = waitingPlayers.findIndex(p => p.id === socket.id);
     if (waitingIndex !== -1) {
       waitingPlayers.splice(waitingIndex, 1);
       io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
     }
 
-    // Gestisci la disconnessione durante una partita
     for (const gameId in games) {
       const game = games[gameId];
       const playerIndex = game.players.findIndex(p => p.id === socket.id);
@@ -225,7 +215,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Funzione per avviare il timer del turno
 const startTurnTimer = (gameId, playerId) => {
   const game = games[gameId];
   if (!game) {
@@ -262,38 +251,42 @@ const startTurnTimer = (gameId, playerId) => {
   console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
 
   game.turnTimer = setInterval(() => {
-    if (!games[gameId]) {
-      clearInterval(game.turnTimer);
-      return;
-    }
-
-    game.timeLeft -= 1;
-    console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}`);
-    io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
-
-    if (game.timeLeft <= 0) {
-      clearInterval(game.turnTimer);
-      const playerAddress = game.players.find(p => p.id === playerId)?.address;
-      const opponent = game.players.find(p => p.id !== playerId);
-      if (!playerAddress || !opponent) {
-        console.error(`Player or opponent not found in game ${gameId}`);
-        delete games[gameId];
+    try {
+      if (!games[gameId]) {
+        clearInterval(game.turnTimer);
         return;
       }
-      game.status = 'finished';
-      game.opponentCardsVisible = true;
-      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
-      game.dealerMessage = 'The dealer announces: A player timed out and folded.';
-      io.to(gameId).emit('gameState', game);
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-      updateLeaderboard(opponent.address, game.pot).then(() => {
-        delete games[gameId];
-      });
+
+      game.timeLeft -= 1;
+      console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}`);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+
+      if (game.timeLeft <= 0) {
+        clearInterval(game.turnTimer);
+        const playerAddress = game.players.find(p => p.id === playerId)?.address;
+        const opponent = game.players.find(p => p.id !== playerId);
+        if (!playerAddress || !opponent) {
+          console.error(`Player or opponent not found in game ${gameId}`);
+          delete games[gameId];
+          return;
+        }
+        game.status = 'finished';
+        game.opponentCardsVisible = true;
+        game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
+        game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+        io.to(gameId).emit('gameState', game);
+        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+        updateLeaderboard(opponent.address, game.pot).then(() => {
+          delete games[gameId];
+        });
+      }
+    } catch (err) {
+      console.error(`Error in turn timer for game ${gameId}:`, err);
+      clearInterval(game.turnTimer);
     }
   }, 1000);
 };
 
-// Funzione per avviare la partita
 const startGame = (gameId) => {
   const game = games[gameId];
   if (!game) {
@@ -338,7 +331,6 @@ const startGame = (gameId) => {
   }, 1000);
 };
 
-// Funzione per pescare una carta
 const drawCard = () => {
   const cardNumber = Math.floor(Math.random() * 13) + 1;
   const suit = ['spades', 'hearts', 'diamonds', 'clubs'][Math.floor(Math.random() * 4)];
@@ -357,7 +349,6 @@ const drawCard = () => {
   };
 };
 
-// Funzione per avanzare alla fase successiva
 const advanceGamePhase = (gameId) => {
   const game = games[gameId];
   if (!game) return;
@@ -422,7 +413,6 @@ const advanceGamePhase = (gameId) => {
   }
 };
 
-// Funzione per generare tutte le combinazioni di k elementi da un array
 const getCombinations = (array, k) => {
   const result = [];
   const combine = (start, combo) => {
@@ -438,7 +428,6 @@ const getCombinations = (array, k) => {
   return result;
 };
 
-// Funzione per valutare le mani
 const evaluatePokerHand = (hand) => {
   const combinations = getCombinations(hand, 5);
   let bestRank = -1;
@@ -537,7 +526,6 @@ const evaluatePokerHand = (hand) => {
   return { rank: bestRank, description: bestDescription, highCards: bestHighCards };
 };
 
-// Funzione per terminare la partita
 const endGame = async (gameId) => {
   const game = games[gameId];
   if (!game) return;
@@ -599,7 +587,6 @@ const endGame = async (gameId) => {
   delete games[gameId];
 };
 
-// Funzione per aggiornare la classifica
 const updateLeaderboard = async (playerAddress, winnings) => {
   try {
     console.log(`Attempting to update leaderboard for ${playerAddress} with winnings: ${winnings}`);
@@ -619,7 +606,6 @@ const updateLeaderboard = async (playerAddress, winnings) => {
   }
 };
 
-// API per ottenere la classifica
 app.get('/leaderboard', async (req, res) => {
   try {
     console.log('Fetching leaderboard...');
@@ -638,7 +624,6 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
-// Avvia il server
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
