@@ -9,7 +9,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: 'https://casino-of-meme.vercel.app', // Aggiorna con l'URL del tuo frontend
+    origin: 'https://casino-of-meme.vercel.app',
     methods: ['GET', 'POST'],
   },
 });
@@ -26,7 +26,7 @@ mongoose.connect(MONGODB_URI)
 
 // Stato dei giochi
 const games = {};
-const waitingPlayers = []; // Lista di attesa per i giocatori
+const waitingPlayers = [];
 
 // Gestione delle connessioni WebSocket
 io.on('connection', (socket) => {
@@ -34,17 +34,22 @@ io.on('connection', (socket) => {
 
   // Unisciti a una partita
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
-    // Aggiungi il giocatore alla lista di attesa
-    waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
-    socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
+    // Cerca se il giocatore è già in lista con lo stesso indirizzo
+    const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
+    if (existingPlayerIndex !== -1) {
+      // Aggiorna il socket.id del giocatore esistente
+      waitingPlayers[existingPlayerIndex].id = socket.id;
+      console.log(`Updated socket.id for player ${playerAddress} to ${socket.id}`);
+    } else {
+      waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
+    }
 
-    // Invia a tutti i giocatori in attesa la lista aggiornata
+    socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
     io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
 
-    // Se ci sono almeno 2 giocatori, avvia una partita
     if (waitingPlayers.length >= 2) {
       const gameId = Date.now().toString();
-      const players = waitingPlayers.splice(0, 2); // Prendi i primi 2 giocatori
+      const players = waitingPlayers.splice(0, 2);
       games[gameId] = {
         players,
         tableCards: [],
@@ -59,35 +64,70 @@ io.on('connection', (socket) => {
         opponentCardsVisible: false,
         gameId,
         dealerMessage: '',
-        bettingRoundComplete: false, // Flag per controllare se il round di scommesse è completo
-        turnTimer: null, // Timer per il turno del giocatore
-        timeLeft: 30, // Tempo rimanente per il turno (in secondi)
+        bettingRoundComplete: false,
+        turnTimer: null,
+        timeLeft: 30,
       };
 
-      // Unisci i giocatori alla stanza del gioco
       players.forEach(player => {
-        io.sockets.sockets.get(player.id)?.join(gameId);
+        const playerSocket = io.sockets.sockets.get(player.id);
+        if (playerSocket) {
+          playerSocket.join(gameId);
+          console.log(`Player ${player.id} joined room ${gameId}`);
+        } else {
+          console.error(`Socket for player ${player.id} not found`);
+        }
       });
 
-      // Aggiorna la lista dei giocatori in attesa per tutti
       io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
-
-      // Avvia il gioco
       startGame(gameId);
+    }
+  });
+
+  // Riconnessione di un giocatore
+  socket.on('reconnectPlayer', ({ playerAddress, gameId }) => {
+    const game = games[gameId];
+    if (game) {
+      const player = game.players.find(p => p.address === playerAddress);
+      if (player) {
+        const oldSocketId = player.id;
+        player.id = socket.id;
+        console.log(`Player ${playerAddress} reconnected. Updated socket.id from ${oldSocketId} to ${socket.id}`);
+        socket.join(gameId);
+        if (game.currentTurn === oldSocketId) {
+          game.currentTurn = socket.id;
+          console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
+        }
+        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      } else {
+        console.error(`Player ${playerAddress} not found in game ${gameId}`);
+      }
+    } else {
+      console.error(`Game ${gameId} not found during reconnection`);
     }
   });
 
   // Gestione delle mosse dei giocatori
   socket.on('makeMove', async ({ gameId, move, amount }) => {
     const game = games[gameId];
-    if (!game || game.currentTurn !== socket.id) return;
+    if (!game || game.currentTurn !== socket.id) {
+      console.log(`Invalid move attempt: game ${gameId}, currentTurn ${game.currentTurn}, socket.id ${socket.id}`);
+      return;
+    }
 
     // Ferma il timer del turno corrente
-    clearTimeout(game.turnTimer);
-    game.timeLeft = 30; // Resetta il timer
+    if (game.turnTimer) {
+      clearInterval(game.turnTimer);
+    }
+    game.timeLeft = 30;
 
-    const playerAddress = game.players.find(p => p.id === socket.id).address;
+    const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
+    if (!playerAddress || !opponent) {
+      console.error(`Player or opponent not found in game ${gameId}`);
+      delete games[gameId];
+      return;
+    }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
 
     if (move === 'fold') {
@@ -107,12 +147,10 @@ io.on('connection', (socket) => {
         game.message = 'You checked.';
         game.dealerMessage = 'The dealer says: Player checked.';
         game.currentTurn = opponent.id;
-        // Verifica se entrambi i giocatori hanno checkato
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
           advanceGamePhase(gameId);
         } else {
-          // Avvia il timer per il turno dell'avversario
           startTurnTimer(gameId, opponent.id);
         }
       }
@@ -124,12 +162,10 @@ io.on('connection', (socket) => {
       game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} SOL.`;
       game.currentTurn = opponent.id;
-      // Verifica se le scommesse sono pareggiate
       if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         advanceGamePhase(gameId);
       } else {
-        // Avvia il timer per il turno dell'avversario
         startTurnTimer(gameId, opponent.id);
       }
       io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
@@ -148,8 +184,7 @@ io.on('connection', (socket) => {
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.currentTurn = opponent.id;
-      game.bettingRoundComplete = false; // Il round di scommesse non è completo finché l'avversario non risponde
-      // Avvia il timer per il turno dell'avversario
+      game.bettingRoundComplete = false;
       startTurnTimer(gameId, opponent.id);
       io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     }
@@ -159,7 +194,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
 
-    // Rimuovi il giocatore dalla lista di attesa, se presente
+    // Rimuovi il giocatore dalla lista di attesa
     const waitingIndex = waitingPlayers.findIndex(p => p.id === socket.id);
     if (waitingIndex !== -1) {
       waitingPlayers.splice(waitingIndex, 1);
@@ -173,8 +208,9 @@ io.on('connection', (socket) => {
       if (playerIndex !== -1) {
         const opponent = game.players.find(p => p.id !== socket.id);
         if (opponent) {
-          // Ferma il timer del turno corrente
-          clearTimeout(game.turnTimer);
+          if (game.turnTimer) {
+            clearInterval(game.turnTimer);
+          }
           game.status = 'finished';
           game.opponentCardsVisible = true;
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
@@ -191,81 +227,114 @@ io.on('connection', (socket) => {
 
 // Funzione per avviare il timer del turno
 const startTurnTimer = (gameId, playerId) => {
-    const game = games[gameId];
-    if (!game) {
-      console.error(`Game ${gameId} not found in startTurnTimer`);
+  const game = games[gameId];
+  if (!game) {
+    console.error(`Game ${gameId} not found in startTurnTimer`);
+    return;
+  }
+
+  const player = game.players.find(p => p.id === playerId);
+  if (!player) {
+    console.error(`Player with socket.id ${playerId} not found in game ${gameId}`);
+    const opponent = game.players.find(p => p.id !== playerId);
+    if (opponent) {
+      game.status = 'finished';
+      game.opponentCardsVisible = true;
+      game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
+      game.dealerMessage = 'The dealer announces: A player is no longer available.';
+      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+      updateLeaderboard(opponent.address, game.pot).then(() => {
+        delete games[gameId];
+      });
+    }
+    return;
+  }
+
+  game.currentTurn = playerId;
+  game.timeLeft = 30;
+
+  if (game.turnTimer) {
+    clearInterval(game.turnTimer);
+  }
+
+  io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+  console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
+
+  game.turnTimer = setInterval(() => {
+    if (!games[gameId]) {
+      clearInterval(game.turnTimer);
       return;
     }
-  
-    game.currentTurn = playerId;
-    game.timeLeft = 30;
-  
-    // Ferma qualsiasi timer precedente per evitare duplicati
-    if (game.turnTimer) {
-      clearInterval(game.turnTimer);
-    }
-  
-    // Invia lo stato iniziale
+
+    game.timeLeft -= 1;
+    console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}`);
     io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
-    console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
-  
-    // Avvia il timer
-    game.turnTimer = setInterval(() => {
-      if (!games[gameId]) {
-        clearInterval(game.turnTimer);
+
+    if (game.timeLeft <= 0) {
+      clearInterval(game.turnTimer);
+      const playerAddress = game.players.find(p => p.id === playerId)?.address;
+      const opponent = game.players.find(p => p.id !== playerId);
+      if (!playerAddress || !opponent) {
+        console.error(`Player or opponent not found in game ${gameId}`);
+        delete games[gameId];
         return;
       }
-  
-      game.timeLeft -= 1;
-      console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}`);
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
-  
-      if (game.timeLeft <= 0) {
-        clearInterval(game.turnTimer);
-        const playerAddress = game.players.find(p => p.id === playerId)?.address;
-        const opponent = game.players.find(p => p.id !== playerId);
-        if (!playerAddress || !opponent) {
-          console.error(`Player or opponent not found in game ${gameId}`);
-          delete games[gameId];
-          return;
-        }
-        game.status = 'finished';
-        game.opponentCardsVisible = true;
-        game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
-        game.dealerMessage = 'The dealer announces: A player timed out and folded.';
-        io.to(gameId).emit('gameState', game);
-        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-        updateLeaderboard(opponent.address, game.pot).then(() => {
-          delete games[gameId];
-        });
-      }
-    }, 1000);
-  };
-
+      game.status = 'finished';
+      game.opponentCardsVisible = true;
+      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
+      game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+      updateLeaderboard(opponent.address, game.pot).then(() => {
+        delete games[gameId];
+      });
+    }
+  }, 1000);
+};
 
 // Funzione per avviare la partita
 const startGame = (gameId) => {
   const game = games[gameId];
+  if (!game) {
+    console.error(`Game ${gameId} not found in startGame`);
+    return;
+  }
+  console.log(`Starting game ${gameId} with players:`, game.players);
+
   game.message = 'The dealer is dealing the cards...';
   game.dealerMessage = 'The dealer is dealing the cards to the players.';
   io.to(gameId).emit('gameState', game);
 
   setTimeout(() => {
-    const player1Cards = [drawCard(), drawCard()];
-    const player2Cards = [drawCard(), drawCard()];
-    game.playerCards[game.players[0].address] = player1Cards;
-    game.playerCards[game.players[1].address] = player2Cards;
-    game.currentTurn = game.players[0].id;
-    game.pot = game.players[0].bet + game.players[1].bet;
-    game.playerBets[game.players[0].address] = game.players[0].bet;
-    game.playerBets[game.players[1].address] = game.players[1].bet;
-    game.currentBet = game.players[0].bet;
-    game.status = 'playing';
-    game.message = 'Pre-Flop: Place your bets.';
-    game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
-    // Avvia il timer per il primo giocatore
-    startTurnTimer(gameId, game.players[0].id);
-    io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+    try {
+      const player1Cards = [drawCard(), drawCard()];
+      const player2Cards = [drawCard(), drawCard()];
+      if (!player1Cards.every(card => card && card.image) || !player2Cards.every(card => card && card.image)) {
+        throw new Error('Invalid cards drawn');
+      }
+      game.playerCards[game.players[0].address] = player1Cards;
+      game.playerCards[game.players[1].address] = player2Cards;
+      game.currentTurn = game.players[0].id;
+      game.pot = game.players[0].bet + game.players[1].bet;
+      game.playerBets[game.players[0].address] = game.players[0].bet;
+      game.playerBets[game.players[1].address] = game.players[1].bet;
+      game.currentBet = game.players[0].bet;
+      game.status = 'playing';
+      game.message = 'Pre-Flop: Place your bets.';
+      game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
+
+      console.log(`Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
+      console.log(`Player 0 socket.id: ${game.players[0].id}, Player 1 socket.id: ${game.players[1].id}`);
+
+      startTurnTimer(gameId, game.players[0].id);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+    } catch (err) {
+      console.error(`Error in startGame ${gameId}:`, err);
+      game.message = 'Error starting game. Please try again.';
+      game.status = 'waiting';
+      io.to(gameId).emit('gameState', game);
+    }
   }, 1000);
 };
 
@@ -282,7 +351,7 @@ const drawCard = () => {
   else if (cardNumber === 13) cardName = 'K';
   else cardName = cardNumber;
   return {
-    value: cardNumber === 1 ? 14 : cardNumber, // Asso vale 14 per il poker
+    value: cardNumber === 1 ? 14 : cardNumber,
     suit: suit,
     image: `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`,
   };
@@ -371,21 +440,17 @@ const getCombinations = (array, k) => {
 
 // Funzione per valutare le mani
 const evaluatePokerHand = (hand) => {
-  // Genera tutte le possibili combinazioni di 5 carte dalle 7 disponibili
   const combinations = getCombinations(hand, 5);
-
   let bestRank = -1;
   let bestDescription = '';
   let bestHighCards = [];
   let bestHand = null;
 
-  // Valuta ogni combinazione
   for (const combo of combinations) {
     const values = combo.map(card => card.value).sort((a, b) => b - a);
     const suits = combo.map(card => card.suit);
     const isFlush = suits.every(suit => suit === suits[0]);
     const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
-    // Gestisci il caso speciale dell'Asso basso (A, 2, 3, 4, 5)
     const isLowStraight = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
     const valueCounts = {};
     values.forEach(val => {
@@ -400,7 +465,7 @@ const evaluatePokerHand = (hand) => {
     if (isFlush && (isStraight || isLowStraight)) {
       rank = 8;
       description = 'Straight Flush';
-      highCards = isLowStraight ? [5] : [values[0]]; // Se è uno straight basso, la carta alta è 5
+      highCards = isLowStraight ? [5] : [values[0]];
     } else if (counts[0] === 4) {
       rank = 7;
       description = 'Four of a Kind';
@@ -410,7 +475,7 @@ const evaluatePokerHand = (hand) => {
       description = 'Full House';
       highCards = [
         parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
-        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2))
+        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2)),
       ];
     } else if (isFlush) {
       rank = 5;
@@ -425,7 +490,7 @@ const evaluatePokerHand = (hand) => {
       description = 'Three of a Kind';
       highCards = [
         parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
-        ...values.filter(val => val !== parseInt(Object.keys(valueCounts).find(v => valueCounts[v] === 3)))
+        ...values.filter(val => val !== parseInt(Object.keys(valueCounts).find(v => valueCounts[v] === 3))),
       ];
     } else if (counts[0] === 2 && counts[1] === 2) {
       rank = 2;
@@ -439,7 +504,7 @@ const evaluatePokerHand = (hand) => {
       const pairValue = parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2));
       highCards = [
         pairValue,
-        ...values.filter(val => val !== pairValue)
+        ...values.filter(val => val !== pairValue),
       ];
     } else {
       rank = 0;
@@ -447,7 +512,6 @@ const evaluatePokerHand = (hand) => {
       highCards = values;
     }
 
-    // Confronta con la migliore combinazione trovata finora
     if (rank > bestRank) {
       bestRank = rank;
       bestDescription = description;
@@ -470,7 +534,6 @@ const evaluatePokerHand = (hand) => {
 
   console.log('Best hand:', bestHand);
   console.log('Best evaluation:', { rank: bestRank, description: bestDescription, highCards: bestHighCards });
-
   return { rank: bestRank, description: bestDescription, highCards: bestHighCards };
 };
 
@@ -479,8 +542,9 @@ const endGame = async (gameId) => {
   const game = games[gameId];
   if (!game) return;
 
-  // Ferma il timer del turno corrente
-  clearTimeout(game.turnTimer);
+  if (game.turnTimer) {
+    clearInterval(game.turnTimer);
+  }
 
   const player1 = game.players[0];
   const player2 = game.players[1];
@@ -521,9 +585,9 @@ const endGame = async (gameId) => {
       }
     }
     if (!tieBreaker) {
-      game.message = 'It\'s a tie! The pot is split.';
-      game.dealerMessage = 'The dealer declares: It\'s a tie! The pot is split.';
-      winner = player1; // Per semplicità
+      game.message = "It's a tie! The pot is split.";
+      game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
+      winner = player1;
     }
   }
 
