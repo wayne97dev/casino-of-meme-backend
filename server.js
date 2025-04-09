@@ -225,6 +225,7 @@ io.on('connection', (socket) => {
       if (game.currentBet > currentPlayerBet) {
         game.message = 'You cannot check, you must call or raise!';
         game.dealerMessage = 'The dealer reminds: You must call or raise!';
+        console.log(`Cannot check: currentBet=${game.currentBet}, playerBet=${currentPlayerBet}`);
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } else {
         game.message = 'You checked.';
@@ -232,14 +233,16 @@ io.on('connection', (socket) => {
         game.currentTurn = opponent.id;
         console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+          console.log('Betting round complete, advancing game phase');
           game.bettingRoundComplete = true;
           advanceGamePhase(gameId);
         } else {
+          console.log(`Starting turn timer for opponent: ${opponent.id}`);
           startTurnTimer(gameId, opponent.id);
         }
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       }
-    } else if (move === 'call') {
+    }else if (move === 'call') {
       const amountToCall = game.currentBet - currentPlayerBet;
       game.pot += amountToCall;
       game.playerBets[playerAddress] = game.currentBet;
