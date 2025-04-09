@@ -8,14 +8,14 @@ const Player = require('./models/Player');
 const app = express();
 const server = http.createServer(app);
 
-// Definisci le origini consentite
+// Define allowed origins
 const allowedOrigins = [
   'https://casino-of-meme.vercel.app',
   'http://localhost:5173',
   'http://localhost:3000',
 ];
 
-// Configura il middleware CORS per tutte le richieste
+// Configure CORS middleware for all requests
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
@@ -29,7 +29,7 @@ app.use(cors({
   credentials: true,
 }));
 
-// Middleware manuale per gestire CORS e loggare le richieste
+// Manual middleware to handle CORS and log requests
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   console.log(`Received request: ${req.method} ${req.url} from origin: ${origin}`);
@@ -49,7 +49,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Configura Socket.IO con CORS
+// Configure Socket.IO with CORS
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
@@ -68,21 +68,21 @@ const io = new Server(server, {
 // Middleware
 app.use(express.json());
 
-// Connessione a MongoDB
+// Connect to MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://Cluster24283:Wkh1UXlmUnNf@cluster24283.ri0qrdr.mongodb.net/casino-of-meme?retryWrites=true&w=majority';
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// Stato dei giochi
+// Game state
 const games = {};
 const waitingPlayers = [];
 
-// Funzione per rimuovere i riferimenti circolari
+// Function to remove circular references
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
   if (obj && typeof obj === 'object') {
     if (seen.has(obj)) {
-      return undefined; // Riferimento circolare trovato, lo rimuoviamo
+      return undefined; // Circular reference found, remove it
     }
     seen.add(obj);
     if (Array.isArray(obj)) {
@@ -139,7 +139,7 @@ io.on('connection', (socket) => {
         timeLeft: 30,
       };
 
-      // Aggiungi le puntate al pot (senza transazione Solana)
+      // Add the bets to the pot (without Solana transaction)
       for (const player of players) {
         games[gameId].pot += player.bet;
         console.log(`Added ${player.bet} SOL to pot from ${player.address}. Total pot: ${games[gameId].pot}`);
@@ -214,9 +214,10 @@ io.on('connection', (socket) => {
       game.opponentCardsVisible = true;
       game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
       game.dealerMessage = 'The dealer announces the winner!';
+      console.log(`Emitting gameState to room ${gameId} with new status: ${game.status}, pot: ${game.pot}`);
       io.to(gameId).emit('gameState', removeCircularReferences(game));
 
-      // Non trasferiamo SOL, semplicemente emettiamo l'evento di vincita
+      // Emit the winnings event without transferring SOL
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
 
       await updateLeaderboard(opponent.address, game.pot);
@@ -230,41 +231,46 @@ io.on('connection', (socket) => {
       } else {
         game.message = 'You checked.';
         game.dealerMessage = 'The dealer says: Player checked.';
-        game.currentTurn = opponent.id;
-        console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
-        if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
-          console.log('Betting round complete, advancing game phase');
-          game.bettingRoundComplete = true;
-          advanceGamePhase(gameId);
-        } else {
-          console.log(`Starting turn timer for opponent: ${opponent.id}`);
-          startTurnTimer(gameId, opponent.id);
-        }
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      }
-    } else if (move === 'check') {
-      if (game.currentBet > currentPlayerBet) {
-        game.message = 'You cannot check, you must call or raise!';
-        game.dealerMessage = 'The dealer reminds: You must call or raise!';
-        console.log(`Cannot check: currentBet=${game.currentBet}, playerBet=${currentPlayerBet}`);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } else {
-        game.message = 'You checked.';
-        game.dealerMessage = 'The dealer says: Player checked.';
         console.log(`Player ${playerAddress} checked. Current bets: ${game.playerBets[playerAddress]} (player) vs ${game.playerBets[opponent.address]} (opponent)`);
-    
-        // Se entrambi i giocatori hanno puntato lo stesso importo, il round di puntate è completo
+
+        // If both players have bet the same amount, the betting round is complete
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           console.log('Betting round complete, advancing game phase');
           game.bettingRoundComplete = true;
           advanceGamePhase(gameId);
         } else {
-          // Passa il turno all'avversario
+          // Pass the turn to the opponent
           game.currentTurn = opponent.id;
           console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
           startTurnTimer(gameId, opponent.id);
         }
+        console.log(`Emitting gameState to room ${gameId} with new currentTurn: ${game.currentTurn}, pot: ${game.pot}`);
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      }
+    } else if (move === 'call') {
+      const amountToCall = game.currentBet - currentPlayerBet;
+      game.pot += amountToCall;
+      game.playerBets[playerAddress] = game.currentBet;
+      game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
+      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} SOL.`;
+
+      game.currentTurn = opponent.id;
+      console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
+      if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+        game.bettingRoundComplete = true;
+        advanceGamePhase(gameId);
+      } else {
+        startTurnTimer(gameId, opponent.id);
+      }
+      console.log(`Emitting gameState to room ${gameId} with new currentTurn: ${game.currentTurn}, pot: ${game.pot}`);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } else if (move === 'bet' || move === 'raise') {
+      const newBet = move === 'bet' ? amount : game.currentBet + amount;
+      if (newBet <= game.currentBet) {
+        game.message = 'The bet must be higher than the current bet!';
+        game.dealerMessage = 'The dealer warns: Bet must be higher than the current bet!';
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+        return;
       }
       const additionalBet = newBet - currentPlayerBet;
       game.pot += additionalBet;
@@ -274,9 +280,11 @@ io.on('connection', (socket) => {
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
 
       game.currentTurn = opponent.id;
-      console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
+      console.log(`Turn passed to opponent after ${move}: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
       game.bettingRoundComplete = false;
+      console.log(`Starting turn timer for opponent after ${move}: ${opponent.id}`);
       startTurnTimer(gameId, opponent.id);
+      console.log(`Emitting gameState to room ${gameId} with new currentTurn: ${game.currentTurn}, pot: ${game.pot}`);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }
   });
@@ -305,7 +313,7 @@ io.on('connection', (socket) => {
           game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
 
-          // Non trasferiamo SOL, semplicemente emettiamo l'evento di vincita
+          // Emit the winnings event without transferring SOL
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
 
           await updateLeaderboard(opponent.address, game.pot);
@@ -475,12 +483,11 @@ const drawCard = () => {
   };
 };
 
-
 const advanceGamePhase = (gameId) => {
   const game = games[gameId];
   if (!game) return;
 
-  // Determina chi ha fatto l'ultima mossa (il giocatore che ha fatto "Check")
+  // Determine who made the last move (the player who checked)
   const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
   const nextPlayer = game.players.find(p => p.id === game.currentTurn);
 
@@ -494,7 +501,7 @@ const advanceGamePhase = (gameId) => {
       game.gamePhase = 'flop';
       game.message = 'Flop: Place your bets.';
       game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${nextPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = nextPlayer.id; // Passa il turno all'altro giocatore
+      game.currentTurn = nextPlayer.id; // Pass the turn to the other player
       game.bettingRoundComplete = false;
       game.currentBet = 0;
       game.playerBets[lastPlayer.address] = 0;
@@ -513,7 +520,7 @@ const advanceGamePhase = (gameId) => {
       game.gamePhase = 'turn';
       game.message = 'Turn: Place your bets.';
       game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${nextPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = nextPlayer.id; // Passa il turno all'altro giocatore
+      game.currentTurn = nextPlayer.id; // Pass the turn to the other player
       game.bettingRoundComplete = false;
       game.currentBet = 0;
       game.playerBets[lastPlayer.address] = 0;
@@ -532,7 +539,7 @@ const advanceGamePhase = (gameId) => {
       game.gamePhase = 'river';
       game.message = 'River: Place your bets.';
       game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${nextPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = nextPlayer.id; // Passa il turno all'altro giocatore
+      game.currentTurn = nextPlayer.id; // Pass the turn to the other player
       game.bettingRoundComplete = false;
       game.currentBet = 0;
       game.playerBets[lastPlayer.address] = 0;
@@ -546,7 +553,6 @@ const advanceGamePhase = (gameId) => {
     endGame(gameId);
   }
 };
-
 
 const getCombinations = (array, k) => {
   const result = [];
