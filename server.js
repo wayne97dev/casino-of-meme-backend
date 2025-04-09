@@ -333,10 +333,7 @@ const startTurnTimer = async (gameId, playerId) => {
       game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
       game.dealerMessage = 'The dealer announces: A player is no longer available.';
       io.to(gameId).emit('gameState', removeCircularReferences(game));
-
-      // Non trasferiamo SOL, semplicemente emettiamo l'evento di vincita
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-
       await updateLeaderboard(opponent.address, game.pot).then(() => {
         delete games[gameId];
       });
@@ -348,6 +345,7 @@ const startTurnTimer = async (gameId, playerId) => {
   game.timeLeft = 30;
 
   if (game.turnTimer) {
+    console.log(`Clearing previous timer for game ${gameId}`);
     clearInterval(game.turnTimer);
   }
 
@@ -377,10 +375,7 @@ const startTurnTimer = async (gameId, playerId) => {
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
           game.dealerMessage = 'The dealer announces: A player is no longer available.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
-
-          // Non trasferiamo SOL, semplicemente emettiamo l'evento di vincita
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-
           await updateLeaderboard(opponent.address, game.pot).then(() => {
             delete games[gameId];
           });
@@ -403,10 +398,7 @@ const startTurnTimer = async (gameId, playerId) => {
         game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
         game.dealerMessage = 'The dealer announces: A player timed out and folded.';
         io.to(gameId).emit('gameState', removeCircularReferences(game));
-
-        // Non trasferiamo SOL, semplicemente emettiamo l'evento di vincita
         io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-
         await updateLeaderboard(opponent.address, game.pot).then(() => {
           delete games[gameId];
         });
