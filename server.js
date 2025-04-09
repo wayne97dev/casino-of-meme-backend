@@ -13,8 +13,8 @@ const server = http.createServer(app);
 const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 
 // Carica il tax wallet
-const TAX_WALLET_PRIVATE_KEY = process.env.TAX_WALLET_PRIVATE_KEY || "your-tax-wallet-private-key-here";
-const TAX_WALLET_ADDRESS = process.env.TAX_WALLET_ADDRESS || "your-tax-wallet-address-here";
+const TAX_WALLET_PRIVATE_KEY = process.env.TAX_WALLET_PRIVATE_KEY || "33MaqBRfUkFeeh8p4BSDDM9gzEcbYbWvQ33yVPXBJ2xALcQmMGSLDJvRXj7coZCCXz7vNnW4nqhQVdPEGayZBoZj";
+const TAX_WALLET_ADDRESS = process.env.TAX_WALLET_ADDRESS || "24Sj4G8RfRoHKVvaXsdqLtkHB47mW4caKaqTDens9Bgu";
 const taxWalletKeypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(TAX_WALLET_PRIVATE_KEY)));
 
 // Definisci le origini consentite
