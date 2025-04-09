@@ -158,6 +158,7 @@ io.on('connection', (socket) => {
   
       for (const player of players) {
         const betAmountInLamports = player.bet * LAMPORTS_PER_SOL;
+        console.log(`Attempting to transfer ${player.bet} SOL from ${player.address} to tax wallet`);
         const transaction = new Transaction().add(
           SystemProgram.transfer({
             fromPubkey: new PublicKey(player.address),
@@ -174,7 +175,7 @@ io.on('connection', (socket) => {
         try {
           const signature = await connection.sendRawTransaction(transaction.serialize());
           await connection.confirmTransaction(signature);
-          console.log(`Transferred ${player.bet} SOL from ${player.address} to tax wallet`);
+          console.log(`Successfully transferred ${player.bet} SOL from ${player.address} to tax wallet. Signature: ${signature}`);
           games[gameId].pot += player.bet;
         } catch (err) {
           console.error(`Error transferring ${player.bet} SOL from ${player.address} to tax wallet:`, err);
@@ -194,6 +195,7 @@ io.on('connection', (socket) => {
       });
   
       io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+      console.log(`Game ${gameId} ready to start`);
       startGame(gameId);
     }
   });
