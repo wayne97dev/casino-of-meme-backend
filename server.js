@@ -250,15 +250,41 @@ const startTurnTimer = (gameId, playerId) => {
   io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
   console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
 
+  // Verifica i client nella room
+  const clientsInRoom = io.sockets.adapter.rooms.get(gameId);
+  console.log(`Clients in room ${gameId}:`, clientsInRoom ? Array.from(clientsInRoom) : 'No clients');
+
   game.turnTimer = setInterval(() => {
     try {
       if (!games[gameId]) {
+        console.log(`Game ${gameId} no longer exists, stopping timer`);
         clearInterval(game.turnTimer);
         return;
       }
 
       game.timeLeft -= 1;
-      console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}`);
+      console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}, currentTurn = ${game.currentTurn}`);
+
+      // Verifica che il client con currentTurn sia ancora connesso
+      const playerSocket = io.sockets.sockets.get(game.currentTurn);
+      if (!playerSocket || !playerSocket.rooms.has(gameId)) {
+        console.error(`Player with socket.id ${game.currentTurn} is not connected or not in room ${gameId}`);
+        const opponent = game.players.find(p => p.id !== game.currentTurn);
+        if (opponent) {
+          game.status = 'finished';
+          game.opponentCardsVisible = true;
+          game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
+          game.dealerMessage = 'The dealer announces: A player is no longer available.';
+          io.to(gameId).emit('gameState', game);
+          io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+          updateLeaderboard(opponent.address, game.pot).then(() => {
+            delete games[gameId];
+          });
+        }
+        clearInterval(game.turnTimer);
+        return;
+      }
+
       io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
 
       if (game.timeLeft <= 0) {
