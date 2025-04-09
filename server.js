@@ -15,6 +15,20 @@ app.use(cors({
   credentials: true,
 }));
 
+// Aggiungi un middleware manuale per gestire CORS e loggare le richieste
+app.use((req, res, next) => {
+  console.log(`Received request: ${req.method} ${req.url} from origin: ${req.headers.origin}`);
+  res.header('Access-Control-Allow-Origin', 'https://casino-of-meme.vercel.app');
+  res.header('Access-Control-Allow-Methods', 'GET, POST');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') {
+    console.log('Handling CORS preflight request');
+    return res.status(200).json({});
+  }
+  next();
+});
+
 // Configura Socket.IO con CORS
 const io = new Server(server, {
   cors: {
