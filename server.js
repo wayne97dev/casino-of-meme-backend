@@ -3,24 +3,31 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const Player = require('./models/Player');
 
 const app = express();
 const server = http.createServer(app);
 
+// Configura la connessione a Solana (usa il cluster appropriato, es. devnet o mainnet)
+const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+
+// Carica il tax wallet
+const TAX_WALLET_PRIVATE_KEY = process.env.TAX_WALLET_PRIVATE_KEY || "your-tax-wallet-private-key-here";
+const TAX_WALLET_ADDRESS = process.env.TAX_WALLET_ADDRESS || "your-tax-wallet-address-here";
+const taxWalletKeypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(TAX_WALLET_PRIVATE_KEY)));
+
 // Definisci le origini consentite
 const allowedOrigins = [
   'https://casino-of-meme.vercel.app',
-  'http://localhost:5173', // Aggiungi l'origine del frontend locale
-  'http://localhost:3000', // Aggiungi altre origini locali se necessario
+  'http://localhost:5173',
+  'http://localhost:3000',
 ];
 
 // Configura il middleware CORS per tutte le richieste
 app.use(cors({
   origin: (origin, callback) => {
-    // Consenti richieste senza origine (es. richieste dirette dal server)
     if (!origin) return callback(null, true);
-    // Controlla se l'origine è consentita
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     } else {
@@ -36,7 +43,10 @@ app.use((req, res, next) => {
   const origin = req.headers.origin;
   console.log(`Received request: ${req.method} ${req.url} from origin: ${origin}`);
   if (allowedOrigins.includes(origin)) {
+    console.log(`Allowing origin: ${origin}`);
     res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    console.log(`Origin ${origin} not allowed by CORS`);
   }
   res.header('Access-Control-Allow-Methods', 'GET, POST');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
@@ -135,6 +145,34 @@ io.on('connection', (socket) => {
         timeLeft: 30,
       };
 
+      // Trasferisci le puntate al tax wallet
+      for (const player of players) {
+        const betAmountInLamports = player.bet * LAMPORTS_PER_SOL;
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: new PublicKey(player.address),
+            toPubkey: new PublicKey(TAX_WALLET_ADDRESS),
+            lamports: betAmountInLamports,
+          })
+        );
+
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = taxWalletKeypair.publicKey;
+        transaction.sign(taxWalletKeypair);
+
+        try {
+          const signature = await connection.sendRawTransaction(transaction.serialize());
+          await connection.confirmTransaction(signature);
+          console.log(`Transferred ${player.bet} SOL from ${player.address} to tax wallet`);
+          games[gameId].pot += player.bet;
+        } catch (err) {
+          console.error(`Error transferring ${player.bet} SOL from ${player.address} to tax wallet:`, err);
+          socket.emit('error', { message: `Failed to transfer ${player.bet} SOL to tax wallet. Contact support.` });
+          return;
+        }
+      }
+
       players.forEach(player => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
@@ -178,12 +216,12 @@ io.on('connection', (socket) => {
       console.log(`Invalid move attempt: game ${gameId}, currentTurn ${game.currentTurn}, socket.id ${socket.id}`);
       return;
     }
-  
+
     if (game.turnTimer) {
       clearInterval(game.turnTimer);
     }
     game.timeLeft = 30;
-  
+
     const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
     if (!playerAddress || !opponent) {
@@ -192,16 +230,42 @@ io.on('connection', (socket) => {
       return;
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
-  
+    const opponentBet = game.playerBets[opponent.address] || 0;
+
     console.log(`Player ${playerAddress} made move: ${move}, amount: ${amount}`);
-  
+
     if (move === 'fold') {
       game.status = 'finished';
       game.opponentCardsVisible = true;
       game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
       game.dealerMessage = 'The dealer announces the winner!';
       io.to(gameId).emit('gameState', removeCircularReferences(game));
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+
+      // Trasferisci il pot dal tax wallet al vincitore
+      const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: taxWalletKeypair.publicKey,
+          toPubkey: new PublicKey(opponent.address),
+          lamports: winAmountInLamports,
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = taxWalletKeypair.publicKey;
+      transaction.sign(taxWalletKeypair);
+
+      try {
+        const signature = await connection.sendRawTransaction(transaction.serialize());
+        await connection.confirmTransaction(signature);
+        console.log(`Transferred ${game.pot} SOL from tax wallet to ${opponent.address}`);
+        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+      } catch (err) {
+        console.error(`Error transferring ${game.pot} SOL from tax wallet to ${opponent.address}:`, err);
+        io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Contact support.` });
+      }
+
       await updateLeaderboard(opponent.address, game.pot);
       delete games[gameId];
     } else if (move === 'check') {
@@ -212,7 +276,7 @@ io.on('connection', (socket) => {
       } else {
         game.message = 'You checked.';
         game.dealerMessage = 'The dealer says: Player checked.';
-        game.currentTurn = opponent.id; // Passa il turno all'avversario
+        game.currentTurn = opponent.id;
         console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
@@ -228,7 +292,33 @@ io.on('connection', (socket) => {
       game.playerBets[playerAddress] = game.currentBet;
       game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} SOL.`;
-      game.currentTurn = opponent.id; // Passa il turno all'avversario
+
+      // Trasferisci l'importo al tax wallet
+      const amountInLamports = amountToCall * LAMPORTS_PER_SOL;
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: new PublicKey(playerAddress),
+          toPubkey: taxWalletKeypair.publicKey,
+          lamports: amountInLamports,
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = taxWalletKeypair.publicKey;
+      transaction.sign(taxWalletKeypair);
+
+      try {
+        const signature = await connection.sendRawTransaction(transaction.serialize());
+        await connection.confirmTransaction(signature);
+        console.log(`Transferred ${amountToCall} SOL from ${playerAddress} to tax wallet`);
+      } catch (err) {
+        console.error(`Error transferring ${amountToCall} SOL from ${playerAddress} to tax wallet:`, err);
+        socket.emit('error', { message: `Failed to transfer ${amountToCall} SOL to tax wallet. Contact support.` });
+        return;
+      }
+
+      game.currentTurn = opponent.id;
       console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
       if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
@@ -251,7 +341,33 @@ io.on('connection', (socket) => {
       game.currentBet = newBet;
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
-      game.currentTurn = opponent.id; // Passa il turno all'avversario
+
+      // Trasferisci l'importo al tax wallet
+      const amountInLamports = additionalBet * LAMPORTS_PER_SOL;
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: new PublicKey(playerAddress),
+          toPubkey: taxWalletKeypair.publicKey,
+          lamports: amountInLamports,
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = taxWalletKeypair.publicKey;
+      transaction.sign(taxWalletKeypair);
+
+      try {
+        const signature = await connection.sendRawTransaction(transaction.serialize());
+        await connection.confirmTransaction(signature);
+        console.log(`Transferred ${additionalBet} SOL from ${playerAddress} to tax wallet`);
+      } catch (err) {
+        console.error(`Error transferring ${additionalBet} SOL from ${playerAddress} to tax wallet:`, err);
+        socket.emit('error', { message: `Failed to transfer ${additionalBet} SOL to tax wallet. Contact support.` });
+        return;
+      }
+
+      game.currentTurn = opponent.id;
       console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
       game.bettingRoundComplete = false;
       startTurnTimer(gameId, opponent.id);
@@ -282,7 +398,32 @@ io.on('connection', (socket) => {
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
           game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
-          io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+
+          // Trasferisci il pot dal tax wallet al vincitore
+          const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
+          const transaction = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: taxWalletKeypair.publicKey,
+              toPubkey: new PublicKey(opponent.address),
+              lamports: winAmountInLamports,
+            })
+          );
+
+          const { blockhash } = await connection.getLatestBlockhash();
+          transaction.recentBlockhash = blockhash;
+          transaction.feePayer = taxWalletKeypair.publicKey;
+          transaction.sign(taxWalletKeypair);
+
+          try {
+            const signature = await connection.sendRawTransaction(transaction.serialize());
+            await connection.confirmTransaction(signature);
+            console.log(`Transferred ${game.pot} SOL from tax wallet to ${opponent.address}`);
+            io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+          } catch (err) {
+            console.error(`Error transferring ${game.pot} SOL from tax wallet to ${opponent.address}:`, err);
+            io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Contact support.` });
+          }
+
           await updateLeaderboard(opponent.address, game.pot);
         }
         delete games[gameId];
@@ -291,7 +432,7 @@ io.on('connection', (socket) => {
   });
 });
 
-const startTurnTimer = (gameId, playerId) => {
+const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
   const game = games[gameId];
   if (!game) {
     console.error(`Game ${gameId} not found in startTurnTimer`);
@@ -308,8 +449,48 @@ const startTurnTimer = (gameId, playerId) => {
       game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
       game.dealerMessage = 'The dealer announces: A player is no longer available.';
       io.to(gameId).emit('gameState', removeCircularReferences(game));
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-      updateLeaderboard(opponent.address, game.pot).then(() => {
+
+      // Trasferisci il pot dal tax wallet al vincitore
+      const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
+
+      // Verifica il saldo del tax wallet
+      let taxWalletBalance;
+      try {
+        taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
+        if (taxWalletBalance < winAmountInLamports + 5000) { // 5000 lamports per le commissioni
+          throw new Error('Insufficient funds in tax wallet');
+        }
+      } catch (err) {
+        console.error(`Error checking tax wallet balance:`, err);
+        io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Insufficient funds in tax wallet.` });
+        return;
+      }
+
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: taxWalletKeypair.publicKey,
+          toPubkey: new PublicKey(opponent.address),
+          lamports: winAmountInLamports,
+        })
+      );
+
+      try {
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = taxWalletKeypair.publicKey;
+        transaction.sign(taxWalletKeypair);
+
+        const signature = await connection.sendRawTransaction(transaction.serialize());
+        await connection.confirmTransaction(signature);
+        console.log(`Transferred ${game.pot} SOL from tax wallet to ${opponent.address}`);
+        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+      } catch (err) {
+        console.error(`Error transferring ${game.pot} SOL from tax wallet to ${opponent.address}:`, err);
+        io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Contact support.` });
+        return;
+      }
+
+      await updateLeaderboard(opponent.address, game.pot).then(() => {
         delete games[gameId];
       });
     }
@@ -330,11 +511,11 @@ const startTurnTimer = (gameId, playerId) => {
   const clientsInRoom = io.sockets.adapter.rooms.get(gameId);
   console.log(`Clients in room ${gameId}:`, clientsInRoom ? Array.from(clientsInRoom) : 'No clients');
 
-  game.turnTimer = setInterval(() => {
+  // Funzione ricorsiva per gestire il timer
+  const runTimer = async () => {
     try {
       if (!games[gameId]) {
         console.log(`Game ${gameId} no longer exists, stopping timer`);
-        clearInterval(game.turnTimer);
         return;
       }
 
@@ -352,19 +533,57 @@ const startTurnTimer = (gameId, playerId) => {
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
           game.dealerMessage = 'The dealer announces: A player is no longer available.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
-          io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-          updateLeaderboard(opponent.address, game.pot).then(() => {
+
+          // Trasferisci il pot dal tax wallet al vincitore
+          const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
+
+          // Verifica il saldo del tax wallet
+          let taxWalletBalance;
+          try {
+            taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
+            if (taxWalletBalance < winAmountInLamports + 5000) {
+              throw new Error('Insufficient funds in tax wallet');
+            }
+          } catch (err) {
+            console.error(`Error checking tax wallet balance:`, err);
+            io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Insufficient funds in tax wallet.` });
+            return;
+          }
+
+          const transaction = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: taxWalletKeypair.publicKey,
+              toPubkey: new PublicKey(opponent.address),
+              lamports: winAmountInLamports,
+            })
+          );
+
+          try {
+            const { blockhash } = await connection.getLatestBlockhash();
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = taxWalletKeypair.publicKey;
+            transaction.sign(taxWalletKeypair);
+
+            const signature = await connection.sendRawTransaction(transaction.serialize());
+            await connection.confirmTransaction(signature);
+            console.log(`Transferred ${game.pot} SOL from tax wallet to ${opponent.address}`);
+            io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+          } catch (err) {
+            console.error(`Error transferring ${game.pot} SOL from tax wallet to ${opponent.address}:`, err);
+            io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Contact support.` });
+            return;
+          }
+
+          await updateLeaderboard(opponent.address, game.pot).then(() => {
             delete games[gameId];
           });
         }
-        clearInterval(game.turnTimer);
         return;
       }
 
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
 
       if (game.timeLeft <= 0) {
-        clearInterval(game.turnTimer);
         const playerAddress = game.players.find(p => p.id === playerId)?.address;
         const opponent = game.players.find(p => p.id !== playerId);
         if (!playerAddress || !opponent) {
@@ -377,16 +596,61 @@ const startTurnTimer = (gameId, playerId) => {
         game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
         game.dealerMessage = 'The dealer announces: A player timed out and folded.';
         io.to(gameId).emit('gameState', removeCircularReferences(game));
-        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-        updateLeaderboard(opponent.address, game.pot).then(() => {
+
+        // Trasferisci il pot dal tax wallet al vincitore
+        const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
+
+        // Verifica il saldo del tax wallet
+        let taxWalletBalance;
+        try {
+          taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
+          if (taxWalletBalance < winAmountInLamports + 5000) {
+            throw new Error('Insufficient funds in tax wallet');
+          }
+        } catch (err) {
+          console.error(`Error checking tax wallet balance:`, err);
+          io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Insufficient funds in tax wallet.` });
+          return;
+        }
+
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: taxWalletKeypair.publicKey,
+            toPubkey: new PublicKey(opponent.address),
+            lamports: winAmountInLamports,
+          })
+        );
+
+        try {
+          const { blockhash } = await connection.getLatestBlockhash();
+          transaction.recentBlockhash = blockhash;
+          transaction.feePayer = taxWalletKeypair.publicKey;
+          transaction.sign(taxWalletKeypair);
+
+          const signature = await connection.sendRawTransaction(transaction.serialize());
+          await connection.confirmTransaction(signature);
+          console.log(`Transferred ${game.pot} SOL from tax wallet to ${opponent.address}`);
+          io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+        } catch (err) {
+          console.error(`Error transferring ${game.pot} SOL from tax wallet to ${opponent.address}:`, err);
+          io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${opponent.address}. Contact support.` });
+          return;
+        }
+
+        await updateLeaderboard(opponent.address, game.pot).then(() => {
           delete games[gameId];
         });
+      } else {
+        // Continua il timer
+        game.turnTimer = setTimeout(runTimer, 1000);
       }
     } catch (err) {
       console.error(`Error in turn timer for game ${gameId}:`, err);
-      clearInterval(game.turnTimer);
     }
-  }, 1000);
+  };
+
+  // Avvia il timer
+  game.turnTimer = setTimeout(runTimer, 1000);
 };
 
 const startGame = (gameId) => {
@@ -649,6 +913,7 @@ const endGame = async (gameId) => {
   console.log(`Player 2 evaluation:`, player2Evaluation);
 
   let winner;
+  let isTie = false;
   if (player1Evaluation.rank > player2Evaluation.rank) {
     winner = player1;
     game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
@@ -675,17 +940,132 @@ const endGame = async (gameId) => {
       }
     }
     if (!tieBreaker) {
+      isTie = true;
       game.message = "It's a tie! The pot is split.";
       game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
-      winner = player1;
     }
   }
 
   game.status = 'finished';
   game.opponentCardsVisible = true;
   io.to(gameId).emit('gameState', removeCircularReferences(game));
-  io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
-  await updateLeaderboard(winner.address, game.pot);
+
+  if (isTie) {
+    // Dividi il pot equamente tra i due giocatori
+    const splitAmount = game.pot / 2;
+    const splitAmountInLamports = splitAmount * LAMPORTS_PER_SOL;
+
+    // Verifica il saldo del tax wallet
+    let taxWalletBalance;
+    try {
+      taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
+      if (taxWalletBalance < (splitAmountInLamports * 2) + 10000) { // 10000 lamports per le commissioni di entrambe le transazioni
+        throw new Error('Insufficient funds in tax wallet');
+      }
+    } catch (err) {
+      console.error(`Error checking tax wallet balance:`, err);
+      io.to(gameId).emit('error', { message: `Failed to distribute winnings. Insufficient funds in tax wallet.` });
+      return;
+    }
+
+    // Trasferisci metà del pot a player1
+    const transaction1 = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: taxWalletKeypair.publicKey,
+        toPubkey: new PublicKey(player1.address),
+        lamports: splitAmountInLamports,
+      })
+    );
+
+    try {
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction1.recentBlockhash = blockhash;
+      transaction1.feePayer = taxWalletKeypair.publicKey;
+      transaction1.sign(taxWalletKeypair);
+
+      const signature1 = await connection.sendRawTransaction(transaction1.serialize());
+      await connection.confirmTransaction(signature1);
+      console.log(`Transferred ${splitAmount} SOL from tax wallet to ${player1.address}`);
+    } catch (err) {
+      console.error(`Error transferring ${splitAmount} SOL from tax wallet to ${player1.address}:`, err);
+      io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${player1.address}. Contact support.` });
+      return;
+    }
+
+    // Trasferisci metà del pot a player2
+    const transaction2 = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: taxWalletKeypair.publicKey,
+        toPubkey: new PublicKey(player2.address),
+        lamports: splitAmountInLamports,
+      })
+    );
+
+    try {
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction2.recentBlockhash = blockhash;
+      transaction2.feePayer = taxWalletKeypair.publicKey;
+      transaction2.sign(taxWalletKeypair);
+
+      const signature2 = await connection.sendRawTransaction(transaction2.serialize());
+      await connection.confirmTransaction(signature2);
+      console.log(`Transferred ${splitAmount} SOL from tax wallet to ${player2.address}`);
+    } catch (err) {
+      console.error(`Error transferring ${splitAmount} SOL from tax wallet to ${player2.address}:`, err);
+      io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${player2.address}. Contact support.` });
+      return;
+    }
+
+    // Emetti l'evento distributeWinnings per entrambi i giocatori
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount });
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount });
+
+    await updateLeaderboard(player1.address, splitAmount);
+    await updateLeaderboard(player2.address, splitAmount);
+  } else {
+    // Trasferisci il pot dal tax wallet al vincitore
+    const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
+
+    // Verifica il saldo del tax wallet
+    let taxWalletBalance;
+    try {
+      taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
+      if (taxWalletBalance < winAmountInLamports + 5000) { // 5000 lamports per le commissioni
+        throw new Error('Insufficient funds in tax wallet');
+      }
+    } catch (err) {
+      console.error(`Error checking tax wallet balance:`, err);
+      io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${winner.address}. Insufficient funds in tax wallet.` });
+      return;
+    }
+
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: taxWalletKeypair.publicKey,
+        toPubkey: new PublicKey(winner.address),
+        lamports: winAmountInLamports,
+      })
+    );
+
+    try {
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = taxWalletKeypair.publicKey;
+      transaction.sign(taxWalletKeypair);
+
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log(`Transferred ${game.pot} SOL from tax wallet to ${winner.address}`);
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
+    } catch (err) {
+      console.error(`Error transferring ${game.pot} SOL from tax wallet to ${winner.address}:`, err);
+      io.to(gameId).emit('error', { message: `Failed to distribute winnings to ${winner.address}. Contact support.` });
+      return;
+    }
+
+    await updateLeaderboard(winner.address, game.pot);
+  }
+
   delete games[gameId];
 };
 
@@ -707,7 +1087,6 @@ const updateLeaderboard = async (playerAddress, winnings) => {
     console.error('Error stack:', err.stack);
   }
 };
-
 
 app.get('/leaderboard', async (req, res) => {
   console.log('Received request for /leaderboard');
