@@ -8,17 +8,36 @@ const Player = require('./models/Player');
 const app = express();
 const server = http.createServer(app);
 
+// Definisci le origini consentite
+const allowedOrigins = [
+  'https://casino-of-meme.vercel.app',
+  'http://localhost:5173', // Aggiungi l'origine del frontend locale
+  'http://localhost:3000', // Aggiungi altre origini locali se necessario
+];
+
 // Configura il middleware CORS per tutte le richieste
 app.use(cors({
-  origin: 'https://casino-of-meme.vercel.app',
+  origin: (origin, callback) => {
+    // Consenti richieste senza origine (es. richieste dirette dal server)
+    if (!origin) return callback(null, true);
+    // Controlla se l'origine è consentita
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST'],
   credentials: true,
 }));
 
 // Aggiungi un middleware manuale per gestire CORS e loggare le richieste
 app.use((req, res, next) => {
-  console.log(`Received request: ${req.method} ${req.url} from origin: ${req.headers.origin}`);
-  res.header('Access-Control-Allow-Origin', 'https://casino-of-meme.vercel.app');
+  const origin = req.headers.origin;
+  console.log(`Received request: ${req.method} ${req.url} from origin: ${origin}`);
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   res.header('Access-Control-Allow-Credentials', 'true');
@@ -32,7 +51,14 @@ app.use((req, res, next) => {
 // Configura Socket.IO con CORS
 const io = new Server(server, {
   cors: {
-    origin: 'https://casino-of-meme.vercel.app',
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      } else {
+        return callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -50,6 +76,27 @@ mongoose.connect(MONGODB_URI)
 // Stato dei giochi
 const games = {};
 const waitingPlayers = [];
+
+// Funzione per rimuovere i riferimenti circolari
+const removeCircularReferences = (obj, seen = new WeakSet()) => {
+  if (obj && typeof obj === 'object') {
+    if (seen.has(obj)) {
+      return undefined; // Riferimento circolare trovato, lo rimuoviamo
+    }
+    seen.add(obj);
+    if (Array.isArray(obj)) {
+      return obj.map(item => removeCircularReferences(item, seen));
+    }
+    const result = {};
+    for (const key in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        result[key] = removeCircularReferences(obj[key], seen);
+      }
+    }
+    return result;
+  }
+  return obj;
+};
 
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
@@ -116,7 +163,7 @@ io.on('connection', (socket) => {
           game.currentTurn = socket.id;
           console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
         }
-        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } else {
         console.error(`Player ${playerAddress} not found in game ${gameId}`);
       }
@@ -131,12 +178,12 @@ io.on('connection', (socket) => {
       console.log(`Invalid move attempt: game ${gameId}, currentTurn ${game.currentTurn}, socket.id ${socket.id}`);
       return;
     }
-
+  
     if (game.turnTimer) {
       clearInterval(game.turnTimer);
     }
     game.timeLeft = 30;
-
+  
     const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
     if (!playerAddress || !opponent) {
@@ -145,15 +192,15 @@ io.on('connection', (socket) => {
       return;
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
-
+  
     console.log(`Player ${playerAddress} made move: ${move}, amount: ${amount}`);
-
+  
     if (move === 'fold') {
       game.status = 'finished';
       game.opponentCardsVisible = true;
       game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
       game.dealerMessage = 'The dealer announces the winner!';
-      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
       await updateLeaderboard(opponent.address, game.pot);
       delete games[gameId];
@@ -161,19 +208,19 @@ io.on('connection', (socket) => {
       if (game.currentBet > currentPlayerBet) {
         game.message = 'You cannot check, you must call or raise!';
         game.dealerMessage = 'The dealer reminds: You must call or raise!';
-        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } else {
         game.message = 'You checked.';
         game.dealerMessage = 'The dealer says: Player checked.';
-        game.currentTurn = opponent.id;
-        console.log(`Turn passed to opponent: ${opponent.id}`);
+        game.currentTurn = opponent.id; // Passa il turno all'avversario
+        console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
           advanceGamePhase(gameId);
         } else {
           startTurnTimer(gameId, opponent.id);
         }
-        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       }
     } else if (move === 'call') {
       const amountToCall = game.currentBet - currentPlayerBet;
@@ -181,21 +228,21 @@ io.on('connection', (socket) => {
       game.playerBets[playerAddress] = game.currentBet;
       game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} SOL.`;
-      game.currentTurn = opponent.id;
-      console.log(`Turn passed to opponent: ${opponent.id}`);
+      game.currentTurn = opponent.id; // Passa il turno all'avversario
+      console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
       if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         advanceGamePhase(gameId);
       } else {
         startTurnTimer(gameId, opponent.id);
       }
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     } else if (move === 'bet' || move === 'raise') {
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
       if (newBet <= game.currentBet) {
         game.message = 'The bet must be higher than the current bet!';
         game.dealerMessage = 'The dealer warns: Bet must be higher than the current bet!';
-        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
         return;
       }
       const additionalBet = newBet - currentPlayerBet;
@@ -204,11 +251,11 @@ io.on('connection', (socket) => {
       game.currentBet = newBet;
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
-      game.currentTurn = opponent.id;
-      console.log(`Turn passed to opponent: ${opponent.id}`);
+      game.currentTurn = opponent.id; // Passa il turno all'avversario
+      console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
       game.bettingRoundComplete = false;
       startTurnTimer(gameId, opponent.id);
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }
   });
 
@@ -234,7 +281,7 @@ io.on('connection', (socket) => {
           game.opponentCardsVisible = true;
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
           game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
-          io.to(gameId).emit('gameState', game);
+          io.to(gameId).emit('gameState', removeCircularReferences(game));
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
           await updateLeaderboard(opponent.address, game.pot);
         }
@@ -260,7 +307,7 @@ const startTurnTimer = (gameId, playerId) => {
       game.opponentCardsVisible = true;
       game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
       game.dealerMessage = 'The dealer announces: A player is no longer available.';
-      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
       updateLeaderboard(opponent.address, game.pot).then(() => {
         delete games[gameId];
@@ -276,7 +323,7 @@ const startTurnTimer = (gameId, playerId) => {
     clearInterval(game.turnTimer);
   }
 
-  io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+  io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
   console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
 
   // Verifica i client nella room
@@ -304,7 +351,7 @@ const startTurnTimer = (gameId, playerId) => {
           game.opponentCardsVisible = true;
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
           game.dealerMessage = 'The dealer announces: A player is no longer available.';
-          io.to(gameId).emit('gameState', game);
+          io.to(gameId).emit('gameState', removeCircularReferences(game));
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
           updateLeaderboard(opponent.address, game.pot).then(() => {
             delete games[gameId];
@@ -314,7 +361,7 @@ const startTurnTimer = (gameId, playerId) => {
         return;
       }
 
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
 
       if (game.timeLeft <= 0) {
         clearInterval(game.turnTimer);
@@ -329,7 +376,7 @@ const startTurnTimer = (gameId, playerId) => {
         game.opponentCardsVisible = true;
         game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
         game.dealerMessage = 'The dealer announces: A player timed out and folded.';
-        io.to(gameId).emit('gameState', game);
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
         io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
         updateLeaderboard(opponent.address, game.pot).then(() => {
           delete games[gameId];
@@ -352,7 +399,7 @@ const startGame = (gameId) => {
 
   game.message = 'The dealer is dealing the cards...';
   game.dealerMessage = 'The dealer is dealing the cards to the players.';
-  io.to(gameId).emit('gameState', game);
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
 
   setTimeout(() => {
     try {
@@ -376,12 +423,12 @@ const startGame = (gameId) => {
       console.log(`Player 0 socket.id: ${game.players[0].id}, Player 1 socket.id: ${game.players[1].id}`);
 
       startTurnTimer(gameId, game.players[0].id);
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     } catch (err) {
       console.error(`Error in startGame ${gameId}:`, err);
       game.message = 'Error starting game. Please try again.';
       game.status = 'waiting';
-      io.to(gameId).emit('gameState', game);
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
     }
   }, 1000);
 };
@@ -411,7 +458,7 @@ const advanceGamePhase = (gameId) => {
   if (game.gamePhase === 'pre-flop') {
     game.message = 'The dealer is dealing the Flop...';
     game.dealerMessage = 'The dealer is dealing the Flop cards.';
-    io.to(gameId).emit('gameState', game);
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
     setTimeout(() => {
       const newCards = Array(3).fill().map(() => drawCard());
       game.tableCards = newCards;
@@ -424,12 +471,12 @@ const advanceGamePhase = (gameId) => {
       game.playerBets[game.players[0].address] = 0;
       game.playerBets[game.players[1].address] = 0;
       startTurnTimer(gameId, game.players[0].id);
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }, 1000);
   } else if (game.gamePhase === 'flop') {
     game.message = 'The dealer is dealing the Turn...';
     game.dealerMessage = 'The dealer is dealing the Turn card.';
-    io.to(gameId).emit('gameState', game);
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
     setTimeout(() => {
       const newCard = drawCard();
       game.tableCards.push(newCard);
@@ -442,12 +489,12 @@ const advanceGamePhase = (gameId) => {
       game.playerBets[game.players[0].address] = 0;
       game.playerBets[game.players[1].address] = 0;
       startTurnTimer(gameId, game.players[0].id);
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }, 1000);
   } else if (game.gamePhase === 'turn') {
     game.message = 'The dealer is dealing the River...';
     game.dealerMessage = 'The dealer is dealing the River card.';
-    io.to(gameId).emit('gameState', game);
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
     setTimeout(() => {
       const newCard = drawCard();
       game.tableCards.push(newCard);
@@ -460,7 +507,7 @@ const advanceGamePhase = (gameId) => {
       game.playerBets[game.players[0].address] = 0;
       game.playerBets[game.players[1].address] = 0;
       startTurnTimer(gameId, game.players[0].id);
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }, 1000);
   } else if (game.gamePhase === 'river') {
     game.gamePhase = 'showdown';
@@ -636,7 +683,7 @@ const endGame = async (gameId) => {
 
   game.status = 'finished';
   game.opponentCardsVisible = true;
-  io.to(gameId).emit('gameState', game);
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
   io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
   await updateLeaderboard(winner.address, game.pot);
   delete games[gameId];
