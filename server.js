@@ -7,15 +7,24 @@ const Player = require('./models/Player');
 
 const app = express();
 const server = http.createServer(app);
+
+// Configura il middleware CORS per tutte le richieste
+app.use(cors({
+  origin: 'https://casino-of-meme.vercel.app',
+  methods: ['GET', 'POST'],
+  credentials: true,
+}));
+
+// Configura Socket.IO con CORS
 const io = new Server(server, {
   cors: {
     origin: 'https://casino-of-meme.vercel.app',
     methods: ['GET', 'POST'],
+    credentials: true,
   },
 });
 
 // Middleware
-app.use(cors());
 app.use(express.json());
 
 // Connessione a MongoDB
@@ -123,6 +132,8 @@ io.on('connection', (socket) => {
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
 
+    console.log(`Player ${playerAddress} made move: ${move}, amount: ${amount}`);
+
     if (move === 'fold') {
       game.status = 'finished';
       game.opponentCardsVisible = true;
@@ -136,18 +147,20 @@ io.on('connection', (socket) => {
       if (game.currentBet > currentPlayerBet) {
         game.message = 'You cannot check, you must call or raise!';
         game.dealerMessage = 'The dealer reminds: You must call or raise!';
+        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
       } else {
         game.message = 'You checked.';
         game.dealerMessage = 'The dealer says: Player checked.';
         game.currentTurn = opponent.id;
+        console.log(`Turn passed to opponent: ${opponent.id}`);
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
           advanceGamePhase(gameId);
         } else {
           startTurnTimer(gameId, opponent.id);
         }
+        io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
       }
-      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
     } else if (move === 'call') {
       const amountToCall = game.currentBet - currentPlayerBet;
       game.pot += amountToCall;
@@ -155,6 +168,7 @@ io.on('connection', (socket) => {
       game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} SOL.`;
       game.currentTurn = opponent.id;
+      console.log(`Turn passed to opponent: ${opponent.id}`);
       if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         advanceGamePhase(gameId);
@@ -177,6 +191,7 @@ io.on('connection', (socket) => {
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
       game.currentTurn = opponent.id;
+      console.log(`Turn passed to opponent: ${opponent.id}`);
       game.bettingRoundComplete = false;
       startTurnTimer(gameId, opponent.id);
       io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
