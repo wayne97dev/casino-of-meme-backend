@@ -191,39 +191,57 @@ io.on('connection', (socket) => {
 
 // Funzione per avviare il timer del turno
 const startTurnTimer = (gameId, playerId) => {
-  const game = games[gameId];
-  if (!game) return;
-
-  game.currentTurn = playerId;
-  game.timeLeft = 30; // Imposta il timer a 30 secondi
-
-  // Invia lo stato iniziale con il tempo rimanente
-  io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
-
-  // Avvia il timer
-  const interval = setInterval(() => {
-    game.timeLeft -= 1;
-    io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
-
-    if (game.timeLeft <= 0) {
-      clearInterval(interval);
-      // Timeout: esegui un fold automatico per il giocatore
-      const playerAddress = game.players.find(p => p.id === playerId).address;
-      const opponent = game.players.find(p => p.id !== playerId);
-      game.status = 'finished';
-      game.opponentCardsVisible = true;
-      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
-      game.dealerMessage = 'The dealer announces: A player timed out and folded.';
-      io.to(gameId).emit('gameState', game);
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-      updateLeaderboard(opponent.address, game.pot).then(() => {
-        delete games[gameId];
-      });
+    const game = games[gameId];
+    if (!game) {
+      console.error(`Game ${gameId} not found in startTurnTimer`);
+      return;
     }
-  }, 1000);
+  
+    game.currentTurn = playerId;
+    game.timeLeft = 30;
+  
+    // Ferma qualsiasi timer precedente per evitare duplicati
+    if (game.turnTimer) {
+      clearInterval(game.turnTimer);
+    }
+  
+    // Invia lo stato iniziale
+    io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+    console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
+  
+    // Avvia il timer
+    game.turnTimer = setInterval(() => {
+      if (!games[gameId]) {
+        clearInterval(game.turnTimer);
+        return;
+      }
+  
+      game.timeLeft -= 1;
+      console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}`);
+      io.to(gameId).emit('gameState', { ...game, timeLeft: game.timeLeft });
+  
+      if (game.timeLeft <= 0) {
+        clearInterval(game.turnTimer);
+        const playerAddress = game.players.find(p => p.id === playerId)?.address;
+        const opponent = game.players.find(p => p.id !== playerId);
+        if (!playerAddress || !opponent) {
+          console.error(`Player or opponent not found in game ${gameId}`);
+          delete games[gameId];
+          return;
+        }
+        game.status = 'finished';
+        game.opponentCardsVisible = true;
+        game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
+        game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+        io.to(gameId).emit('gameState', game);
+        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+        updateLeaderboard(opponent.address, game.pot).then(() => {
+          delete games[gameId];
+        });
+      }
+    }, 1000);
+  };
 
-  game.turnTimer = interval;
-};
 
 // Funzione per avviare la partita
 const startGame = (gameId) => {
