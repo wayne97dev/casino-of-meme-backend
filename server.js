@@ -4,19 +4,26 @@ const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const bs58 = require('bs58'); // Deve essere qui
+const bs58 = require('bs58');
 const Player = require('./models/Player');
+require('dotenv').config(); // Aggiunto per caricare le variabili d'ambiente
 
 const app = express();
 const server = http.createServer(app);
 
+// Configura la connessione a Solana (usa il cluster appropriato, es. devnet o mainnet)
 const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 
-// Carica il tax wallet
-const TAX_WALLET_PRIVATE_KEY = process.env.TAX_WALLET_PRIVATE_KEY || "33MaqBRfUkFeeh8p4BSDDM9gzEcbYbWvQ33yVPXBJ2xALcQmMGSLDJvRXj7coZCCXz7vNnW4nqhQVdPEGayZBoZj";
+// Carica il tax wallet da variabili d'ambiente
+const TAX_WALLET_PRIVATE_KEY = process.env.TAX_WALLET_PRIVATE_KEY;
 const TAX_WALLET_ADDRESS = process.env.TAX_WALLET_ADDRESS || "24Sj4G8RfRoHKVvaXsdqLtkHB47mW4caKaqTDens9Bgu";
-const taxWalletKeypair = Keypair.fromSecretKey(bs58.decode(TAX_WALLET_PRIVATE_KEY));
 
+if (!TAX_WALLET_PRIVATE_KEY) {
+  console.error('Errore: TAX_WALLET_PRIVATE_KEY non definita nelle variabili d\'ambiente!');
+  process.exit(1);
+}
+
+const taxWalletKeypair = Keypair.fromSecretKey(bs58.decode(TAX_WALLET_PRIVATE_KEY));
 
 // Definisci le origini consentite
 const allowedOrigins = [
@@ -39,7 +46,7 @@ app.use(cors({
   credentials: true,
 }));
 
-// Aggiungi un middleware manuale per gestire CORS e loggare le richieste
+// Middleware manuale per gestire CORS e loggare le richieste
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   console.log(`Received request: ${req.method} ${req.url} from origin: ${origin}`);
@@ -433,7 +440,7 @@ io.on('connection', (socket) => {
   });
 });
 
-const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
+const startTurnTimer = async (gameId, playerId) => {
   const game = games[gameId];
   if (!game) {
     console.error(`Game ${gameId} not found in startTurnTimer`);
@@ -458,7 +465,7 @@ const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
       let taxWalletBalance;
       try {
         taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
-        if (taxWalletBalance < winAmountInLamports + 5000) { // 5000 lamports per le commissioni
+        if (taxWalletBalance < winAmountInLamports + 5000) {
           throw new Error('Insufficient funds in tax wallet');
         }
       } catch (err) {
@@ -508,11 +515,9 @@ const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
   io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
   console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
 
-  // Verifica i client nella room
   const clientsInRoom = io.sockets.adapter.rooms.get(gameId);
   console.log(`Clients in room ${gameId}:`, clientsInRoom ? Array.from(clientsInRoom) : 'No clients');
 
-  // Funzione ricorsiva per gestire il timer
   const runTimer = async () => {
     try {
       if (!games[gameId]) {
@@ -523,7 +528,6 @@ const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
       game.timeLeft -= 1;
       console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}, currentTurn = ${game.currentTurn}`);
 
-      // Verifica che il client con currentTurn sia ancora connesso
       const playerSocket = io.sockets.sockets.get(game.currentTurn);
       if (!playerSocket || !playerSocket.rooms.has(gameId)) {
         console.error(`Player with socket.id ${game.currentTurn} is not connected or not in room ${gameId}`);
@@ -535,10 +539,8 @@ const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
           game.dealerMessage = 'The dealer announces: A player is no longer available.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
 
-          // Trasferisci il pot dal tax wallet al vincitore
           const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
 
-          // Verifica il saldo del tax wallet
           let taxWalletBalance;
           try {
             taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
@@ -598,10 +600,8 @@ const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
         game.dealerMessage = 'The dealer announces: A player timed out and folded.';
         io.to(gameId).emit('gameState', removeCircularReferences(game));
 
-        // Trasferisci il pot dal tax wallet al vincitore
         const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
 
-        // Verifica il saldo del tax wallet
         let taxWalletBalance;
         try {
           taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
@@ -642,7 +642,6 @@ const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
           delete games[gameId];
         });
       } else {
-        // Continua il timer
         game.turnTimer = setTimeout(runTimer, 1000);
       }
     } catch (err) {
@@ -650,7 +649,6 @@ const startTurnTimer = async (gameId, playerId) => { // Aggiungi async qui
     }
   };
 
-  // Avvia il timer
   game.turnTimer = setTimeout(runTimer, 1000);
 };
 
@@ -952,15 +950,13 @@ const endGame = async (gameId) => {
   io.to(gameId).emit('gameState', removeCircularReferences(game));
 
   if (isTie) {
-    // Dividi il pot equamente tra i due giocatori
     const splitAmount = game.pot / 2;
     const splitAmountInLamports = splitAmount * LAMPORTS_PER_SOL;
 
-    // Verifica il saldo del tax wallet
     let taxWalletBalance;
     try {
       taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
-      if (taxWalletBalance < (splitAmountInLamports * 2) + 10000) { // 10000 lamports per le commissioni di entrambe le transazioni
+      if (taxWalletBalance < (splitAmountInLamports * 2) + 10000) {
         throw new Error('Insufficient funds in tax wallet');
       }
     } catch (err) {
@@ -969,7 +965,6 @@ const endGame = async (gameId) => {
       return;
     }
 
-    // Trasferisci metà del pot a player1
     const transaction1 = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: taxWalletKeypair.publicKey,
@@ -993,7 +988,6 @@ const endGame = async (gameId) => {
       return;
     }
 
-    // Trasferisci metà del pot a player2
     const transaction2 = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: taxWalletKeypair.publicKey,
@@ -1017,21 +1011,18 @@ const endGame = async (gameId) => {
       return;
     }
 
-    // Emetti l'evento distributeWinnings per entrambi i giocatori
     io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount });
     io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount });
 
     await updateLeaderboard(player1.address, splitAmount);
     await updateLeaderboard(player2.address, splitAmount);
   } else {
-    // Trasferisci il pot dal tax wallet al vincitore
     const winAmountInLamports = game.pot * LAMPORTS_PER_SOL;
 
-    // Verifica il saldo del tax wallet
     let taxWalletBalance;
     try {
       taxWalletBalance = await connection.getBalance(taxWalletKeypair.publicKey);
-      if (taxWalletBalance < winAmountInLamports + 5000) { // 5000 lamports per le commissioni
+      if (taxWalletBalance < winAmountInLamports + 5000) {
         throw new Error('Insufficient funds in tax wallet');
       }
     } catch (err) {
