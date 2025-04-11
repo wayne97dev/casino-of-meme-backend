@@ -10,7 +10,7 @@ const server = http.createServer(app);
 
 // Define allowed origins
 const allowedOrigins = [
-  'https://casino-of-meme.vercel.app',
+  'https://casino-of-meme.com',
   'http://localhost:5173',
   'http://localhost:3000',
 ];
