@@ -3,21 +3,20 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const axios = require('axios');
 const Player = require('./models/Player');
-const Game = require('./models/Game'); // Importa il modello Game
+const Game = require('./models/Game');
 
 const app = express();
 const server = http.createServer(app);
 
-// Define allowed origins
+// Definizione degli origin consentiti
 const allowedOrigins = [
   'https://casino-of-meme.com',
   'http://localhost:5173',
   'http://localhost:3000',
 ];
 
-// Configure CORS middleware for all requests
+// Configurazione del middleware CORS
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
@@ -31,7 +30,7 @@ app.use(cors({
   credentials: true,
 }));
 
-// Manual middleware to handle CORS and log requests
+// Middleware manuale per logging e gestione CORS
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   console.log(`Received request: ${req.method} ${req.url} from origin: ${origin}`);
@@ -51,7 +50,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Configure Socket.IO with CORS
+// Configurazione di Socket.IO con CORS
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
@@ -67,30 +66,30 @@ const io = new Server(server, {
   },
 });
 
-// Middleware
+// Middleware per parsing JSON
 app.use(express.json());
 
-// Connect to MongoDB
+// Connessione a MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://Cluster24283:Wkh1UXlmUnNf@cluster24283.ri0qrdr.mongodb.net/casino-of-meme?retryWrites=true&w=majority';
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// Game state
+// Stato del gioco
 const games = {};
 const waitingPlayers = [];
 
-// COM mint address
+// Indirizzo del mint COM
 const COM_MINT_ADDRESS = process.env.COM_MINT_ADDRESS || '8BtoThi2ZoXnF7QQK1Wjmh2JuBw9FjVvhnGMVZ2vpump';
 
-// Minimum bet fisso in COM
+// Scommessa minima in COM
 const MIN_BET = 1000; // 1000 COM
 
-// Function to remove circular references
+// Funzione per rimuovere riferimenti circolari
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
   if (obj && typeof obj === 'object') {
     if (seen.has(obj)) {
-      return undefined; // Circular reference found, remove it
+      return undefined; // Riferimento circolare trovato, rimuovilo
     }
     seen.add(obj);
     if (Array.isArray(obj)) {
@@ -252,6 +251,30 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('leaveWaitingList', ({ playerAddress }) => {
+    const playerIndex = waitingPlayers.findIndex(p => p.address === playerAddress && p.id === socket.id);
+    if (playerIndex !== -1) {
+      const player = waitingPlayers[playerIndex];
+      waitingPlayers.splice(playerIndex, 1);
+      console.log(`Player ${playerAddress} left the waiting list`);
+
+      // Invia il rimborso al giocatore
+      socket.emit('refund', {
+        message: 'You left the waiting list. Your bet has been refunded.',
+        amount: player.bet,
+      });
+
+      // Aggiorna gli altri giocatori nella lista d'attesa
+      io.emit('waitingPlayers', { 
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+      });
+      socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
+    } else {
+      socket.emit('error', { message: 'You are not in the waiting list.' });
+      console.log(`Player ${playerAddress} not found in waiting list`);
+    }
+  });
+
   socket.on('reconnectPlayer', async ({ playerAddress, gameId }) => {
     const game = games[gameId];
     if (game) {
@@ -391,8 +414,12 @@ io.on('connection', (socket) => {
 
     const waitingIndex = waitingPlayers.findIndex(p => p.id === socket.id);
     if (waitingIndex !== -1) {
+      const player = waitingPlayers[waitingIndex];
       waitingPlayers.splice(waitingIndex, 1);
-      io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+      console.log(`Player ${player.address} removed from waiting list due to disconnect`);
+      io.emit('waitingPlayers', { 
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+      });
     }
 
     for (const gameId in games) {
@@ -629,7 +656,6 @@ const advanceGamePhase = async (gameId) => {
     return;
   }
 
-  // Determina chi ha fatto l'ultima mossa (il giocatore che ha fatto "Check")
   const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
   const nextPlayer = game.players.find(p => p.id === game.currentTurn);
 
@@ -948,14 +974,14 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
-// Gestisci crash non gestiti
+// Gestione dei crash non gestiti
 process.on('uncaughtException', async (err) => {
   console.error('Uncaught Exception:', err);
   await refundAllActiveGames();
   process.exit(1);
 });
 
-// Gestisci la terminazione del server
+// Gestione della terminazione del server
 process.on('SIGTERM', async () => {
   console.log('Server shutting down...');
   await refundAllActiveGames();
