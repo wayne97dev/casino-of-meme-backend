@@ -3,8 +3,9 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const axios = require('axios'); // Aggiunto axios
+const axios = require('axios');
 const Player = require('./models/Player');
+const Game = require('./models/Game'); // Importa il modello Game
 
 const app = express();
 const server = http.createServer(app);
@@ -106,15 +107,70 @@ const removeCircularReferences = (obj, seen = new WeakSet()) => {
   return obj;
 };
 
+// Funzione di rimborso per una partita
+const refundBetsForGame = async (gameId) => {
+  try {
+    const game = await Game.findOne({ gameId });
+    if (!game || game.status === 'finished') {
+      console.log(`No active game ${gameId} to refund or already finished`);
+      return;
+    }
+
+    for (const player of game.players) {
+      const playerSocket = io.sockets.sockets.get(player.id);
+      if (playerSocket) {
+        playerSocket.emit('refund', {
+          message: 'Game crashed or interrupted. Your bet has been refunded.',
+          amount: player.bet,
+        });
+        console.log(`Refunded ${player.bet} COM to ${player.address} for game ${gameId}`);
+      }
+    }
+
+    // Rimuovi la partita dal database
+    await Game.deleteOne({ gameId });
+    console.log(`Deleted game ${gameId} after refund`);
+
+    // Rimuovi la partita dallo stato in memoria
+    if (games[gameId]) {
+      delete games[gameId];
+    }
+  } catch (err) {
+    console.error(`Error refunding bets for game ${gameId}:`, err);
+  }
+};
+
+// Funzione per rimborsare tutte le partite attive
+const refundAllActiveGames = async () => {
+  try {
+    const activeGames = await Game.find({ status: { $in: ['waiting', 'playing'] } });
+    for (const game of activeGames) {
+      for (const player of game.players) {
+        const playerSocket = io.sockets.sockets.get(player.id);
+        if (playerSocket) {
+          playerSocket.emit('refund', {
+            message: 'Server crashed or shutting down. Your bet has been refunded.',
+            amount: player.bet,
+          });
+          console.log(`Refunded ${player.bet} COM to ${player.address} for game ${game.gameId}`);
+        }
+      }
+      await Game.deleteOne({ gameId: game.gameId });
+      console.log(`Deleted game ${game.gameId} after refund`);
+    }
+  } catch (err) {
+    console.error('Error refunding active games:', err);
+  }
+};
+
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
 
-    // Validate minimum bet
-    const minBet = MIN_BET; // Usa il valore fisso
-    console.log(`Current minBet: ${minBet} COM`);
+    // Validazione della scommessa
+    const minBet = MIN_BET;
     if (betAmount < minBet) {
       socket.emit('error', { message: `Bet must be at least ${minBet.toFixed(2)} COM` });
       console.log(`Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
@@ -163,6 +219,27 @@ io.on('connection', (socket) => {
         timeLeft: 30,
       };
 
+      // Salva la partita nel database
+      try {
+        const game = new Game({
+          gameId,
+          players: players.map(p => ({
+            id: p.id,
+            address: p.address,
+            bet: p.bet,
+          })),
+          pot: players[0].bet + players[1].bet,
+          status: 'waiting',
+        });
+        await game.save();
+        console.log(`Saved game ${gameId} to database`);
+      } catch (err) {
+        console.error(`Error saving game ${gameId}:`, err);
+        socket.emit('error', { message: 'Error starting game' });
+        await refundBetsForGame(gameId);
+        return;
+      }
+
       players.forEach(player => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
@@ -175,7 +252,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('reconnectPlayer', ({ playerAddress, gameId }) => {
+  socket.on('reconnectPlayer', async ({ playerAddress, gameId }) => {
     const game = games[gameId];
     if (game) {
       const player = game.players.find(p => p.address === playerAddress);
@@ -187,6 +264,16 @@ io.on('connection', (socket) => {
         if (game.currentTurn === oldSocketId) {
           game.currentTurn = socket.id;
           console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
+        }
+        // Aggiorna il socket.id nel database
+        try {
+          await Game.updateOne(
+            { gameId, 'players.address': playerAddress },
+            { $set: { 'players.$.id': socket.id } }
+          );
+          console.log(`Updated socket.id for ${playerAddress} in game ${gameId} database`);
+        } catch (err) {
+          console.error(`Error updating socket.id for ${playerAddress} in game ${gameId}:`, err);
         }
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } else {
@@ -211,7 +298,7 @@ io.on('connection', (socket) => {
     const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
     if (!playerAddress || !opponent) {
-      delete games[gameId];
+      await refundBetsForGame(gameId);
       return;
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
@@ -224,6 +311,13 @@ io.on('connection', (socket) => {
       io.to(gameId).emit('gameState', removeCircularReferences(game));
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
       await updateLeaderboard(opponent.address, game.pot);
+      try {
+        await Game.updateOne({ gameId }, { status: 'finished' });
+        await Game.deleteOne({ gameId });
+        console.log(`Deleted game ${gameId} from database`);
+      } catch (err) {
+        console.error(`Error updating/deleting game ${gameId}:`, err);
+      }
       delete games[gameId];
     } else if (move === 'check') {
       if (game.currentBet > currentPlayerBet) {
@@ -255,9 +349,16 @@ io.on('connection', (socket) => {
       } else {
         startTurnTimer(gameId, opponent.id);
       }
+      // Aggiorna il pot nel database
+      try {
+        await Game.updateOne({ gameId }, { pot: game.pot });
+        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
+      } catch (err) {
+        console.error(`Error updating pot for game ${gameId}:`, err);
+      }
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     } else if (move === 'bet' || move === 'raise') {
-      const minBet = MIN_BET; // Usa il valore fisso
+      const minBet = MIN_BET;
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
       if (newBet <= game.currentBet || amount < minBet) {
         game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
@@ -273,6 +374,13 @@ io.on('connection', (socket) => {
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       game.currentTurn = opponent.id;
       game.bettingRoundComplete = false;
+      // Aggiorna il pot nel database
+      try {
+        await Game.updateOne({ gameId }, { pot: game.pot });
+        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
+      } catch (err) {
+        console.error(`Error updating pot for game ${gameId}:`, err);
+      }
       startTurnTimer(gameId, opponent.id);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }
@@ -301,13 +409,19 @@ io.on('connection', (socket) => {
           game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
           game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
-
-          // Emit the winnings event without transferring SOL
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-
           await updateLeaderboard(opponent.address, game.pot);
+          try {
+            await Game.updateOne({ gameId }, { status: 'finished' });
+            await Game.deleteOne({ gameId });
+            console.log(`Deleted game ${gameId} from database`);
+          } catch (err) {
+            console.error(`Error updating/deleting game ${gameId}:`, err);
+          }
+          delete games[gameId];
+        } else {
+          await refundBetsForGame(gameId);
         }
-        delete games[gameId];
       }
     }
   });
@@ -317,6 +431,7 @@ const startTurnTimer = async (gameId, playerId) => {
   const game = games[gameId];
   if (!game) {
     console.error(`Game ${gameId} not found in startTurnTimer`);
+    await refundBetsForGame(gameId);
     return;
   }
 
@@ -331,9 +446,17 @@ const startTurnTimer = async (gameId, playerId) => {
       game.dealerMessage = 'The dealer announces: A player is no longer available.';
       io.to(gameId).emit('gameState', removeCircularReferences(game));
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-      await updateLeaderboard(opponent.address, game.pot).then(() => {
-        delete games[gameId];
-      });
+      await updateLeaderboard(opponent.address, game.pot);
+      try {
+        await Game.updateOne({ gameId }, { status: 'finished' });
+        await Game.deleteOne({ gameId });
+        console.log(`Deleted game ${gameId} from database`);
+      } catch (err) {
+        console.error(`Error updating/deleting game ${gameId}:`, err);
+      }
+      delete games[gameId];
+    } else {
+      await refundBetsForGame(gameId);
     }
     return;
   }
@@ -356,6 +479,7 @@ const startTurnTimer = async (gameId, playerId) => {
     try {
       if (!games[gameId]) {
         console.log(`Game ${gameId} no longer exists, stopping timer`);
+        await refundBetsForGame(gameId);
         return;
       }
 
@@ -373,9 +497,17 @@ const startTurnTimer = async (gameId, playerId) => {
           game.dealerMessage = 'The dealer announces: A player is no longer available.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-          await updateLeaderboard(opponent.address, game.pot).then(() => {
-            delete games[gameId];
-          });
+          await updateLeaderboard(opponent.address, game.pot);
+          try {
+            await Game.updateOne({ gameId }, { status: 'finished' });
+            await Game.deleteOne({ gameId });
+            console.log(`Deleted game ${gameId} from database`);
+          } catch (err) {
+            console.error(`Error updating/deleting game ${gameId}:`, err);
+          }
+          delete games[gameId];
+        } else {
+          await refundBetsForGame(gameId);
         }
         return;
       }
@@ -387,7 +519,7 @@ const startTurnTimer = async (gameId, playerId) => {
         const opponent = game.players.find(p => p.id !== playerId);
         if (!playerAddress || !opponent) {
           console.error(`Player or opponent not found in game ${gameId}`);
-          delete games[gameId];
+          await refundBetsForGame(gameId);
           return;
         }
         game.status = 'finished';
@@ -396,24 +528,32 @@ const startTurnTimer = async (gameId, playerId) => {
         game.dealerMessage = 'The dealer announces: A player timed out and folded.';
         io.to(gameId).emit('gameState', removeCircularReferences(game));
         io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-        await updateLeaderboard(opponent.address, game.pot).then(() => {
-          delete games[gameId];
-        });
+        await updateLeaderboard(opponent.address, game.pot);
+        try {
+          await Game.updateOne({ gameId }, { status: 'finished' });
+          await Game.deleteOne({ gameId });
+          console.log(`Deleted game ${gameId} from database`);
+        } catch (err) {
+          console.error(`Error updating/deleting game ${gameId}:`, err);
+        }
+        delete games[gameId];
       } else {
         game.turnTimer = setTimeout(runTimer, 1000);
       }
     } catch (err) {
       console.error(`Error in turn timer for game ${gameId}:`, err);
+      await refundBetsForGame(gameId);
     }
   };
 
   game.turnTimer = setTimeout(runTimer, 1000);
 };
 
-const startGame = (gameId) => {
+const startGame = async (gameId) => {
   const game = games[gameId];
   if (!game) {
     console.error(`Game ${gameId} not found in startGame`);
+    await refundBetsForGame(gameId);
     return;
   }
   console.log(`Starting game ${gameId} with players:`, game.players);
@@ -421,6 +561,15 @@ const startGame = (gameId) => {
   game.message = 'The dealer is dealing the cards...';
   game.dealerMessage = 'The dealer is dealing the cards to the players.';
   io.to(gameId).emit('gameState', removeCircularReferences(game));
+
+  try {
+    await Game.updateOne({ gameId }, { status: 'playing' });
+    console.log(`Updated game ${gameId} status to playing`);
+  } catch (err) {
+    console.error(`Error updating game ${gameId} status:`, err);
+    await refundBetsForGame(gameId);
+    return;
+  }
 
   setTimeout(() => {
     try {
@@ -432,7 +581,7 @@ const startGame = (gameId) => {
       game.playerCards[game.players[0].address] = player1Cards;
       game.playerCards[game.players[1].address] = player2Cards;
       game.currentTurn = game.players[0].id;
-      game.pot = game.players[0].bet + players[1].bet;
+      game.pot = game.players[0].bet + game.players[1].bet;
       game.playerBets[game.players[0].address] = game.players[0].bet;
       game.playerBets[game.players[1].address] = game.players[1].bet;
       game.currentBet = game.players[0].bet;
@@ -447,9 +596,9 @@ const startGame = (gameId) => {
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     } catch (err) {
       console.error(`Error in startGame ${gameId}:`, err);
-      game.message = 'Error starting game. Please try again.';
-      game.status = 'waiting';
+      game.message = 'Error starting game. Refunding bets...';
       io.to(gameId).emit('gameState', removeCircularReferences(game));
+      refundBetsForGame(gameId);
     }
   }, 1000);
 };
@@ -472,9 +621,13 @@ const drawCard = () => {
   };
 };
 
-const advanceGamePhase = (gameId) => {
+const advanceGamePhase = async (gameId) => {
   const game = games[gameId];
-  if (!game) return;
+  if (!game) {
+    console.error(`Game ${gameId} not found in advanceGamePhase`);
+    await refundBetsForGame(gameId);
+    return;
+  }
 
   // Determina chi ha fatto l'ultima mossa (il giocatore che ha fatto "Check")
   const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
@@ -485,57 +638,72 @@ const advanceGamePhase = (gameId) => {
     game.dealerMessage = 'The dealer is dealing the Flop cards.';
     io.to(gameId).emit('gameState', removeCircularReferences(game));
     setTimeout(() => {
-      const newCards = Array(3).fill().map(() => drawCard());
-      game.tableCards = newCards;
-      game.gamePhase = 'flop';
-      game.message = 'Flop: Place your bets.';
-      game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = lastPlayer.id; // Passa il turno all'altro giocatore
-      game.bettingRoundComplete = false;
-      game.currentBet = 0;
-      game.playerBets[lastPlayer.address] = 0;
-      game.playerBets[nextPlayer.address] = 0;
-      console.log(`Advancing to Flop, turn passed to: ${lastPlayer.id}`);
-      startTurnTimer(gameId, lastPlayer.id);
-      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      try {
+        const newCards = Array(3).fill().map(() => drawCard());
+        game.tableCards = newCards;
+        game.gamePhase = 'flop';
+        game.message = 'Flop: Place your bets.';
+        game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.bettingRoundComplete = false;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to Flop, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to flop in game ${gameId}:`, err);
+        refundBetsForGame(gameId);
+      }
     }, 1000);
   } else if (game.gamePhase === 'flop') {
     game.message = 'The dealer is dealing the Turn...';
     game.dealerMessage = 'The dealer is dealing the Turn card.';
     io.to(gameId).emit('gameState', removeCircularReferences(game));
     setTimeout(() => {
-      const newCard = drawCard();
-      game.tableCards.push(newCard);
-      game.gamePhase = 'turn';
-      game.message = 'Turn: Place your bets.';
-      game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = lastPlayer.id; // Passa il turno all'altro giocatore
-      game.bettingRoundComplete = false;
-      game.currentBet = 0;
-      game.playerBets[lastPlayer.address] = 0;
-      game.playerBets[nextPlayer.address] = 0;
-      console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
-      startTurnTimer(gameId, lastPlayer.id);
-      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      try {
+        const newCard = drawCard();
+        game.tableCards.push(newCard);
+        game.gamePhase = 'turn';
+        game.message = 'Turn: Place your bets.';
+        game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.bettingRoundComplete = false;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to turn in game ${gameId}:`, err);
+        refundBetsForGame(gameId);
+      }
     }, 1000);
   } else if (game.gamePhase === 'turn') {
     game.message = 'The dealer is dealing the River...';
     game.dealerMessage = 'The dealer is dealing the River card.';
     io.to(gameId).emit('gameState', removeCircularReferences(game));
     setTimeout(() => {
-      const newCard = drawCard();
-      game.tableCards.push(newCard);
-      game.gamePhase = 'river';
-      game.message = 'River: Place your bets.';
-      game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-      game.currentTurn = lastPlayer.id; // Passa il turno all'altro giocatore
-      game.bettingRoundComplete = false;
-      game.currentBet = 0;
-      game.playerBets[lastPlayer.address] = 0;
-      game.playerBets[nextPlayer.address] = 0;
-      console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
-      startTurnTimer(gameId, lastPlayer.id);
-      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      try {
+        const newCard = drawCard();
+        game.tableCards.push(newCard);
+        game.gamePhase = 'river';
+        game.message = 'River: Place your bets.';
+        game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.bettingRoundComplete = false;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to river in game ${gameId}:`, err);
+        refundBetsForGame(gameId);
+      }
     }, 1000);
   } else if (game.gamePhase === 'river') {
     game.gamePhase = 'showdown';
@@ -658,7 +826,11 @@ const evaluatePokerHand = (hand) => {
 
 const endGame = async (gameId) => {
   const game = games[gameId];
-  if (!game) return;
+  if (!game) {
+    console.error(`Game ${gameId} not found in endGame`);
+    await refundBetsForGame(gameId);
+    return;
+  }
 
   if (game.turnTimer) {
     clearInterval(game.turnTimer);
@@ -716,16 +888,21 @@ const endGame = async (gameId) => {
 
   if (isTie) {
     const splitAmount = game.pot / 2;
-
     io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount });
     io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount });
-
     await updateLeaderboard(player1.address, splitAmount);
     await updateLeaderboard(player2.address, splitAmount);
   } else {
     io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
-
     await updateLeaderboard(winner.address, game.pot);
+  }
+
+  try {
+    await Game.updateOne({ gameId }, { status: 'finished' });
+    await Game.deleteOne({ gameId });
+    console.log(`Deleted game ${gameId} from database`);
+  } catch (err) {
+    console.error(`Error updating/deleting game ${gameId}:`, err);
   }
 
   delete games[gameId];
@@ -757,11 +934,10 @@ app.get('/leaderboard', async (req, res) => {
       console.log('Leaderboard is empty');
       res.json([]);
     } else {
-      // Aggiungi un campo per indicare l'unità (opzionale)
       const leaderboardWithUnit = leaderboard.map(player => ({
         address: player.address,
         totalWinnings: player.totalWinnings,
-        unit: 'COM', // Indica che le vincite sono in COM
+        unit: 'COM',
       }));
       res.json(leaderboardWithUnit);
     }
@@ -770,6 +946,25 @@ app.get('/leaderboard', async (req, res) => {
     console.error('Error stack:', err.stack);
     res.status(500).json({ error: 'Error fetching leaderboard' });
   }
+});
+
+// Gestisci crash non gestiti
+process.on('uncaughtException', async (err) => {
+  console.error('Uncaught Exception:', err);
+  await refundAllActiveGames();
+  process.exit(1);
+});
+
+// Gestisci la terminazione del server
+process.on('SIGTERM', async () => {
+  console.log('Server shutting down...');
+  await refundAllActiveGames();
+  server.close(() => {
+    mongoose.connection.close(() => {
+      console.log('MongoDB connection closed');
+      process.exit(0);
+    });
+  });
 });
 
 const PORT = process.env.PORT || 3001;
