@@ -712,34 +712,39 @@ const endGame = async (gameId) => {
 
 const updateLeaderboard = async (playerAddress, winnings) => {
   try {
+    console.log(`Updating leaderboard for ${playerAddress} with ${winnings.toFixed(2)} COM`);
     let player = await Player.findOne({ address: playerAddress });
     if (!player) {
       player = new Player({ address: playerAddress, totalWinnings: winnings });
     } else {
-      player.totalWinnings += winnings; // Vincite in COM
+      player.totalWinnings += winnings;
     }
     await player.save();
-    console.log(`Leaderboard updated for ${playerAddress}: ${player.totalWinnings} COM`);
+    console.log(`Leaderboard updated for ${playerAddress}: ${player.totalWinnings.toFixed(2)} COM`);
   } catch (err) {
-    console.error(`Error updating leaderboard for ${playerAddress}:`, err);
+    console.error(`Error updating leaderboard for ${playerAddress}:`, err.message);
   }
 };
 
 app.get('/leaderboard', async (req, res) => {
   console.log('Received request for /leaderboard');
   try {
-    console.log('Fetching leaderboard...');
     const leaderboard = await Player.find().sort({ totalWinnings: -1 }).limit(10);
     console.log('Leaderboard fetched:', leaderboard);
     if (!leaderboard || leaderboard.length === 0) {
       console.log('Leaderboard is empty');
       res.json([]);
     } else {
-      res.json(leaderboard);
+      // Aggiungi un campo per indicare l'unità (opzionale)
+      const leaderboardWithUnit = leaderboard.map(player => ({
+        address: player.address,
+        totalWinnings: player.totalWinnings,
+        unit: 'COM', // Indica che le vincite sono in COM
+      }));
+      res.json(leaderboardWithUnit);
     }
   } catch (err) {
     console.error('Error fetching leaderboard:', err.message);
-    console.error('Error stack:', err.stack);
     res.status(500).json({ error: 'Error fetching leaderboard' });
   }
 });
