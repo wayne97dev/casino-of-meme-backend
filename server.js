@@ -82,40 +82,8 @@ const waitingPlayers = [];
 // COM mint address
 const COM_MINT_ADDRESS = process.env.COM_MINT_ADDRESS || '8BtoThi2ZoXnF7QQK1Wjmh2JuBw9FjVvhnGMVZ2vpump';
 
-// Function to get COM price in SOL
-const getComPrice = async () => {
-  try {
-    const response = await axios.get('https://api.jupiter.ag/quote', {
-      params: {
-        inputMint: COM_MINT_ADDRESS,
-        outputMint: 'So11111111111111111111111111111111111111112', // WSOL
-        amount: 1_000_000, // 1 COM (6 decimali)
-      },
-    });
-    return response.data.data[0].outAmount / 1_000_000; // Prezzo in SOL
-  } catch (err) {
-    console.error('Error fetching COM price:', err.message);
-    return null;
-  }
-};
-
-// Function to calculate minimum bet in COM (equivalente a $5 USD)
-const getMinBet = async () => {
-  try {
-    const priceInSol = await getComPrice();
-    if (!priceInSol) {
-      return 0.01; // Fallback
-    }
-    const solPriceInUsd = 150; // Prezzo SOL in USD (aggiorna dinamicamente se necessario)
-    const comPriceInUsd = priceInSol * solPriceInUsd;
-    const minBetInUsd = 5; // $5 USD
-    const minBetInCom = minBetInUsd / comPriceInUsd;
-    return Math.max(0.01, parseFloat(minBetInCom.toFixed(2))); // Minimo 0.01 COM
-  } catch (err) {
-    console.error('Error calculating min bet:', err.message);
-    return 0.01; // Fallback
-  }
-};
+// Minimum bet fisso in COM
+const MIN_BET = 1000; // 1000 COM
 
 // Function to remove circular references
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
@@ -145,9 +113,10 @@ io.on('connection', (socket) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
 
     // Validate minimum bet
-    const minBet = await getMinBet();
+    const minBet = MIN_BET; // Usa il valore fisso
+    console.log(`Current minBet: ${minBet} COM`);
     if (betAmount < minBet) {
-      socket.emit('error', { message: `Bet must be at least ${minBet.toFixed(2)} COM (equivalent to $5 USD)` });
+      socket.emit('error', { message: `Bet must be at least ${minBet.toFixed(2)} COM` });
       console.log(`Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
       return;
     }
@@ -288,7 +257,7 @@ io.on('connection', (socket) => {
       }
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     } else if (move === 'bet' || move === 'raise') {
-      const minBet = await getMinBet();
+      const minBet = MIN_BET; // Usa il valore fisso
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
       if (newBet <= game.currentBet || amount < minBet) {
         game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
@@ -463,7 +432,7 @@ const startGame = (gameId) => {
       game.playerCards[game.players[0].address] = player1Cards;
       game.playerCards[game.players[1].address] = player2Cards;
       game.currentTurn = game.players[0].id;
-      game.pot = game.players[0].bet + game.players[1].bet;
+      game.pot = game.players[0].bet + players[1].bet;
       game.playerBets[game.players[0].address] = game.players[0].bet;
       game.playerBets[game.players[1].address] = game.players[1].bet;
       game.currentBet = game.players[0].bet;
