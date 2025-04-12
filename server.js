@@ -5,7 +5,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const axios = require('axios');
 const Player = require('./models/Player');
-const Game = require('./models/Game'); // Importa il modello Game
+const Game = require('./models/Game.js'); // Importa il modello Game
 
 const app = express();
 const server = http.createServer(app);
