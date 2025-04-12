@@ -16,19 +16,10 @@ const allowedOrigins = [
   'http://localhost:3000',
 ];
 
-// Configurazione del middleware CORS
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    } else {
-      return callback(new Error('Not allowed by CORS'));
-    }
-  },
-  methods: ['GET', 'POST'],
-  credentials: true,
-}));
+app.use((req, res, next) => {
+  console.log(`Received request: ${req.method} ${req.url} from origin: ${req.headers.origin}`);
+  next();
+});
 
 // Middleware manuale per logging e gestione CORS
 app.use((req, res, next) => {
@@ -71,7 +62,13 @@ app.use(express.json());
 
 // Connessione a MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://Cluster24283:Wkh1UXlmUnNf@cluster24283.ri0qrdr.mongodb.net/casino-of-meme?retryWrites=true&w=majority';
-mongoose.connect(MONGODB_URI)
+mongoose.connect(MONGODB_URI, {
+  serverSelectionTimeoutMS: 30000, // Timeout per la selezione del server
+  connectTimeoutMS: 30000, // Timeout per la connessione
+  socketTimeoutMS: 45000, // Timeout per le operazioni
+  maxPoolSize: 10, // Limita il numero di connessioni
+  retryWrites: true, // Riprova scritture in caso di errori
+})
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
 
