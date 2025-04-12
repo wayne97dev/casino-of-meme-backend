@@ -103,21 +103,22 @@ io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
-    console.log(`Player ${playerAddress} joined with bet ${betAmount}`);
+    console.log(`Player ${playerAddress} joined with bet ${betAmount} COM`);
+    if (betAmount <= 0) {
+      socket.emit('error', { message: 'Bet amount must be positive' });
+      return;
+    }
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
-      console.log(`Updated socket.id for player ${playerAddress} to ${socket.id}`);
     } else {
       waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
-      console.log(`Added player ${playerAddress} to waiting list. Total waiting: ${waitingPlayers.length}`);
     }
-
+  
     socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
     io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
-
+  
     if (waitingPlayers.length >= 2) {
-      console.log('Starting game with players:', waitingPlayers);
       const gameId = Date.now().toString();
       const players = waitingPlayers.splice(0, 2);
       games[gameId] = {
@@ -125,9 +126,12 @@ io.on('connection', (socket) => {
         tableCards: [],
         playerCards: {},
         currentTurn: null,
-        pot: 0,
+        pot: players[0].bet + players[1].bet,
         currentBet: 0,
-        playerBets: {},
+        playerBets: {
+          [players[0].address]: players[0].bet,
+          [players[1].address]: players[1].bet,
+        },
         gamePhase: 'pre-flop',
         status: 'waiting',
         message: 'The dealer is preparing the game...',
@@ -138,27 +142,15 @@ io.on('connection', (socket) => {
         turnTimer: null,
         timeLeft: 30,
       };
-
-      // Add the bets to the pot (without Solana transaction)
-      for (const player of players) {
-        games[gameId].pot += player.bet;
-        console.log(`Added ${player.bet} SOL to pot from ${player.address}. Total pot: ${games[gameId].pot}`);
-      }
-
-      console.log('Joining players to game room:', gameId);
+  
       players.forEach(player => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
           playerSocket.join(gameId);
-          console.log(`Player ${player.id} joined room ${gameId}`);
-        } else {
-          console.error(`Socket for player ${player.id} not found`);
         }
       });
-
-      console.log('Emitting updated waiting players list:', waitingPlayers);
+  
       io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
-      console.log(`Game ${gameId} ready to start`);
       startGame(gameId);
     }
   });
@@ -188,87 +180,67 @@ io.on('connection', (socket) => {
   socket.on('makeMove', async ({ gameId, move, amount }) => {
     const game = games[gameId];
     if (!game || game.currentTurn !== socket.id) {
-      console.log(`Invalid move attempt: game ${gameId}, currentTurn ${game.currentTurn}, socket.id ${socket.id}`);
       return;
     }
-
+  
     if (game.turnTimer) {
       clearInterval(game.turnTimer);
     }
     game.timeLeft = 30;
-
+  
     const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
     if (!playerAddress || !opponent) {
-      console.error(`Player or opponent not found in game ${gameId}`);
       delete games[gameId];
       return;
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
-    const opponentBet = game.playerBets[opponent.address] || 0;
-
-    console.log(`Player ${playerAddress} made move: ${move}, amount: ${amount}`);
-
+  
     if (move === 'fold') {
       game.status = 'finished';
       game.opponentCardsVisible = true;
       game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
       game.dealerMessage = 'The dealer announces the winner!';
-      console.log(`Emitting gameState to room ${gameId} with new status: ${game.status}, pot: ${game.pot}`);
       io.to(gameId).emit('gameState', removeCircularReferences(game));
-
-      // Emit the winnings event without transferring SOL
       io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-
       await updateLeaderboard(opponent.address, game.pot);
       delete games[gameId];
     } else if (move === 'check') {
       if (game.currentBet > currentPlayerBet) {
         game.message = 'You cannot check, you must call or raise!';
         game.dealerMessage = 'The dealer reminds: You must call or raise!';
-        console.log(`Cannot check: currentBet=${game.currentBet}, playerBet=${currentPlayerBet}`);
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } else {
         game.message = 'You checked.';
         game.dealerMessage = 'The dealer says: Player checked.';
-        console.log(`Player ${playerAddress} checked. Current bets: ${game.playerBets[playerAddress]} (player) vs ${game.playerBets[opponent.address]} (opponent)`);
-
-        // If both players have bet the same amount, the betting round is complete
         if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
-          console.log('Betting round complete, advancing game phase');
           game.bettingRoundComplete = true;
           advanceGamePhase(gameId);
         } else {
-          // Pass the turn to the opponent
           game.currentTurn = opponent.id;
-          console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
           startTurnTimer(gameId, opponent.id);
         }
-        console.log(`Emitting gameState to room ${gameId} with new currentTurn: ${game.currentTurn}, pot: ${game.pot}`);
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       }
     } else if (move === 'call') {
       const amountToCall = game.currentBet - currentPlayerBet;
       game.pot += amountToCall;
       game.playerBets[playerAddress] = game.currentBet;
-      game.message = `You called ${amountToCall.toFixed(2)} SOL.`;
-      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} SOL.`;
-
+      game.message = `You called ${amountToCall.toFixed(2)} COM.`;
+      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
       game.currentTurn = opponent.id;
-      console.log(`Turn passed to opponent: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
       if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         advanceGamePhase(gameId);
       } else {
         startTurnTimer(gameId, opponent.id);
       }
-      console.log(`Emitting gameState to room ${gameId} with new currentTurn: ${game.currentTurn}, pot: ${game.pot}`);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     } else if (move === 'bet' || move === 'raise') {
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
-      if (newBet <= game.currentBet) {
-        game.message = 'The bet must be higher than the current bet!';
-        game.dealerMessage = 'The dealer warns: Bet must be higher than the current bet!';
+      if (newBet <= game.currentBet || amount <= 0) {
+        game.message = 'The bet must be higher than the current bet and positive!';
+        game.dealerMessage = 'The dealer warns: Bet must be higher and positive!';
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
         return;
       }
@@ -276,15 +248,11 @@ io.on('connection', (socket) => {
       game.pot += additionalBet;
       game.playerBets[playerAddress] = newBet;
       game.currentBet = newBet;
-      game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
-      game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} SOL.`;
-
+      game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+      game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       game.currentTurn = opponent.id;
-      console.log(`Turn passed to opponent after ${move}: ${opponent.id}, new currentTurn: ${game.currentTurn}`);
       game.bettingRoundComplete = false;
-      console.log(`Starting turn timer for opponent after ${move}: ${opponent.id}`);
       startTurnTimer(gameId, opponent.id);
-      console.log(`Emitting gameState to room ${gameId} with new currentTurn: ${game.currentTurn}, pot: ${game.pot}`);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }
   });
@@ -744,20 +712,16 @@ const endGame = async (gameId) => {
 
 const updateLeaderboard = async (playerAddress, winnings) => {
   try {
-    console.log(`Attempting to update leaderboard for ${playerAddress} with winnings: ${winnings}`);
     let player = await Player.findOne({ address: playerAddress });
     if (!player) {
-      console.log(`Player ${playerAddress} not found, creating new entry with winnings: ${winnings}`);
       player = new Player({ address: playerAddress, totalWinnings: winnings });
     } else {
-      console.log(`Player ${playerAddress} found, current totalWinnings: ${player.totalWinnings}, adding: ${winnings}`);
-      player.totalWinnings += winnings;
+      player.totalWinnings += winnings; // Vincite in COM
     }
     await player.save();
-    console.log(`Leaderboard successfully updated for ${playerAddress}: totalWinnings now ${player.totalWinnings}`);
+    console.log(`Leaderboard updated for ${playerAddress}: ${player.totalWinnings} COM`);
   } catch (err) {
-    console.error(`Error updating leaderboard for ${playerAddress}:`, err.message);
-    console.error('Error stack:', err.stack);
+    console.error(`Error updating leaderboard for ${playerAddress}:`, err);
   }
 };
 
