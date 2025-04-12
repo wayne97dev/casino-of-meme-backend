@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const axios = require('axios'); // Aggiunto axios
 const Player = require('./models/Player');
 
 const app = express();
@@ -78,6 +79,44 @@ mongoose.connect(MONGODB_URI)
 const games = {};
 const waitingPlayers = [];
 
+// COM mint address
+const COM_MINT_ADDRESS = process.env.COM_MINT_ADDRESS || 'YOUR_COM_MINT_ADDRESS_HERE';
+
+// Function to get COM price in SOL
+const getComPrice = async () => {
+  try {
+    const response = await axios.get('https://api.jupiter.ag/quote', {
+      params: {
+        inputMint: COM_MINT_ADDRESS,
+        outputMint: 'So11111111111111111111111111111111111111112', // WSOL
+        amount: 1_000_000, // 1 COM (6 decimali)
+      },
+    });
+    return response.data.data[0].outAmount / 1_000_000; // Prezzo in SOL
+  } catch (err) {
+    console.error('Error fetching COM price:', err.message);
+    return null;
+  }
+};
+
+// Function to calculate minimum bet in COM (equivalente a $5 USD)
+const getMinBet = async () => {
+  try {
+    const priceInSol = await getComPrice();
+    if (!priceInSol) {
+      return 0.01; // Fallback
+    }
+    const solPriceInUsd = 150; // Prezzo SOL in USD (aggiorna dinamicamente se necessario)
+    const comPriceInUsd = priceInSol * solPriceInUsd;
+    const minBetInUsd = 5; // $5 USD
+    const minBetInCom = minBetInUsd / comPriceInUsd;
+    return Math.max(0.01, parseFloat(minBetInCom.toFixed(2))); // Minimo 0.01 COM
+  } catch (err) {
+    console.error('Error calculating min bet:', err.message);
+    return 0.01; // Fallback
+  }
+};
+
 // Function to remove circular references
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
   if (obj && typeof obj === 'object') {
@@ -103,21 +142,33 @@ io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
-    console.log(`Player ${playerAddress} joined with bet ${betAmount} COM`);
-    if (betAmount <= 0) {
-      socket.emit('error', { message: 'Bet amount must be positive' });
+    console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
+
+    // Validate minimum bet
+    const minBet = await getMinBet();
+    if (betAmount < minBet) {
+      socket.emit('error', { message: `Bet must be at least ${minBet.toFixed(2)} COM (equivalent to $5 USD)` });
+      console.log(`Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
       return;
     }
+    if (betAmount <= 0) {
+      socket.emit('error', { message: 'Bet amount must be positive' });
+      console.log(`Bet ${betAmount} COM rejected: non-positive`);
+      return;
+    }
+
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
+      console.log(`Updated player ${playerAddress} socket.id to ${socket.id}`);
     } else {
       waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
+      console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
     }
-  
+
     socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
     io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
-  
+
     if (waitingPlayers.length >= 2) {
       const gameId = Date.now().toString();
       const players = waitingPlayers.splice(0, 2);
@@ -142,14 +193,14 @@ io.on('connection', (socket) => {
         turnTimer: null,
         timeLeft: 30,
       };
-  
+
       players.forEach(player => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
           playerSocket.join(gameId);
         }
       });
-  
+
       io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
       startGame(gameId);
     }
@@ -182,12 +233,12 @@ io.on('connection', (socket) => {
     if (!game || game.currentTurn !== socket.id) {
       return;
     }
-  
+
     if (game.turnTimer) {
       clearInterval(game.turnTimer);
     }
     game.timeLeft = 30;
-  
+
     const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
     if (!playerAddress || !opponent) {
@@ -195,7 +246,7 @@ io.on('connection', (socket) => {
       return;
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
-  
+
     if (move === 'fold') {
       game.status = 'finished';
       game.opponentCardsVisible = true;
@@ -237,10 +288,11 @@ io.on('connection', (socket) => {
       }
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     } else if (move === 'bet' || move === 'raise') {
+      const minBet = await getMinBet();
       const newBet = move === 'bet' ? amount : game.currentBet + amount;
-      if (newBet <= game.currentBet || amount <= 0) {
-        game.message = 'The bet must be higher than the current bet and positive!';
-        game.dealerMessage = 'The dealer warns: Bet must be higher and positive!';
+      if (newBet <= game.currentBet || amount < minBet) {
+        game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
+        game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
         return;
       }
@@ -729,6 +781,7 @@ const updateLeaderboard = async (playerAddress, winnings) => {
 app.get('/leaderboard', async (req, res) => {
   console.log('Received request for /leaderboard');
   try {
+    console.log('Fetching leaderboard...');
     const leaderboard = await Player.find().sort({ totalWinnings: -1 }).limit(10);
     console.log('Leaderboard fetched:', leaderboard);
     if (!leaderboard || leaderboard.length === 0) {
@@ -745,6 +798,7 @@ app.get('/leaderboard', async (req, res) => {
     }
   } catch (err) {
     console.error('Error fetching leaderboard:', err.message);
+    console.error('Error stack:', err.stack);
     res.status(500).json({ error: 'Error fetching leaderboard' });
   }
 });
