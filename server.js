@@ -80,7 +80,7 @@ const games = {};
 const waitingPlayers = [];
 
 // COM mint address
-const COM_MINT_ADDRESS = process.env.COM_MINT_ADDRESS || 'YOUR_COM_MINT_ADDRESS_HERE';
+const COM_MINT_ADDRESS = process.env.COM_MINT_ADDRESS || '8BtoThi2ZoXnF7QQK1Wjmh2JuBw9FjVvhnGMVZ2vpump';
 
 // Function to get COM price in SOL
 const getComPrice = async () => {
