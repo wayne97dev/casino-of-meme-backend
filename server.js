@@ -6,7 +6,7 @@ const cors = require('cors');
 const Player = require('./models/Player');
 const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
+const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
 
 const app = express();
@@ -17,43 +17,36 @@ const allowedOrigins = [
   'https://casino-of-meme.com',
   'http://localhost:5173',
   'http://localhost:3000',
-  
 ];
 
-// Middleware per logging e gestione CORS
+// Middleware per logging
 app.use((req, res, next) => {
   console.log(`Received request: ${req.method} ${req.url} from origin: ${req.headers.origin}`);
   next();
 });
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  console.log(`Received request: ${req.method} ${req.url} from origin: ${origin}`);
-  if (allowedOrigins.includes(origin)) {
-    console.log(`Allowing origin: ${origin}`);
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    console.log(`Origin ${origin} not allowed by CORS`);
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') {
-    console.log('Handling CORS preflight request');
-    return res.status(200).json({});
-  }
-  next();
-});
+// Middleware CORS ottimizzato
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
 
 // Configurazione di Socket.IO con CORS
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
       } else {
-        return callback(new Error('Not allowed by CORS'));
+        callback(new Error('Not allowed by CORS'));
       }
     },
     methods: ['GET', 'POST'],
@@ -181,12 +174,83 @@ const refundAllActiveGames = async () => {
   }
 };
 
+// Endpoint per il saldo del tax wallet
+app.get('/tax-wallet-balance', async (req, res) => {
+  try {
+    const balance = await connection.getBalance(wallet.publicKey);
+    const taxWalletBalance = balance / LAMPORTS_PER_SOL;
+    res.json({ success: true, balance: taxWalletBalance });
+  } catch (err) {
+    console.error('Error fetching tax wallet balance:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch tax wallet balance' });
+  }
+});
+
+// Endpoint per le ricompense
+app.get('/rewards', async (req, res) => {
+  try {
+    const balance = await connection.getBalance(wallet.publicKey);
+    const usableBalance = balance * 0.5;
+    const solPerToken = Math.floor(usableBalance * 0.95);
+    const solPerPortion = Math.floor(solPerToken / 3);
+    const dailySolReward = solPerPortion / LAMPORTS_PER_SOL;
+
+    const wbtcATA = await getAssociatedTokenAddress(
+      new PublicKey('3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh'),
+      wallet.publicKey
+    );
+    const wethATA = await getAssociatedTokenAddress(
+      new PublicKey('7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs'),
+      wallet.publicKey
+    );
+
+    const wbtcBalance = await connection.getTokenAccountBalance(wbtcATA).catch(() => ({
+      value: { amount: '0' },
+    }));
+    const wethBalance = await connection.getTokenAccountBalance(wethATA).catch(() => ({
+      value: { amount: '0' },
+    }));
+
+    const dailyWbtcReward = Number(wbtcBalance.value.amount) / 1e8;
+    const dailyWethReward = Number(wethBalance.value.amount) / 1e8;
+
+    res.json({
+      success: true,
+      rewards: {
+        sol: dailySolReward,
+        wbtc: dailyWbtcReward,
+        weth: dailyWethReward,
+      },
+    });
+  } catch (err) {
+    console.error('Error fetching rewards:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch rewards' });
+  }
+});
+
+// Endpoint per il saldo COM
+app.get('/com-balance/:playerAddress', async (req, res) => {
+  const { playerAddress } = req.params;
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    const balance = await connection.getTokenAccountBalance(userATA).catch(() => ({
+      value: { uiAmount: 0 },
+    }));
+    const comBalance = balance.value.uiAmount || 0;
+    res.json({ success: true, balance: comBalance });
+  } catch (err) {
+    console.error('Error fetching COM balance:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch COM balance' });
+  }
+});
+
 // Endpoint per distribuire vincite in COM
 app.post('/distribute-winnings', async (req, res) => {
   const { winnerAddress, amount } = req.body;
 
-  if (!winnerAddress || !amount) {
-    return res.status(400).json({ success: false, error: 'Missing winnerAddress or amount' });
+  if (!winnerAddress || !amount || isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid winnerAddress or amount' });
   }
 
   try {
@@ -198,7 +262,7 @@ app.post('/distribute-winnings', async (req, res) => {
         casinoATA,
         winnerATA,
         wallet.publicKey,
-        amount * 1e9 // 9 decimali
+        amount * 1e9
       )
     );
 
@@ -222,8 +286,8 @@ app.post('/distribute-winnings', async (req, res) => {
 app.post('/refund', async (req, res) => {
   const { playerAddress, amount } = req.body;
 
-  if (!playerAddress || !amount) {
-    return res.status(400).json({ success: false, error: 'Missing playerAddress or amount' });
+  if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
   }
 
   try {
@@ -235,7 +299,7 @@ app.post('/refund', async (req, res) => {
         casinoATA,
         playerATA,
         wallet.publicKey,
-        amount * 1e9 // 9 decimali
+        amount * 1e9
       )
     );
 
@@ -259,8 +323,8 @@ app.post('/refund', async (req, res) => {
 app.post('/join-poker-game', async (req, res) => {
   const { playerAddress, betAmount } = req.body;
 
-  if (!playerAddress || !betAmount) {
-    return res.status(400).json({ success: false, error: 'Missing playerAddress or betAmount' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress or betAmount' });
   }
 
   try {
@@ -268,7 +332,6 @@ app.post('/join-poker-game', async (req, res) => {
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica se l'ATA dell'utente esiste, altrimenti crealo
     let userAccountExists = false;
     try {
       await getAccount(connection, userATA);
@@ -291,7 +354,6 @@ app.post('/join-poker-game', async (req, res) => {
       console.log(`Created user ATA for ${playerAddress}`);
     }
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
     let casinoAccountExists = false;
     try {
       await getAccount(connection, casinoATA);
@@ -314,19 +376,17 @@ app.post('/join-poker-game', async (req, res) => {
       console.log('Created casino ATA');
     }
 
-    // Verifica il saldo COM dell'utente
     const userBalance = await connection.getTokenAccountBalance(userATA);
     if (userBalance.value.uiAmount < betAmount) {
-      return res.status(400).json({ success: false, error: 'Saldo COM insufficiente' });
+      return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
 
-    // Crea la transazione per trasferire COM
     const transaction = new Transaction().add(
       createTransferInstruction(
         userATA,
         casinoATA,
         userPublicKey,
-        betAmount * 1e9 // Usa 9 decimali
+        betAmount * 1e9
       )
     );
 
@@ -350,8 +410,8 @@ app.post('/join-poker-game', async (req, res) => {
 app.post('/make-poker-move', async (req, res) => {
   const { playerAddress, gameId, move, amount } = req.body;
 
-  if (!playerAddress || !gameId || !move || amount === undefined) {
-    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  if (!playerAddress || !gameId || !move || amount === undefined || isNaN(amount) || amount < 0) {
+    return res.status(400).json({ success: false, error: 'Invalid required fields' });
   }
 
   try {
@@ -359,30 +419,30 @@ app.post('/make-poker-move', async (req, res) => {
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica il saldo COM dell'utente
-    const userBalance = await connection.getTokenAccountBalance(userATA);
-    if (userBalance.value.uiAmount < amount) {
-      return res.status(400).json({ success: false, error: 'Saldo COM insufficiente' });
+    if (amount > 0) {
+      const userBalance = await connection.getTokenAccountBalance(userATA);
+      if (userBalance.value.uiAmount < amount) {
+        return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
+      }
+
+      const transaction = new Transaction().add(
+        createTransferInstruction(
+          userATA,
+          casinoATA,
+          userPublicKey,
+          amount * 1e9
+        )
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
     }
-
-    // Crea la transazione per trasferire COM
-    const transaction = new Transaction().add(
-      createTransferInstruction(
-        userATA,
-        casinoATA,
-        userPublicKey,
-        amount * 1e9 // Usa 9 decimali
-      )
-    );
-
-    const { blockhash } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = wallet.publicKey;
-    transaction.partialSign(wallet);
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    await connection.confirmTransaction(signature);
-    console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
 
     res.json({ success: true });
   } catch (err) {
@@ -395,21 +455,19 @@ app.post('/make-poker-move', async (req, res) => {
 app.post('/start-blackjack', async (req, res) => {
   const { playerAddress, betAmount } = req.body;
 
-  if (!playerAddress || !betAmount) {
-    return res.status(400).json({ success: false, error: 'Missing playerAddress or betAmount' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress or betAmount' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = betAmount * LAMPORTS_PER_SOL;
 
-    // Verifica il saldo SOL dell'utente
     const userBalance = await connection.getBalance(userPublicKey);
     if (userBalance < betInLamports) {
-      return res.status(400).json({ success: false, error: 'Saldo SOL insufficiente' });
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Crea la transazione per trasferire SOL
     const transaction = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: userPublicKey,
@@ -438,8 +496,8 @@ app.post('/start-blackjack', async (req, res) => {
 app.post('/blackjack-stand', async (req, res) => {
   const { playerAddress, betAmount, playerScore, dealerScore } = req.body;
 
-  if (!playerAddress || !betAmount || playerScore === undefined || dealerScore === undefined) {
-    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || playerScore === undefined || dealerScore === undefined) {
+    return res.status(400).json({ success: false, error: 'Invalid required fields' });
   }
 
   try {
@@ -511,21 +569,19 @@ app.post('/blackjack-stand', async (req, res) => {
 app.post('/spin-slots', async (req, res) => {
   const { playerAddress, betAmount } = req.body;
 
-  if (!playerAddress || !betAmount) {
-    return res.status(400).json({ success: false, error: 'Missing playerAddress or betAmount' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress or betAmount' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = betAmount * LAMPORTS_PER_SOL;
 
-    // Verifica il saldo SOL dell'utente
     const userBalance = await connection.getBalance(userPublicKey);
     if (userBalance < betInLamports) {
-      return res.status(400).json({ success: false, error: 'Saldo SOL insufficiente' });
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Crea la transazione per trasferire SOL
     const transaction = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: userPublicKey,
@@ -554,15 +610,14 @@ app.post('/spin-slots', async (req, res) => {
 app.post('/distribute-winnings-sol', async (req, res) => {
   const { playerAddress, amount } = req.body;
 
-  if (!playerAddress || !amount) {
-    return res.status(400).json({ success: false, error: 'Missing playerAddress or amount' });
+  if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const amountInLamports = amount * LAMPORTS_PER_SOL;
 
-    // Crea la transazione per trasferire SOL
     const transaction = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: wallet.publicKey,
