@@ -7,7 +7,7 @@ const Player = require('./models/Player');
 const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
-const bs58 = require('bs58');
+const bsuse = require('bs58');
 
 const app = express();
 const server = http.createServer(app);
@@ -19,9 +19,23 @@ const allowedOrigins = [
   'http://localhost:3000',
 ];
 
+// Inizializzazione di socket.io
+console.log('DEBUG - Creating socket.io server...');
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+});
+console.log('DEBUG - socket.io server created:', io ? 'Success' : 'Failed');
+
 // Middleware per logging
 app.use((req, res, next) => {
-  console.log(`Received request: ${req.method} ${req.url} from origin: ${req.headers.origin}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} from origin: ${req.headers.origin}`);
+  res.on('finish', () => {
+    console.log(`[${new Date().toISOString()}] Response status: ${res.statusCode}`);
+  });
   next();
 });
 
@@ -42,8 +56,16 @@ app.use(cors({
   credentials: true,
 }));
 
+// Gestore esplicito per richieste OPTIONS
+app.options('*', cors());
+
 // Middleware per parsing JSON
 app.use(express.json());
+
+// Endpoint health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 // Connessione a MongoDB
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -51,15 +73,19 @@ if (!MONGODB_URI) {
   console.error('ERROR - MONGODB_URI is missing in environment variables');
   process.exit(1);
 }
+console.log('DEBUG - MONGODB_URI:', MONGODB_URI ? 'Present' : 'Missing');
 mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 30000,
-  connectTimeoutMS: 30000,
-  socketTimeoutMS: 45000,
+  serverSelectionTimeoutMS: 50000,
+  connectTimeoutMS: 50000,
+  socketTimeoutMS: 60000,
   maxPoolSize: 10,
   retryWrites: true,
 })
   .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
+  });
 
 // Connessione a Solana
 const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
@@ -73,7 +99,13 @@ if (!WALLET_PRIVATE_KEY) {
 console.log('DEBUG - WALLET_PRIVATE_KEY:', WALLET_PRIVATE_KEY ? 'Present' : 'Missing');
 
 // Crea il wallet dal backend
-const wallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
+let wallet;
+try {
+  wallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
+} catch (err) {
+  console.error('ERROR - Invalid WALLET_PRIVATE_KEY:', err.message);
+  process.exit(1);
+}
 
 // Stato del gioco
 const games = {};
@@ -165,7 +197,9 @@ const refundAllActiveGames = async () => {
 // Endpoint per il saldo del tax wallet
 app.get('/tax-wallet-balance', async (req, res) => {
   try {
+    console.log('Fetching tax wallet balance for:', wallet.publicKey.toBase58());
     const balance = await connection.getBalance(wallet.publicKey);
+    console.log('Balance fetched:', balance);
     const taxWalletBalance = balance / LAMPORTS_PER_SOL;
     res.json({ success: true, balance: taxWalletBalance });
   } catch (err) {
@@ -630,8 +664,9 @@ app.post('/distribute-winnings-sol', async (req, res) => {
   }
 });
 
+// Gestione delle connessioni WebSocket
 io.on('connection', (socket) => {
-  console.log('A player connected:', socket.id);
+  console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
@@ -1069,7 +1104,7 @@ const startGame = async (gameId) => {
       game.playerCards[game.players[0].address] = player1Cards;
       game.playerCards[game.players[1].address] = player2Cards;
       game.currentTurn = game.players[0].id;
-      game.pot = game.players[0].bet + game.players[1].bet;
+      game.pot = game.players[0].bet + players[1].bet;
       game.playerBets[game.players[0].address] = game.players[0].bet;
       game.playerBets[game.players[1].address] = game.players[1].bet;
       game.currentBet = game.players[0].bet;
@@ -1415,7 +1450,10 @@ app.get('/leaderboard', async (req, res) => {
   console.log('Received request for /leaderboard');
   try {
     console.log('Fetching leaderboard...');
-    const leaderboard = await Player.find().sort({ totalWinnings: -1 }).limit(10);
+    const leaderboard = await Player.find()
+      .sort({ totalWinnings: -1 })
+      .limit(10)
+      .maxTimeMS(5000);
     console.log('Leaderboard fetched:', leaderboard);
     if (!leaderboard || leaderboard.length === 0) {
       console.log('Leaderboard is empty');
@@ -1438,6 +1476,13 @@ app.get('/leaderboard', async (req, res) => {
 // Gestione dei crash non gestiti
 process.on('uncaughtException', async (err) => {
   console.error('Uncaught Exception:', err);
+  await refundAllActiveGames();
+  process.exit(1);
+});
+
+// Gestione delle promesse non gestite
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
   await refundAllActiveGames();
   process.exit(1);
 });
