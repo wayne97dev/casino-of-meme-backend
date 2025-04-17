@@ -80,7 +80,7 @@ const waitingPlayers = [];
 const COM_MINT_ADDRESS = process.env.COM_MINT_ADDRESS || '7tXGPcSsWDgPHmLBS1EirBsPPitBktfCepp8KeGiJmrR';
 
 // Scommessa minima in COM
-const MIN_BET = 1000; // 1000 COM
+const MIN_BET = 2000; // 1000 COM
 
 // Funzione per rimuovere riferimenti circolari
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
