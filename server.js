@@ -1,3 +1,7 @@
+
+require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
+
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -8,6 +12,7 @@ const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
+
 
 const app = express();
 const server = http.createServer(app);
