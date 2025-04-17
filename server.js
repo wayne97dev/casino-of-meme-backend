@@ -199,6 +199,8 @@ const refundAllActiveGames = async () => {
   }
 };
 
+
+
 // Endpoint per il saldo del tax wallet
 app.get('/tax-wallet-balance', async (req, res) => {
   try {
@@ -624,16 +626,16 @@ app.post('/blackjack-stand', async (req, res) => {
   }
 });
 
-// Endpoint per un giro di Meme Slots
-app.post('/spin-slots', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction } = req.body;
 
-  console.log('DEBUG - /spin-slots called with:', { playerAddress, betAmount, hasSignedTransaction: !!signedTransaction });
+app.post('/create-transaction', async (req, res) => {
+  const { playerAddress, betAmount, type } = req.body;
+
+  console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
 
   // Validazione dei parametri
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
   }
 
   try {
@@ -647,49 +649,154 @@ app.post('/spin-slots', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid Solana address' });
     }
 
-    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL); // Assicurati che sia intero
-    console.log('DEBUG - Bet in lamports:', betInLamports);
+    const transaction = new Transaction();
 
-    // Verifica il saldo dell'utente
+    if (type === 'sol') {
+      // Trasferimento SOL
+      const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+      console.log('DEBUG - Bet in lamports:', betInLamports);
+
+      // Verifica il saldo dell'utente
+      const userBalance = await connection.getBalance(userPublicKey);
+      console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
+      if (userBalance < betInLamports) {
+        console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
+        return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+      }
+
+      transaction.add(
+        SystemProgram.transfer({
+          fromPubkey: userPublicKey,
+          toPubkey: wallet.publicKey,
+          lamports: betInLamports,
+        })
+      );
+    } else if (type === 'com') {
+      // Trasferimento COM (per Poker PvP)
+      const betInTokens = Math.round(betAmount * 1e9); // COM usa 9 decimali
+      const mintPublicKey = new PublicKey(MINT_ADDRESS);
+      const userATA = await getAssociatedTokenAddress(mintPublicKey, userPublicKey);
+      const casinoATA = await getAssociatedTokenAddress(mintPublicKey, wallet.publicKey);
+
+      // Verifica il saldo COM
+      const userBalance = await connection.getTokenAccountBalance(userATA).catch(() => ({
+        value: { uiAmount: 0 },
+      }));
+      if (userBalance.value.uiAmount < betAmount) {
+        console.log('DEBUG - Insufficient COM balance:', userBalance.value.uiAmount);
+        return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
+      }
+
+      transaction.add(
+        createTransferInstruction(
+          userATA,
+          casinoATA,
+          userPublicKey,
+          betInTokens
+        )
+      );
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid transaction type' });
+    }
+
+    // Ottieni il blockhash recente
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = userPublicKey;
+
+    // Log della transazione creata
+    console.log('DEBUG - Transaction created:', {
+      instructions: transaction.instructions.map((instr, index) => ({
+        index,
+        programId: instr.programId.toBase58(),
+        keys: instr.keys.map(key => key.pubkey.toBase58()),
+        data: instr.data.toString('hex'),
+      })),
+      recentBlockhash: transaction.recentBlockhash,
+    });
+
+    // Serializza la transazione
+    const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
+
+    res.json({ success: true, transaction: serializedTransaction });
+  } catch (err) {
+    console.error('Error in create-transaction:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to create transaction: ${err.message}` });
+  }
+});
+
+// Endpoint per un giro di Meme Slots
+app.post('/spin-slots', async (req, res) => {
+  const { playerAddress, betAmount, signedTransaction } = req.body;
+
+  console.log('DEBUG - /spin-slots called with:', { playerAddress, betAmount, hasSignedTransaction: !!signedTransaction });
+
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
+  }
+
+  try {
+    let userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+
     const userBalance = await connection.getBalance(userPublicKey);
-    console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
     if (userBalance < betInLamports) {
       console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Decodifica la transazione firmata
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
     console.log('DEBUG - Decoded transaction:', {
-      from: transaction.instructions[0]?.keys[0]?.pubkey?.toBase58(),
-      to: transaction.instructions[0]?.keys[1]?.pubkey?.toBase58(),
-      lamports: transaction.instructions[0]?.data?.readBigInt64LE(4),
+      instructions: transaction.instructions.map((instr, index) => ({
+        index,
+        programId: instr.programId.toBase58(),
+        keys: instr.keys.map(key => key.pubkey.toBase58()),
+        data: instr.data.toString('hex'),
+      })),
     });
 
-    // Verifica le firme
     if (!transaction.verifySignatures()) {
       console.log('DEBUG - Invalid transaction signatures');
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
-    // Verifica che la transazione corrisponda ai parametri
-    const transferInstruction = transaction.instructions[0];
-    if (
-      !transferInstruction.programId.equals(SystemProgram.programId) ||
-      transferInstruction.keys[0].pubkey.toBase58() !== playerAddress ||
-      transferInstruction.keys[1].pubkey.toBase58() !== wallet.publicKey.toBase58() ||
-      transferInstruction.data.readBigInt64LE(4) !== BigInt(betInLamports)
-    ) {
-      console.log('DEBUG - Transaction does not match expected parameters');
-      return res.status(400).json({ success: false, error: 'Transaction does not match expected parameters' });
+    if (transaction.instructions.length !== 1) {
+      console.log('DEBUG - Unexpected number of instructions:', transaction.instructions.length);
+      return res.status(400).json({ success: false, error: `Transaction must contain exactly one instruction, found ${transaction.instructions.length}` });
     }
 
-    // Invia la transazione
+    const transferInstruction = transaction.instructions[0];
+    if (!transferInstruction.programId.equals(SystemProgram.programId)) {
+      console.log('DEBUG - Invalid program ID:', transferInstruction.programId.toBase58());
+      return res.status(400).json({ success: false, error: 'Instruction must be a SystemProgram.transfer' });
+    }
+
+    if (
+      transferInstruction.keys.length !== 2 ||
+      transferInstruction.keys[0].pubkey.toBase58() !== playerAddress ||
+      transferInstruction.keys[1].pubkey.toBase58() !== wallet.publicKey.toBase58()
+    ) {
+      console.log('DEBUG - Invalid instruction keys');
+      return res.status(400).json({ success: false, error: 'Invalid instruction keys' });
+    }
+
+    const instructionData = transferInstruction.data;
+    if (instructionData.length < 12) {
+      console.log('DEBUG - Invalid instruction data length:', instructionData.length);
+      return res.status(400).json({ success: false, error: 'Invalid instruction data length' });
+    }
+
+    const lamports = instructionData.readBigInt64LE(4);
+    if (lamports !== BigInt(betInLamports)) {
+      console.log('DEBUG - Mismatch in lamports:', { expected: betInLamports, actual: Number(lamports) });
+      return res.status(400).json({ success: false, error: 'Transaction lamports do not match bet amount' });
+    }
+
     const signature = await connection.sendRawTransaction(transaction.serialize());
     console.log('DEBUG - Transaction signature:', signature);
 
-    // Conferma la transazione
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
       console.log('DEBUG - Transaction failed:', confirmation.value.err);
