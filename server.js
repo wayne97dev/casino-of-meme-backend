@@ -7,7 +7,7 @@ const Player = require('./models/Player');
 const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
-const bsuse = require('bs58');
+const bs58 = require('bs58');
 
 const app = express();
 const server = http.createServer(app);
