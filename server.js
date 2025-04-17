@@ -422,6 +422,62 @@ app.post('/create-transaction', async (req, res) => {
   }
 });
 
+// Endpoint per preparare i dati della transazione (nuovo)
+app.post('/prepare-transaction', async (req, res) => {
+  const { playerAddress, betAmount, type } = req.body;
+
+  console.log('DEBUG - /prepare-transaction called with:', { playerAddress, betAmount, type });
+
+  // Validazione dei parametri
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
+  }
+
+  try {
+    // Validazione dell'indirizzo Solana
+    let userPublicKey;
+    try {
+      userPublicKey = new PublicKey(playerAddress);
+      console.log('DEBUG - Valid Solana address:', playerAddress);
+    } catch (err) {
+      console.log('DEBUG - Invalid Solana address:', err.message);
+      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
+    }
+
+    if (type === 'sol') {
+      // Calcola i lamports
+      const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+      console.log('DEBUG - Bet in lamports:', betInLamports);
+
+      // Verifica il saldo dell'utente
+      const userBalance = await connection.getBalance(userPublicKey);
+      console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
+      if (userBalance < betInLamports) {
+        console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
+        return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+      }
+
+      // Ottieni il blockhash recente
+      const { blockhash } = await connection.getLatestBlockhash();
+      console.log('DEBUG - Recent blockhash:', blockhash);
+
+      // Restituisci i dati necessari per costruire la transazione
+      res.json({
+        success: true,
+        betInLamports,
+        recentBlockhash: blockhash,
+        taxWalletAddress: wallet.publicKey.toBase58(),
+      });
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid transaction type' });
+    }
+  } catch (err) {
+    console.error('Error in prepare-transaction:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to prepare transaction: ${err.message}` });
+  }
+});
+
 // Nuovo endpoint per processare le transazioni di tutti i minigiochi (escluso Poker PvP)
 app.post('/process-transaction', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
