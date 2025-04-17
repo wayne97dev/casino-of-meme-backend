@@ -5,6 +5,9 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const Player = require('./models/Player');
 const Game = require('./models/Game');
+const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
+const bs58 = require('bs58');
 
 const app = express();
 const server = http.createServer(app);
@@ -14,14 +17,15 @@ const allowedOrigins = [
   'https://casino-of-meme.com',
   'http://localhost:5173',
   'http://localhost:3000',
+  
 ];
 
+// Middleware per logging e gestione CORS
 app.use((req, res, next) => {
   console.log(`Received request: ${req.method} ${req.url} from origin: ${req.headers.origin}`);
   next();
 });
 
-// Middleware manuale per logging e gestione CORS
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   console.log(`Received request: ${req.method} ${req.url} from origin: ${origin}`);
@@ -61,24 +65,43 @@ const io = new Server(server, {
 app.use(express.json());
 
 // Connessione a MongoDB
-const MONGODB_URI = process.env.MONGODB_URI || 
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error('ERROR - MONGODB_URI is missing in environment variables');
+  process.exit(1);
+}
 mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 30000, // Timeout per la selezione del server
-  connectTimeoutMS: 30000, // Timeout per la connessione
-  socketTimeoutMS: 45000, // Timeout per le operazioni
-  maxPoolSize: 10, // Limita il numero di connessioni
-  retryWrites: true, // Riprova scritture in caso di errori
+  serverSelectionTimeoutMS: 30000,
+  connectTimeoutMS: 30000,
+  socketTimeoutMS: 45000,
+  maxPoolSize: 10,
+  retryWrites: true,
 })
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
+
+// Connessione a Solana
+const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
+
+// Carica la private key in formato base58
+const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
+if (!WALLET_PRIVATE_KEY) {
+  console.error('ERROR - WALLET_PRIVATE_KEY is missing in environment variables');
+  process.exit(1);
+}
+console.log('DEBUG - WALLET_PRIVATE_KEY:', WALLET_PRIVATE_KEY ? 'Present' : 'Missing');
+
+// Crea il wallet dal backend
+const wallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
 
 // Stato del gioco
 const games = {};
 const waitingPlayers = [];
 
 // Indirizzo del mint COM
-const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7'; // Sostituisci con il tuo nuovo mint address
+const COM_MINT_ADDRESS = '7tXGPcSsWDgPHmLBS1EirBsPPitBktfCepp8KeGiJmrR';
 console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
+const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
 
 // Scommessa minima in COM
 const MIN_BET = 1000; // 1000 COM
@@ -87,7 +110,7 @@ const MIN_BET = 1000; // 1000 COM
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
   if (obj && typeof obj === 'object') {
     if (seen.has(obj)) {
-      return undefined; // Riferimento circolare trovato, rimuovilo
+      return undefined;
     }
     seen.add(obj);
     if (Array.isArray(obj)) {
@@ -124,11 +147,9 @@ const refundBetsForGame = async (gameId) => {
       }
     }
 
-    // Rimuovi la partita dal database
     await Game.deleteOne({ gameId });
     console.log(`Deleted game ${gameId} after refund`);
 
-    // Rimuovi la partita dallo stato in memoria
     if (games[gameId]) {
       delete games[gameId];
     }
@@ -160,13 +181,418 @@ const refundAllActiveGames = async () => {
   }
 };
 
+// Endpoint per distribuire vincite in COM
+app.post('/distribute-winnings', async (req, res) => {
+  const { winnerAddress, amount } = req.body;
+
+  if (!winnerAddress || !amount) {
+    return res.status(400).json({ success: false, error: 'Missing winnerAddress or amount' });
+  }
+
+  try {
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, new PublicKey(winnerAddress));
+
+    const transaction = new Transaction().add(
+      createTransferInstruction(
+        casinoATA,
+        winnerATA,
+        wallet.publicKey,
+        amount * 1e9 // 9 decimali
+      )
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Sent ${amount} COM to the Winner ${winnerAddress}`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error distributing winnings:', err);
+    res.status(500).json({ success: false, error: 'Failed to distribute winnings' });
+  }
+});
+
+// Endpoint per gestire i rimborsi in COM
+app.post('/refund', async (req, res) => {
+  const { playerAddress, amount } = req.body;
+
+  if (!playerAddress || !amount) {
+    return res.status(400).json({ success: false, error: 'Missing playerAddress or amount' });
+  }
+
+  try {
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    const playerATA = await getAssociatedTokenAddress(MINT_ADDRESS, new PublicKey(playerAddress));
+
+    const transaction = new Transaction().add(
+      createTransferInstruction(
+        casinoATA,
+        playerATA,
+        wallet.publicKey,
+        amount * 1e9 // 9 decimali
+      )
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Refunded ${amount} COM to ${playerAddress}`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error processing refund:', err);
+    res.status(500).json({ success: false, error: 'Failed to process refund' });
+  }
+});
+
+// Endpoint per unirsi a una partita di Poker PvP
+app.post('/join-poker-game', async (req, res) => {
+  const { playerAddress, betAmount } = req.body;
+
+  if (!playerAddress || !betAmount) {
+    return res.status(400).json({ success: false, error: 'Missing playerAddress or betAmount' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+
+    // Verifica se l'ATA dell'utente esiste, altrimenti crealo
+    let userAccountExists = false;
+    try {
+      await getAccount(connection, userATA);
+      userAccountExists = true;
+    } catch (err) {
+      const transaction = new Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          userATA,
+          userPublicKey,
+          MINT_ADDRESS
+        )
+      );
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log(`Created user ATA for ${playerAddress}`);
+    }
+
+    // Verifica se l'ATA del casinò esiste, altrimenti crealo
+    let casinoAccountExists = false;
+    try {
+      await getAccount(connection, casinoATA);
+      casinoAccountExists = true;
+    } catch (err) {
+      const transaction = new Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          casinoATA,
+          wallet.publicKey,
+          MINT_ADDRESS
+        )
+      );
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log('Created casino ATA');
+    }
+
+    // Verifica il saldo COM dell'utente
+    const userBalance = await connection.getTokenAccountBalance(userATA);
+    if (userBalance.value.uiAmount < betAmount) {
+      return res.status(400).json({ success: false, error: 'Saldo COM insufficiente' });
+    }
+
+    // Crea la transazione per trasferire COM
+    const transaction = new Transaction().add(
+      createTransferInstruction(
+        userATA,
+        casinoATA,
+        userPublicKey,
+        betAmount * 1e9 // Usa 9 decimali
+      )
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in join-poker-game:', err);
+    res.status(500).json({ success: false, error: 'Failed to join game' });
+  }
+});
+
+// Endpoint per gestire le mosse in Poker PvP
+app.post('/make-poker-move', async (req, res) => {
+  const { playerAddress, gameId, move, amount } = req.body;
+
+  if (!playerAddress || !gameId || !move || amount === undefined) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+
+    // Verifica il saldo COM dell'utente
+    const userBalance = await connection.getTokenAccountBalance(userATA);
+    if (userBalance.value.uiAmount < amount) {
+      return res.status(400).json({ success: false, error: 'Saldo COM insufficiente' });
+    }
+
+    // Crea la transazione per trasferire COM
+    const transaction = new Transaction().add(
+      createTransferInstruction(
+        userATA,
+        casinoATA,
+        userPublicKey,
+        amount * 1e9 // Usa 9 decimali
+      )
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in make-poker-move:', err);
+    res.status(500).json({ success: false, error: 'Failed to process move' });
+  }
+});
+
+// Endpoint per iniziare una partita di Blackjack
+app.post('/start-blackjack', async (req, res) => {
+  const { playerAddress, betAmount } = req.body;
+
+  if (!playerAddress || !betAmount) {
+    return res.status(400).json({ success: false, error: 'Missing playerAddress or betAmount' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = betAmount * LAMPORTS_PER_SOL;
+
+    // Verifica il saldo SOL dell'utente
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Saldo SOL insufficiente' });
+    }
+
+    // Crea la transazione per trasferire SOL
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: userPublicKey,
+        toPubkey: wallet.publicKey,
+        lamports: betInLamports,
+      })
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Transferred ${betAmount} SOL from ${playerAddress} to casino for Blackjack`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in start-blackjack:', err);
+    res.status(500).json({ success: false, error: 'Failed to start Blackjack game' });
+  }
+});
+
+// Endpoint per gestire la fine di una partita di Blackjack
+app.post('/blackjack-stand', async (req, res) => {
+  const { playerAddress, betAmount, playerScore, dealerScore } = req.body;
+
+  if (!playerAddress || !betAmount || playerScore === undefined || dealerScore === undefined) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const winAmount = betAmount * 2;
+    const winAmountInLamports = winAmount * LAMPORTS_PER_SOL;
+    const betInLamports = betAmount * LAMPORTS_PER_SOL;
+
+    let outcome, message;
+
+    if (dealerScore > 21) {
+      outcome = 'win';
+      message = `Dealer busted! You won ${winAmount.toFixed(2)} SOL!`;
+    } else if (playerScore > dealerScore) {
+      outcome = 'win';
+      message = `You won ${winAmount.toFixed(2)} SOL!`;
+    } else if (playerScore === dealerScore) {
+      outcome = 'tie';
+      message = "It's a tie! Your bet is returned.";
+    } else {
+      outcome = 'loss';
+      message = 'Dealer wins! Try again.';
+    }
+
+    if (outcome === 'win') {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: winAmountInLamports,
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log(`Distributed ${winAmount} SOL to ${playerAddress} for Blackjack win`);
+    } else if (outcome === 'tie') {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: betInLamports,
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log(`Refunded ${betAmount} SOL to ${playerAddress} for Blackjack tie`);
+    }
+
+    res.json({ success: true, outcome, winAmount: outcome === 'win' ? winAmount : 0, message });
+  } catch (err) {
+    console.error('Error in blackjack-stand:', err);
+    res.status(500).json({ success: false, error: 'Failed to process Blackjack stand' });
+  }
+});
+
+// Endpoint per un giro di Meme Slots
+app.post('/spin-slots', async (req, res) => {
+  const { playerAddress, betAmount } = req.body;
+
+  if (!playerAddress || !betAmount) {
+    return res.status(400).json({ success: false, error: 'Missing playerAddress or betAmount' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = betAmount * LAMPORTS_PER_SOL;
+
+    // Verifica il saldo SOL dell'utente
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Saldo SOL insufficiente' });
+    }
+
+    // Crea la transazione per trasferire SOL
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: userPublicKey,
+        toPubkey: wallet.publicKey,
+        lamports: betInLamports,
+      })
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Transferred ${betAmount} SOL from ${playerAddress} to casino for Meme Slots`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in spin-slots:', err);
+    res.status(500).json({ success: false, error: 'Failed to process spin' });
+  }
+});
+
+// Endpoint per distribuire vincite in SOL
+app.post('/distribute-winnings-sol', async (req, res) => {
+  const { playerAddress, amount } = req.body;
+
+  if (!playerAddress || !amount) {
+    return res.status(400).json({ success: false, error: 'Missing playerAddress or amount' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const amountInLamports = amount * LAMPORTS_PER_SOL;
+
+    // Crea la transazione per trasferire SOL
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: userPublicKey,
+        lamports: amountInLamports,
+      })
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Distributed ${amount} SOL to ${playerAddress}`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in distribute-winnings-sol:', err);
+    res.status(500).json({ success: false, error: 'Failed to distribute winnings' });
+  }
+});
+
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
 
-    // Validazione della scommessa
     const minBet = MIN_BET;
     if (betAmount < minBet) {
       socket.emit('error', { message: `Bet must be at least ${minBet.toFixed(2)} COM` });
@@ -216,7 +642,6 @@ io.on('connection', (socket) => {
         timeLeft: 30,
       };
 
-      // Salva la partita nel database
       try {
         const game = new Game({
           gameId,
@@ -256,15 +681,13 @@ io.on('connection', (socket) => {
       waitingPlayers.splice(playerIndex, 1);
       console.log(`Player ${playerAddress} left the waiting list`);
 
-      // Invia il rimborso al giocatore
       socket.emit('refund', {
         message: 'You left the waiting list. Your bet has been refunded.',
         amount: player.bet,
       });
 
-      // Aggiorna gli altri giocatori nella lista d'attesa
-      io.emit('waitingPlayers', { 
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
       });
       socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
     } else {
@@ -286,7 +709,6 @@ io.on('connection', (socket) => {
           game.currentTurn = socket.id;
           console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
         }
-        // Aggiorna il socket.id nel database
         try {
           await Game.updateOne(
             { gameId, 'players.address': playerAddress },
@@ -370,7 +792,6 @@ io.on('connection', (socket) => {
       } else {
         startTurnTimer(gameId, opponent.id);
       }
-      // Aggiorna il pot nel database
       try {
         await Game.updateOne({ gameId }, { pot: game.pot });
         console.log(`Updated pot for game ${gameId} to ${game.pot}`);
@@ -395,7 +816,6 @@ io.on('connection', (socket) => {
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       game.currentTurn = opponent.id;
       game.bettingRoundComplete = false;
-      // Aggiorna il pot nel database
       try {
         await Game.updateOne({ gameId }, { pot: game.pot });
         console.log(`Updated pot for game ${gameId} to ${game.pot}`);
@@ -415,8 +835,8 @@ io.on('connection', (socket) => {
       const player = waitingPlayers[waitingIndex];
       waitingPlayers.splice(waitingIndex, 1);
       console.log(`Player ${player.address} removed from waiting list due to disconnect`);
-      io.emit('waitingPlayers', { 
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
       });
     }
 
