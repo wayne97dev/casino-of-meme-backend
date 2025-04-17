@@ -422,16 +422,16 @@ app.post('/create-transaction', async (req, res) => {
   }
 });
 
-// Endpoint per preparare i dati della transazione (nuovo)
-app.post('/prepare-transaction', async (req, res) => {
-  const { playerAddress, betAmount, type } = req.body;
+// Endpoint per ottenere solo il recentBlockhash
+app.post('/get-recent-blockhash', async (req, res) => {
+  const { playerAddress } = req.body;
 
-  console.log('DEBUG - /prepare-transaction called with:', { playerAddress, betAmount, type });
+  console.log('DEBUG - /get-recent-blockhash called with:', { playerAddress });
 
   // Validazione dei parametri
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
+  if (!playerAddress) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress' });
   }
 
   try {
@@ -445,38 +445,21 @@ app.post('/prepare-transaction', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid Solana address' });
     }
 
-    if (type === 'sol') {
-      // Calcola i lamports
-      const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-      console.log('DEBUG - Bet in lamports:', betInLamports);
+    // Ottieni il blockhash recente
+    const { blockhash } = await connection.getLatestBlockhash();
+    console.log('DEBUG - Recent blockhash:', blockhash);
 
-      // Verifica il saldo dell'utente
-      const userBalance = await connection.getBalance(userPublicKey);
-      console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
-      if (userBalance < betInLamports) {
-        console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
-        return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-      }
-
-      // Ottieni il blockhash recente
-      const { blockhash } = await connection.getLatestBlockhash();
-      console.log('DEBUG - Recent blockhash:', blockhash);
-
-      // Restituisci i dati necessari per costruire la transazione
-      res.json({
-        success: true,
-        betInLamports,
-        recentBlockhash: blockhash,
-        taxWalletAddress: wallet.publicKey.toBase58(),
-      });
-    } else {
-      return res.status(400).json({ success: false, error: 'Invalid transaction type' });
-    }
+    // Restituisci il blockhash
+    res.json({
+      success: true,
+      recentBlockhash: blockhash,
+    });
   } catch (err) {
-    console.error('Error in prepare-transaction:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to prepare transaction: ${err.message}` });
+    console.error('Error in get-recent-blockhash:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to get recent blockhash: ${err.message}` });
   }
 });
+
 
 // Nuovo endpoint per processare le transazioni di tutti i minigiochi (escluso Poker PvP)
 app.post('/process-transaction', async (req, res) => {
