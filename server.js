@@ -77,7 +77,8 @@ const games = {};
 const waitingPlayers = [];
 
 // Indirizzo del mint COM
-const COM_MINT_ADDRESS = process.env.COM_MINT_ADDRESS || '7tXGPcSsWDgPHmLBS1EirBsPPitBktfCepp8KeGiJmrR';
+const COM_MINT_ADDRESS = '7tXGPcSsWDgPHmLBS1EirBsPPitBktfCepp8KeGiJmrR'; // Sostituisci con il tuo nuovo mint address
+console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
 
 // Scommessa minima in COM
 const MIN_BET = 2000; // 1000 COM
