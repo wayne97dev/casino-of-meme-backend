@@ -61,7 +61,7 @@ const io = new Server(server, {
 app.use(express.json());
 
 // Connessione a MongoDB
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://Cluster24283:Wkh1UXlmUnNf@cluster24283.ri0qrdr.mongodb.net/casino-of-meme?retryWrites=true&w=majority';
+const MONGODB_URI = process.env.MONGODB_URI || 
 mongoose.connect(MONGODB_URI, {
   serverSelectionTimeoutMS: 30000, // Timeout per la selezione del server
   connectTimeoutMS: 30000, // Timeout per la connessione
