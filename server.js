@@ -99,7 +99,7 @@ const games = {};
 const waitingPlayers = [];
 
 // Indirizzo del mint COM
-const COM_MINT_ADDRESS = '7tXGPcSsWDgPHmLBS1EirBsPPitBktfCepp8KeGiJmrR';
+const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
 console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
 const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
 
