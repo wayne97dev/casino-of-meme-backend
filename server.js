@@ -2,6 +2,7 @@
 require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
 
 
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -12,7 +13,6 @@ const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
-
 
 const app = express();
 const server = http.createServer(app);
@@ -121,7 +121,7 @@ const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
 console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
 const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
 
-// Scommessa minima in COM
+// Scommessa minima in COM per Poker PvP
 const MIN_BET = 1000; // 1000 COM
 
 // Funzione per rimuovere riferimenti circolari
@@ -199,8 +199,6 @@ const refundAllActiveGames = async () => {
   }
 };
 
-
-
 // Endpoint per il saldo del tax wallet
 app.get('/tax-wallet-balance', async (req, res) => {
   try {
@@ -274,7 +272,7 @@ app.get('/com-balance/:playerAddress', async (req, res) => {
   }
 });
 
-// Endpoint per distribuire vincite in COM
+// Endpoint per distribuire vincite in COM (usato per Poker PvP)
 app.post('/distribute-winnings', async (req, res) => {
   const { winnerAddress, amount } = req.body;
 
@@ -311,7 +309,7 @@ app.post('/distribute-winnings', async (req, res) => {
   }
 });
 
-// Endpoint per gestire i rimborsi in COM
+// Endpoint per gestire i rimborsi in COM (usato per Poker PvP)
 app.post('/refund', async (req, res) => {
   const { playerAddress, amount } = req.body;
 
@@ -348,7 +346,228 @@ app.post('/refund', async (req, res) => {
   }
 });
 
-// Endpoint per unirsi a una partita di Poker PvP
+// Endpoint per creare una transazione (usato da tutti i minigiochi escluso Poker PvP)
+app.post('/create-transaction', async (req, res) => {
+  const { playerAddress, betAmount, type } = req.body;
+
+  console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
+
+  // Validazione dei parametri
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
+  }
+
+  try {
+    // Validazione dell'indirizzo Solana
+    let userPublicKey;
+    try {
+      userPublicKey = new PublicKey(playerAddress);
+      console.log('DEBUG - Valid Solana address:', playerAddress);
+    } catch (err) {
+      console.log('DEBUG - Invalid Solana address:', err.message);
+      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
+    }
+
+    const transaction = new Transaction();
+
+    if (type === 'sol') {
+      // Trasferimento SOL verso il tax wallet
+      const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+      console.log('DEBUG - Bet in lamports:', betInLamports);
+
+      // Verifica il saldo dell'utente
+      const userBalance = await connection.getBalance(userPublicKey);
+      console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
+      if (userBalance < betInLamports) {
+        console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
+        return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+      }
+
+      transaction.add(
+        SystemProgram.transfer({
+          fromPubkey: userPublicKey,
+          toPubkey: wallet.publicKey, // Tax wallet
+          lamports: betInLamports,
+        })
+      );
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid transaction type' });
+    }
+
+    // Ottieni il blockhash recente
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = userPublicKey;
+
+    // Log della transazione creata
+    console.log('DEBUG - Transaction created:', {
+      instructionCount: transaction.instructions.length,
+      instructions: transaction.instructions.map((instr, index) => ({
+        index,
+        programId: instr.programId.toBase58(),
+        keys: instr.keys.map(key => key.pubkey.toBase58()),
+        data: instr.data.toString('hex'),
+      })),
+      recentBlockhash: transaction.recentBlockhash,
+    });
+
+    // Serializza la transazione
+    const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
+
+    res.json({ success: true, transaction: serializedTransaction });
+  } catch (err) {
+    console.error('Error in create-transaction:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to create transaction: ${err.message}` });
+  }
+});
+
+// Nuovo endpoint per processare le transazioni di tutti i minigiochi (escluso Poker PvP)
+app.post('/process-transaction', async (req, res) => {
+  const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
+
+  console.log('DEBUG - /process-transaction called with:', {
+    playerAddress,
+    betAmount,
+    hasSignedTransaction: !!signedTransaction,
+    gameType,
+  });
+
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !gameType) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction, gameType });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, signedTransaction, or gameType' });
+  }
+
+  // Validazione del gameType
+  const validGameTypes = ['memeSlots', 'crazyWheel', 'solanaCardDuel', 'coinFlip'];
+  if (!validGameTypes.includes(gameType)) {
+    console.log('DEBUG - Invalid gameType:', gameType);
+    return res.status(400).json({ success: false, error: 'Invalid gameType' });
+  }
+
+  try {
+    let userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+    console.log('DEBUG - Decoded transaction in /process-transaction:', {
+      instructionCount: transaction.instructions.length,
+      instructions: transaction.instructions.map((instr, index) => ({
+        index,
+        programId: instr.programId.toBase58(),
+        keys: instr.keys.map(key => key.pubkey.toBase58()),
+        data: instr.data.toString('hex'),
+      })),
+    });
+
+    if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures');
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    if (transaction.instructions.length !== 1) {
+      console.log('DEBUG - Unexpected number of instructions:', transaction.instructions.length);
+      console.log('DEBUG - Instructions details:', transaction.instructions.map((instr, index) => ({
+        index,
+        programId: instr.programId.toBase58(),
+        keys: instr.keys.map(key => key.pubkey.toBase58()),
+        data: instr.data.toString('hex'),
+      })));
+      return res.status(400).json({
+        success: false,
+        error: `Transaction must contain exactly one instruction, found ${transaction.instructions.length}`,
+      });
+    }
+
+    const transferInstruction = transaction.instructions[0];
+    if (!transferInstruction.programId.equals(SystemProgram.programId)) {
+      console.log('DEBUG - Invalid program ID:', transferInstruction.programId.toBase58());
+      return res.status(400).json({ success: false, error: 'Instruction must be a SystemProgram.transfer' });
+    }
+
+    if (
+      transferInstruction.keys.length !== 2 ||
+      transferInstruction.keys[0].pubkey.toBase58() !== playerAddress ||
+      transferInstruction.keys[1].pubkey.toBase58() !== wallet.publicKey.toBase58()
+    ) {
+      console.log('DEBUG - Invalid instruction keys');
+      return res.status(400).json({ success: false, error: 'Invalid instruction keys' });
+    }
+
+    const instructionData = transferInstruction.data;
+    if (instructionData.length < 12) {
+      console.log('DEBUG - Invalid instruction data length:', instructionData.length);
+      return res.status(400).json({ success: false, error: 'Invalid instruction data length' });
+    }
+
+    const lamports = instructionData.readBigInt64LE(4);
+    if (lamports !== BigInt(betInLamports)) {
+      console.log('DEBUG - Mismatch in lamports:', { expected: betInLamports, actual: Number(lamports) });
+      return res.status(400).json({ success: false, error: 'Transaction lamports do not match bet amount' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Transaction signature:', signature);
+
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    console.log(`Transferred ${betAmount} SOL from ${playerAddress} to tax wallet for ${gameType}`);
+
+    res.json({ success: true, signature });
+  } catch (err) {
+    console.error('Error in process-transaction:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to process transaction: ${err.message}` });
+  }
+});
+
+// Endpoint per distribuire vincite in SOL (usato per tutti i minigiochi escluso Poker PvP)
+app.post('/distribute-winnings-sol', async (req, res) => {
+  const { playerAddress, amount } = req.body;
+
+  if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const amountInLamports = amount * LAMPORTS_PER_SOL;
+
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: userPublicKey,
+        lamports: amountInLamports,
+      })
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.partialSign(wallet);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Distributed ${amount} SOL to ${playerAddress}`);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in distribute-winnings-sol:', err);
+    res.status(500).json({ success: false, error: 'Failed to distribute winnings' });
+  }
+});
+
+// Endpoint per unirsi a una partita di Poker PvP (invariato)
 app.post('/join-poker-game', async (req, res) => {
   const { playerAddress, betAmount } = req.body;
 
@@ -435,7 +654,7 @@ app.post('/join-poker-game', async (req, res) => {
   }
 });
 
-// Endpoint per gestire le mosse in Poker PvP
+// Endpoint per gestire le mosse in Poker PvP (invariato)
 app.post('/make-poker-move', async (req, res) => {
   const { playerAddress, gameId, move, amount } = req.body;
 
@@ -480,375 +699,35 @@ app.post('/make-poker-move', async (req, res) => {
   }
 });
 
-// Endpoint per iniziare una partita di Blackjack
-app.post('/start-blackjack', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction } = req.body;
-
-  console.log('DEBUG - /start-blackjack called with:', { playerAddress, betAmount });
-
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
-  }
-
+// Endpoint per la leaderboard (invariato)
+app.get('/leaderboard', async (req, res) => {
+  console.log('Received request for /leaderboard');
   try {
-    let userPublicKey;
-    try {
-      userPublicKey = new PublicKey(playerAddress);
-      console.log('DEBUG - Valid Solana address:', playerAddress);
-    } catch (err) {
-      console.log('DEBUG - Invalid Solana address:', err.message);
-      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
-    }
-
-    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-    console.log('DEBUG - Bet in lamports:', betInLamports);
-
-    const userBalance = await connection.getBalance(userPublicKey);
-    console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
-    if (userBalance < betInLamports) {
-      console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
-      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-    }
-
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-    console.log('DEBUG - Decoded transaction:', {
-      from: transaction.instructions[0]?.keys[0]?.pubkey?.toBase58(),
-      to: transaction.instructions[0]?.keys[1]?.pubkey?.toBase58(),
-      lamports: transaction.instructions[0]?.data?.readBigInt64LE(4),
-    });
-
-    if (!transaction.verifySignatures()) {
-      console.log('DEBUG - Invalid transaction signatures');
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    const transferInstruction = transaction.instructions[0];
-    if (
-      !transferInstruction.programId.equals(SystemProgram.programId) ||
-      transferInstruction.keys[0].pubkey.toBase58() !== playerAddress ||
-      transferInstruction.keys[1].pubkey.toBase58() !== wallet.publicKey.toBase58() ||
-      transferInstruction.data.readBigInt64LE(4) !== BigInt(betInLamports)
-    ) {
-      console.log('DEBUG - Transaction does not match expected parameters');
-      return res.status(400).json({ success: false, error: 'Transaction does not match expected parameters' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    console.log('DEBUG - Transaction signature:', signature);
-
-    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-    if (confirmation.value.err) {
-      console.log('DEBUG - Transaction failed:', confirmation.value.err);
-      return res.status(500).json({ success: false, error: 'Transaction failed' });
-    }
-
-    console.log(`Transferred ${betAmount} SOL from ${playerAddress} to casino for Blackjack`);
-
-    res.json({ success: true, signature });
-  } catch (err) {
-    console.error('Error in start-blackjack:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to start Blackjack: ${err.message}` });
-  }
-});
-
-// Endpoint per gestire la fine di una partita di Blackjack
-app.post('/blackjack-stand', async (req, res) => {
-  const { playerAddress, betAmount, playerScore, dealerScore } = req.body;
-
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || playerScore === undefined || dealerScore === undefined) {
-    return res.status(400).json({ success: false, error: 'Invalid required fields' });
-  }
-
-  try {
-    const userPublicKey = new PublicKey(playerAddress);
-    const winAmount = betAmount * 2;
-    const winAmountInLamports = winAmount * LAMPORTS_PER_SOL;
-    const betInLamports = betAmount * LAMPORTS_PER_SOL;
-
-    let outcome, message;
-
-    if (dealerScore > 21) {
-      outcome = 'win';
-      message = `Dealer busted! You won ${winAmount.toFixed(2)} SOL!`;
-    } else if (playerScore > dealerScore) {
-      outcome = 'win';
-      message = `You won ${winAmount.toFixed(2)} SOL!`;
-    } else if (playerScore === dealerScore) {
-      outcome = 'tie';
-      message = "It's a tie! Your bet is returned.";
+    console.log('Fetching leaderboard...');
+    const leaderboard = await Player.find()
+      .sort({ totalWinnings: -1 })
+      .limit(10)
+      .maxTimeMS(5000);
+    console.log('Leaderboard fetched:', leaderboard);
+    if (!leaderboard || leaderboard.length === 0) {
+      console.log('Leaderboard is empty');
+      res.json([]);
     } else {
-      outcome = 'loss';
-      message = 'Dealer wins! Try again.';
-    }
-
-    if (outcome === 'win') {
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: userPublicKey,
-          lamports: winAmountInLamports,
-        })
-      );
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log(`Distributed ${winAmount} SOL to ${playerAddress} for Blackjack win`);
-    } else if (outcome === 'tie') {
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: userPublicKey,
-          lamports: betInLamports,
-        })
-      );
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log(`Refunded ${betAmount} SOL to ${playerAddress} for Blackjack tie`);
-    }
-
-    res.json({ success: true, outcome, winAmount: outcome === 'win' ? winAmount : 0, message });
-  } catch (err) {
-    console.error('Error in blackjack-stand:', err);
-    res.status(500).json({ success: false, error: 'Failed to process Blackjack stand' });
-  }
-});
-
-
-app.post('/create-transaction', async (req, res) => {
-  const { playerAddress, betAmount, type } = req.body;
-
-  console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
-
-  // Validazione dei parametri
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
-  }
-
-  try {
-    // Validazione dell'indirizzo Solana
-    let userPublicKey;
-    try {
-      userPublicKey = new PublicKey(playerAddress);
-      console.log('DEBUG - Valid Solana address:', playerAddress);
-    } catch (err) {
-      console.log('DEBUG - Invalid Solana address:', err.message);
-      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
-    }
-
-    const transaction = new Transaction();
-
-    if (type === 'sol') {
-      // Trasferimento SOL
-      const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-      console.log('DEBUG - Bet in lamports:', betInLamports);
-
-      // Verifica il saldo dell'utente
-      const userBalance = await connection.getBalance(userPublicKey);
-      console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
-      if (userBalance < betInLamports) {
-        console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
-        return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-      }
-
-      transaction.add(
-        SystemProgram.transfer({
-          fromPubkey: userPublicKey,
-          toPubkey: wallet.publicKey,
-          lamports: betInLamports,
-        })
-      );
-    } else if (type === 'com') {
-      // Trasferimento COM (per Poker PvP)
-      const betInTokens = Math.round(betAmount * 1e9); // COM usa 9 decimali
-      const mintPublicKey = new PublicKey(MINT_ADDRESS);
-      const userATA = await getAssociatedTokenAddress(mintPublicKey, userPublicKey);
-      const casinoATA = await getAssociatedTokenAddress(mintPublicKey, wallet.publicKey);
-
-      // Verifica il saldo COM
-      const userBalance = await connection.getTokenAccountBalance(userATA).catch(() => ({
-        value: { uiAmount: 0 },
+      const leaderboardWithUnit = leaderboard.map(player => ({
+        address: player.address,
+        totalWinnings: player.totalWinnings,
+        unit: 'COM',
       }));
-      if (userBalance.value.uiAmount < betAmount) {
-        console.log('DEBUG - Insufficient COM balance:', userBalance.value.uiAmount);
-        return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
-      }
-
-      transaction.add(
-        createTransferInstruction(
-          userATA,
-          casinoATA,
-          userPublicKey,
-          betInTokens
-        )
-      );
-    } else {
-      return res.status(400).json({ success: false, error: 'Invalid transaction type' });
+      res.json(leaderboardWithUnit);
     }
-
-    // Ottieni il blockhash recente
-    const { blockhash } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = userPublicKey;
-
-    // Log della transazione creata
-    console.log('DEBUG - Transaction created:', {
-      instructions: transaction.instructions.map((instr, index) => ({
-        index,
-        programId: instr.programId.toBase58(),
-        keys: instr.keys.map(key => key.pubkey.toBase58()),
-        data: instr.data.toString('hex'),
-      })),
-      recentBlockhash: transaction.recentBlockhash,
-    });
-
-    // Serializza la transazione
-    const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
-
-    res.json({ success: true, transaction: serializedTransaction });
   } catch (err) {
-    console.error('Error in create-transaction:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to create transaction: ${err.message}` });
+    console.error('Error fetching leaderboard:', err.message);
+    console.error('Error stack:', err.stack);
+    res.status(500).json({ error: 'Error fetching leaderboard' });
   }
 });
 
-// Endpoint per un giro di Meme Slots
-app.post('/spin-slots', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction } = req.body;
-
-  console.log('DEBUG - /spin-slots called with:', { playerAddress, betAmount, hasSignedTransaction: !!signedTransaction });
-
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
-  }
-
-  try {
-    let userPublicKey = new PublicKey(playerAddress);
-    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-
-    const userBalance = await connection.getBalance(userPublicKey);
-    if (userBalance < betInLamports) {
-      console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
-      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-    }
-
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-    console.log('DEBUG - Decoded transaction:', {
-      instructions: transaction.instructions.map((instr, index) => ({
-        index,
-        programId: instr.programId.toBase58(),
-        keys: instr.keys.map(key => key.pubkey.toBase58()),
-        data: instr.data.toString('hex'),
-      })),
-    });
-
-    if (!transaction.verifySignatures()) {
-      console.log('DEBUG - Invalid transaction signatures');
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    if (transaction.instructions.length !== 1) {
-      console.log('DEBUG - Unexpected number of instructions:', transaction.instructions.length);
-      return res.status(400).json({ success: false, error: `Transaction must contain exactly one instruction, found ${transaction.instructions.length}` });
-    }
-
-    const transferInstruction = transaction.instructions[0];
-    if (!transferInstruction.programId.equals(SystemProgram.programId)) {
-      console.log('DEBUG - Invalid program ID:', transferInstruction.programId.toBase58());
-      return res.status(400).json({ success: false, error: 'Instruction must be a SystemProgram.transfer' });
-    }
-
-    if (
-      transferInstruction.keys.length !== 2 ||
-      transferInstruction.keys[0].pubkey.toBase58() !== playerAddress ||
-      transferInstruction.keys[1].pubkey.toBase58() !== wallet.publicKey.toBase58()
-    ) {
-      console.log('DEBUG - Invalid instruction keys');
-      return res.status(400).json({ success: false, error: 'Invalid instruction keys' });
-    }
-
-    const instructionData = transferInstruction.data;
-    if (instructionData.length < 12) {
-      console.log('DEBUG - Invalid instruction data length:', instructionData.length);
-      return res.status(400).json({ success: false, error: 'Invalid instruction data length' });
-    }
-
-    const lamports = instructionData.readBigInt64LE(4);
-    if (lamports !== BigInt(betInLamports)) {
-      console.log('DEBUG - Mismatch in lamports:', { expected: betInLamports, actual: Number(lamports) });
-      return res.status(400).json({ success: false, error: 'Transaction lamports do not match bet amount' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    console.log('DEBUG - Transaction signature:', signature);
-
-    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-    if (confirmation.value.err) {
-      console.log('DEBUG - Transaction failed:', confirmation.value.err);
-      return res.status(500).json({ success: false, error: 'Transaction failed' });
-    }
-
-    console.log(`Transferred ${betAmount} SOL from ${playerAddress} to casino for Meme Slots`);
-
-    res.json({ success: true, signature });
-  } catch (err) {
-    console.error('Error in spin-slots:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to process spin: ${err.message}` });
-  }
-});
-
-// Endpoint per distribuire vincite in SOL
-app.post('/distribute-winnings-sol', async (req, res) => {
-  const { playerAddress, amount } = req.body;
-
-  if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
-  }
-
-  try {
-    const userPublicKey = new PublicKey(playerAddress);
-    const amountInLamports = amount * LAMPORTS_PER_SOL;
-
-    const transaction = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: wallet.publicKey,
-        toPubkey: userPublicKey,
-        lamports: amountInLamports,
-      })
-    );
-
-    const { blockhash } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = wallet.publicKey;
-    transaction.partialSign(wallet);
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    await connection.confirmTransaction(signature);
-    console.log(`Distributed ${amount} SOL to ${playerAddress}`);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error in distribute-winnings-sol:', err);
-    res.status(500).json({ success: false, error: 'Failed to distribute winnings' });
-  }
-});
-
-// Gestione delle connessioni WebSocket
+// Gestione delle connessioni WebSocket per Poker PvP (invariato)
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
 
