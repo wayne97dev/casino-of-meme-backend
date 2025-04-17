@@ -28,31 +28,19 @@ app.use((req, res, next) => {
 // Middleware CORS ottimizzato
 app.use(cors({
   origin: (origin, callback) => {
+    console.log(`CORS check for origin: ${origin}`);
     if (!origin || allowedOrigins.includes(origin)) {
+      console.log(`Allowing origin: ${origin}`);
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      console.log(`Blocking origin: ${origin}`);
+      callback(new Error(`Origin ${origin} not allowed by CORS`));
     }
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
-
-// Configurazione di Socket.IO con CORS
-const io = new Server(server, {
-  cors: {
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    },
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
-});
 
 // Middleware per parsing JSON
 app.use(express.json());
