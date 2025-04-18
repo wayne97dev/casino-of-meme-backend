@@ -477,7 +477,9 @@ app.post('/play-crazy-wheel', async (req, res) => {
 
     let resultIndex;
     const betIndices = crazyTimeWheel
-      .map((segment, index) => (betSegments.includes(String(segment.value)) ? index : -1))
+      .map((segment, index) =>
+        betSegments.includes(String(segment.value)) ? index : -1
+      )
       .filter(index => index !== -1);
 
     if (Math.random() < COMPUTER_WIN_CHANCE.crazyWheel) {
@@ -502,10 +504,12 @@ app.post('/play-crazy-wheel', async (req, res) => {
       resultIndex,
       result: result.value,
       type: result.type,
+      color: result.color,
+      colorName: result.colorName,
       topSlotSegment,
       topSlotMultiplier,
       crazyTimeWheelLength: crazyTimeWheel.length,
-      crazyTimeWheelSample: crazyTimeWheel.slice(0, 5), // Logga i primi 5 segmenti per debug
+      crazyTimeWheelSample: crazyTimeWheel.slice(0, 5),
     });
 
     if (result.type === 'number') {
@@ -638,7 +642,6 @@ app.get('/get-crazy-wheel', (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to fetch wheel data' });
   }
 });
-
 
 
 
