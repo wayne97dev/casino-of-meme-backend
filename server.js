@@ -478,7 +478,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
     let resultIndex;
     const colorMap = {};
 
-    // Crea una mappa di segmenti per valore, tipo e colore
+    // Crea una mappa di segmenti per colore
     crazyTimeWheel.forEach((segment, index) => {
       const key = `${segment.value}-${segment.type}-${segment.colorName}`;
       if (!colorMap[key]) {
