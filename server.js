@@ -478,9 +478,9 @@ app.post('/play-crazy-wheel', async (req, res) => {
     let resultIndex;
     const colorMap = {};
 
-    // Crea una mappa di segmenti per colore
+    // Crea una mappa di segmenti per valore, tipo e colore
     crazyTimeWheel.forEach((segment, index) => {
-      const key = `${segment.value}-${segment.colorName}`;
+      const key = `${segment.value}-${segment.type}-${segment.colorName}`;
       if (!colorMap[key]) {
         colorMap[key] = [];
       }
@@ -492,7 +492,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
       crazyTimeWheel
         .filter(seg => String(seg.value) === segment)
         .forEach(seg => {
-          const key = `${seg.value}-${seg.colorName}`;
+          const key = `${seg.value}-${seg.type}-${seg.colorName}`;
           if (colorMap[key]) {
             betColorKeys.push(key);
           }
