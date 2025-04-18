@@ -511,6 +511,8 @@ app.post('/play-crazy-wheel', async (req, res) => {
       type: result.type,
       topSlotSegment,
       topSlotMultiplier,
+      crazyTimeWheelLength: crazyTimeWheel.length,
+      crazyTimeWheelSample: crazyTimeWheel.slice(0, 5), // Logga i primi 5 segmenti per debug
     });
 
     if (result.type === 'number') {
@@ -592,7 +594,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
         if (betOnBonus > 0) {
           totalWin = betOnBonus * multiplier;
           bonusMessage = topSlotApplied
-            ? `Crazy Time: Hai vinto ${totalWin.window.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
+            ? `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
             : `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL!`;
         } else {
           bonusMessage = 'Hai attivato Crazy Time, ma non hai scommesso su di esso.';
@@ -633,6 +635,8 @@ app.post('/play-crazy-wheel', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to play crazy wheel' });
   }
 });
+
+
 
 // Funzione per creare il mazzo
 const createDeck = () => {
