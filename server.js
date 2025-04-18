@@ -476,42 +476,44 @@ app.post('/play-crazy-wheel', async (req, res) => {
     const topSlotMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
 
     let resultIndex;
-    const betIndices = [];
-    const betColors = [];
+    const colorMap = {};
 
-    // Crea una mappa di segmenti scommessi con i loro colori
+    // Crea una mappa di segmenti per colore
+    crazyTimeWheel.forEach((segment, index) => {
+      const key = `${segment.value}-${segment.colorName}`;
+      if (!colorMap[key]) {
+        colorMap[key] = [];
+      }
+      colorMap[key].push(index);
+    });
+
+    const betColorKeys = [];
     betSegments.forEach(segment => {
-      const matchingIndices = crazyTimeWheel
-        .map((seg, index) => (String(seg.value) === segment ? index : -1))
-        .filter(index => index !== -1);
-      matchingIndices.forEach(index => {
-        betIndices.push(index);
-        betColors.push(crazyTimeWheel[index].colorName);
-      });
+      crazyTimeWheel
+        .filter(seg => String(seg.value) === segment)
+        .forEach(seg => {
+          const key = `${seg.value}-${seg.colorName}`;
+          if (colorMap[key]) {
+            betColorKeys.push(key);
+          }
+        });
     });
 
     if (Math.random() < COMPUTER_WIN_CHANCE.crazyWheel) {
-      // Scegli un segmento non scommesso, considerando il colore
-      const nonBetIndices = crazyTimeWheel
-        .map((segment, index) => (betIndices.includes(index) ? -1 : index))
-        .filter(index => index !== -1);
-      resultIndex = nonBetIndices.length > 0
-        ? nonBetIndices[Math.floor(Math.random() * nonBetIndices.length)]
-        : Math.floor(Math.random() * crazyTimeWheel.length);
+      // Scegli un segmento non scommesso
+      const nonBetKeys = Object.keys(colorMap).filter(key => !betColorKeys.includes(key));
+      const selectedKey = nonBetKeys.length > 0
+        ? nonBetKeys[Math.floor(Math.random() * nonBetKeys.length)]
+        : Object.keys(colorMap)[Math.floor(Math.random() * Object.keys(colorMap).length)];
+      const indices = colorMap[selectedKey];
+      resultIndex = indices[Math.floor(Math.random() * indices.length)];
     } else {
-      // Scegli un segmento scommesso, dando priorità al colore
-      if (betIndices.length > 0) {
-        // Se ci sono più colori per lo stesso value, scegli casualmente tra i colori
-        const possibleColors = [...new Set(betColors)]; // Colori unici
-        const selectedColor = possibleColors[Math.floor(Math.random() * possibleColors.length)];
-        const colorIndices = betIndices.filter(
-          index => crazyTimeWheel[index].colorName === selectedColor
-        );
-        resultIndex = colorIndices[Math.floor(Math.random() * colorIndices.length)];
-      } else {
-        // Se non ci sono scommesse, scegli un segmento casuale
-        resultIndex = Math.floor(Math.random() * crazyTimeWheel.length);
-      }
+      // Scegli un segmento scommesso
+      const selectedKey = betColorKeys.length > 0
+        ? betColorKeys[Math.floor(Math.random() * betColorKeys.length)]
+        : Object.keys(colorMap)[Math.floor(Math.random() * Object.keys(colorMap).length)];
+      const indices = colorMap[selectedKey];
+      resultIndex = indices[Math.floor(Math.random() * indices.length)];
     }
 
     const result = crazyTimeWheel[resultIndex];
@@ -528,7 +530,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
       topSlotSegment,
       topSlotMultiplier,
       betSegments,
-      betColors,
+      betColorKeys,
       crazyTimeWheelLength: crazyTimeWheel.length,
       crazyTimeWheelSample: crazyTimeWheel.slice(0, 5),
     });
@@ -642,6 +644,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
 
     res.json({
       success: true,
+      resultIndex, // Aggiunto per il frontend
       result,
       topSlot: { segment: topSlotSegment, multiplier: topSlotMultiplier },
       bonusResult,
