@@ -145,6 +145,547 @@ const removeCircularReferences = (obj, seen = new WeakSet()) => {
   return obj;
 };
 
+
+
+// Costanti per i minigiochi
+const COMPUTER_WIN_CHANCE = {
+  solanaCardDuel: 0.92,
+  memeSlots: 0.92,
+  coinFlip: 0.92,
+  crazyWheel: 0.95,
+};
+
+const slotMemes = [
+  { name: 'Doge', image: '/doge.png' },
+  { name: 'Pepe', image: '/pepe.png' },
+  { name: 'Wojak', image: '/wojak.png' },
+  { name: 'Shiba', image: '/shiba.png' },
+  { name: 'Moon', image: '/moon.png' },
+  { name: 'Meme', image: '/meme.png' },
+  { name: 'BONUS', image: '/BONUS.png' },
+  { name: 'Random', image: '/random.png' },
+];
+
+const crazyTimeWheelBase = [
+  ...Array(23).fill().map(() => ({ type: 'number', value: 1, color: '#FFD700', colorName: 'Yellow' })),
+  ...Array(15).fill().map(() => ({ type: 'number', value: 2, color: '#00FF00', colorName: 'Green' })),
+  ...Array(7).fill().map(() => ({ type: 'number', value: 5, color: '#FF4500', colorName: 'Orange' })),
+  ...Array(4).fill().map(() => ({ type: 'number', value: 10, color: '#1E90FF', colorName: 'Blue' })),
+  ...Array(4).fill().map(() => ({ type: 'bonus', value: 'Coin Flip', color: '#FF69B4', colorName: 'Pink' })),
+  ...Array(2).fill().map(() => ({ type: 'bonus', value: 'Pachinko', color: '#00CED1', colorName: 'Turquoise' })),
+  ...Array(2).fill().map(() => ({ type: 'bonus', value: 'Cash Hunt', color: '#8A2BE2', colorName: 'Purple' })),
+  { type: 'bonus', value: 'Crazy Time', color: '#FF0000', colorName: 'Red' },
+];
+
+const shuffleArray = (array) => {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+};
+
+const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
+
+// Endpoint per Meme Slots
+app.post('/play-meme-slots', async (req, res) => {
+  const { playerAddress, betAmount, signedTransaction } = req.body;
+
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+
+    // Verifica il saldo SOL
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    // Genera il risultato della slot
+    let result;
+    const winLines = [
+      [0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24],
+      [0, 5, 10, 15, 20], [1, 6, 11, 16, 21], [2, 7, 12, 17, 22], [3, 8, 13, 18, 23], [4, 9, 14, 19, 24],
+      [0, 6, 12, 18, 24], [4, 8, 12, 16, 20],
+    ];
+
+    if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
+      // Computer vince: genera un risultato senza linee vincenti
+      result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+      let attempts = 0;
+      while (attempts < 20) {
+        let hasWin = false;
+        for (const line of winLines) {
+          const symbolsInLine = line.map(index => result[index].name);
+          let currentSymbol = symbolsInLine[0];
+          let streak = 1;
+          for (let j = 1; j < symbolsInLine.length; j++) {
+            if (symbolsInLine[j].toLowerCase() === currentSymbol.toLowerCase()) {
+              streak++;
+              if (streak >= 3) {
+                hasWin = true;
+                break;
+              }
+            } else {
+              currentSymbol = symbolsInLine[j];
+              streak = 1;
+            }
+          }
+          if (hasWin) break;
+        }
+        if (!hasWin) break;
+        result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+        attempts++;
+      }
+    } else {
+      // Giocatore vince: genera una linea vincente
+      result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+      const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
+      const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
+      const streakOptions = [
+        { streak: 3, probability: 0.9 },
+        { streak: 4, probability: 0.09 },
+        { streak: 5, probability: 0.01 },
+      ];
+      const totalProbability = streakOptions.reduce((sum, option) => sum + option.probability, 0);
+      let random = Math.random() * totalProbability;
+      let selectedStreak = 3;
+      for (const option of streakOptions) {
+        if (random < option.probability) {
+          selectedStreak = option.streak;
+          break;
+        }
+        random -= option.probability;
+      }
+      for (let i = 0; i < selectedStreak; i++) {
+        result[winningLine[i]] = winningSymbol;
+      }
+    }
+
+    // Calcola le vincite
+    const winningLinesFound = [];
+    const winningIndices = new Set();
+    let totalWin = 0;
+
+    for (let i = 0; i < winLines.length; i++) {
+      const line = winLines[i];
+      const symbolsInLine = line.map(index => result[index].name);
+      let currentSymbol = symbolsInLine[0];
+      let streak = 1;
+      let streakStart = 0;
+
+      for (let j = 1; j < symbolsInLine.length; j++) {
+        if (symbolsInLine[j] === currentSymbol) {
+          streak++;
+        } else {
+          if (streak >= 3) {
+            winningLinesFound.push(i);
+            for (let k = streakStart; k < streakStart + streak; k++) {
+              winningIndices.add(line[k]);
+            }
+            let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
+            if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
+            totalWin += winAmount;
+          }
+          currentSymbol = symbolsInLine[j];
+          streak = 1;
+          streakStart = j;
+        }
+      }
+
+      if (streak >= 3) {
+        winningLinesFound.push(i);
+        for (let k = streakStart; k < streakStart + streak; k++) {
+          winningIndices.add(line[k]);
+        }
+        let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
+        if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
+        totalWin += winAmount;
+      }
+    }
+
+    // Distribuisci le vincite
+    if (totalWin > 0) {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature);
+      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
+    }
+
+    res.json({
+      success: true,
+      result: result.map(item => ({ name: item.name, image: item.image })),
+      winningLines: winningLinesFound,
+      winningIndices: Array.from(winningIndices),
+      totalWin,
+    });
+  } catch (err) {
+    console.error('Error in play-meme-slots:', err);
+    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
+  }
+});
+
+// Endpoint per Coin Flip
+app.post('/play-coin-flip', async (req, res) => {
+  const { playerAddress, betAmount, signedTransaction, choice } = req.body;
+
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !choice || !['blue', 'red'].includes(choice)) {
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+
+    // Verifica il saldo SOL
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    // Genera il risultato del Coin Flip
+    let flipResult;
+    if (Math.random() < COMPUTER_WIN_CHANCE.coinFlip) {
+      flipResult = choice === 'blue' ? 'red' : 'blue';
+    } else {
+      flipResult = choice;
+    }
+
+    let totalWin = 0;
+    if (choice === flipResult) {
+      totalWin = betAmount * 2;
+
+      // Distribuisci la vincita
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature);
+      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
+    }
+
+    res.json({
+      success: true,
+      flipResult,
+      totalWin,
+    });
+  } catch (err) {
+    console.error('Error in play-coin-flip:', err);
+    res.status(500).json({ success: false, error: 'Failed to play coin flip' });
+  }
+});
+
+// Endpoint per Crazy Wheel
+app.post('/play-crazy-wheel', async (req, res) => {
+  const { playerAddress, bets, signedTransaction } = req.body;
+
+  if (!playerAddress || !bets || !signedTransaction) {
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  const totalBet = Object.values(bets).reduce((sum, bet) => sum + bet, 0);
+  if (totalBet <= 0) {
+    return res.status(400).json({ success: false, error: 'No bets placed' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(totalBet * LAMPORTS_PER_SOL);
+
+    // Verifica il saldo SOL
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    // Genera il risultato della ruota
+    const betSegments = Object.keys(bets).filter(segment => bets[segment] > 0);
+    const topSlotSegment = betSegments[Math.floor(Math.random() * betSegments.length)] || '1';
+    const topSlotMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
+
+    let resultIndex;
+    const betIndices = crazyTimeWheel
+      .map((segment, index) => (betSegments.includes(String(segment.value)) ? index : -1))
+      .filter(index => index !== -1);
+
+    if (Math.random() < COMPUTER_WIN_CHANCE.crazyWheel) {
+      const nonBetIndices = crazyTimeWheel
+        .map((segment, index) => (betIndices.includes(index) ? -1 : index))
+        .filter(index => index !== -1);
+      resultIndex = nonBetIndices.length > 0
+        ? nonBetIndices[Math.floor(Math.random() * nonBetIndices.length)]
+        : Math.floor(Math.random() * crazyTimeWheel.length);
+    } else {
+      resultIndex = betIndices.length > 0
+        ? betIndices[Math.floor(Math.random() * betIndices.length)]
+        : Math.floor(Math.random() * crazyTimeWheel.length);
+    }
+
+    const result = crazyTimeWheel[resultIndex];
+    let totalWin = 0;
+    let bonusResult = null;
+
+    if (result.type === 'number') {
+      const betOnResult = bets[result.value] || 0;
+      if (betOnResult > 0) {
+        let multiplier = parseInt(result.value);
+        if (String(topSlotSegment) === String(result.value)) {
+          multiplier *= topSlotMultiplier;
+        }
+        totalWin = betOnResult * multiplier;
+      }
+    } else {
+      if (result.value === 'Coin Flip') {
+        const redMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
+        const blueMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
+        const side = Math.random() < 0.5 ? 'red' : 'blue';
+        let multiplier = side === 'red' ? redMultiplier : blueMultiplier;
+        if (String(topSlotSegment) === 'Coin Flip') {
+          multiplier *= topSlotMultiplier;
+        }
+        bonusResult = { type: 'Coin Flip', side, redMultiplier, blueMultiplier, multiplier };
+        const betOnBonus = bets['Coin Flip'] || 0;
+        if (betOnBonus > 0) {
+          totalWin = betOnBonus * multiplier;
+        }
+      }
+      // Aggiungi logica per Pachinko, Cash Hunt, Crazy Time se necessario
+    }
+
+    // Distribuisci le vincite
+    if (totalWin > 0) {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature);
+      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
+    }
+
+    res.json({
+      success: true,
+      result,
+      topSlot: { segment: topSlotSegment, multiplier: topSlotMultiplier },
+      bonusResult,
+      totalWin,
+    });
+  } catch (err) {
+    console.error('Error in play-crazy-wheel:', err);
+    res.status(500).json({ success: false, error: 'Failed to play crazy wheel' });
+  }
+});
+
+// Endpoint per Solana Card Duel (Blackjack)
+app.post('/play-solana-card-duel', async (req, res) => {
+  const { playerAddress, betAmount, signedTransaction, action, playerCards, opponentCards } = req.body;
+
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !action) {
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+
+    // Verifica il saldo SOL
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    const deck = Array.from({ length: 52 }, (_, i) => {
+      const cardNumber = (i % 13) + 1;
+      const suit = ['spades', 'hearts', 'diamonds', 'clubs'][Math.floor(i / 13)];
+      const suitChar = 'SHDC'[Math.floor(i / 13)];
+      let cardName = cardNumber === 1 ? 'A' : cardNumber === 10 ? '0' : cardNumber === 11 ? 'J' : cardNumber === 12 ? 'Q' : cardNumber === 13 ? 'K' : cardNumber;
+      return {
+        value: Math.min(cardNumber, 10),
+        suit,
+        image: `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`,
+      };
+    });
+
+    const drawCard = (isComputer = false) => {
+      if (isComputer && Math.random() < COMPUTER_WIN_CHANCE.solanaCardDuel) {
+        const highValueCards = deck.filter(card => card.value === 10 || card.value === 1);
+        return highValueCards[Math.floor(Math.random() * highValueCards.length)] || deck[Math.floor(Math.random() * deck.length)];
+      }
+      return deck[Math.floor(Math.random() * deck.length)];
+    };
+
+    let newPlayerCards = playerCards || [];
+    let newOpponentCards = opponentCards || [];
+    let message = '';
+    let outcome = '';
+    let totalWin = 0;
+
+    if (action === 'start') {
+      newPlayerCards = [drawCard(), drawCard()];
+      newOpponentCards = [drawCard(), drawCard()];
+      message = 'Bet placed! Your turn: Hit or Stand.';
+    } else if (action === 'hit') {
+      newPlayerCards = [...newPlayerCards, drawCard()];
+      const playerScore = newPlayerCards.reduce((sum, card) => sum + card.value, 0);
+      if (playerScore > 21) {
+        message = 'Bust! Dealer wins.';
+        outcome = 'lose';
+      } else {
+        message = 'Hit! Your turn: Hit or Stand.';
+      }
+    } else if (action === 'stand') {
+      let dealerScore = newOpponentCards.reduce((sum, card) => sum + card.value, 0);
+      while (dealerScore < 17) {
+        newOpponentCards = [...newOpponentCards, drawCard()];
+        dealerScore = newOpponentCards.reduce((sum, card) => sum + card.value, 0);
+      }
+
+      const playerScore = newPlayerCards.reduce((sum, card) => sum + card.value, 0);
+      if (playerScore > 21) {
+        message = 'Player busts! Dealer wins.';
+        outcome = 'lose';
+      } else if (dealerScore > 21) {
+        message = 'Dealer busts! You win!';
+        outcome = 'win';
+        totalWin = betAmount * 2;
+      } else if (playerScore > dealerScore) {
+        message = 'You win!';
+        outcome = 'win';
+        totalWin = betAmount * 2;
+      } else if (playerScore < dealerScore) {
+        message = 'Dealer wins!';
+        outcome = 'lose';
+      } else {
+        message = 'Push! It\'s a tie.';
+        outcome = 'tie';
+        totalWin = betAmount;
+      }
+
+      if (totalWin > 0) {
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: wallet.publicKey,
+            toPubkey: userPublicKey,
+            lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
+          })
+        );
+
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = wallet.publicKey;
+        transaction.partialSign(wallet);
+
+        const winSignature = await connection.sendRawTransaction(transaction.serialize());
+        await connection.confirmTransaction(winSignature);
+        console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      playerCards: newPlayerCards,
+      opponentCards: newOpponentCards,
+      message,
+      outcome,
+      totalWin,
+    });
+  } catch (err) {
+    console.error('Error in play-solana-card-duel:', err);
+    res.status(500).json({ success: false, error: 'Failed to play solana card duel' });
+  }
+});
+
 // Funzione di rimborso per una partita
 const refundBetsForGame = async (gameId) => {
   try {
@@ -465,107 +1006,48 @@ app.post('/get-recent-blockhash', async (req, res) => {
 app.post('/process-transaction', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
 
-  console.log('DEBUG - /process-transaction called with:', {
-    playerAddress,
-    betAmount,
-    hasSignedTransaction: !!signedTransaction,
-    gameType,
-  });
-
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !gameType) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction, gameType });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, signedTransaction, or gameType' });
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
-  // Validazione del gameType
   const validGameTypes = ['memeSlots', 'crazyWheel', 'solanaCardDuel', 'coinFlip'];
   if (!validGameTypes.includes(gameType)) {
-    console.log('DEBUG - Invalid gameType:', gameType);
     return res.status(400).json({ success: false, error: 'Invalid gameType' });
   }
 
   try {
-    let userPublicKey = new PublicKey(playerAddress);
+    const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
     const userBalance = await connection.getBalance(userPublicKey);
     if (userBalance < betInLamports) {
-      console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
-    console.log('DEBUG - Decoded transaction in /process-transaction:', {
-      instructionCount: transaction.instructions.length,
-      instructions: transaction.instructions.map((instr, index) => ({
-        index,
-        programId: instr.programId.toBase58(),
-        keys: instr.keys.map(key => key.pubkey.toBase58()),
-        data: instr.data.toString('hex'),
-      })),
-    });
 
     if (!transaction.verifySignatures()) {
-      console.log('DEBUG - Invalid transaction signatures');
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
-    if (transaction.instructions.length !== 1) {
-      console.log('DEBUG - Unexpected number of instructions:', transaction.instructions.length);
-      console.log('DEBUG - Instructions details:', transaction.instructions.map((instr, index) => ({
-        index,
-        programId: instr.programId.toBase58(),
-        keys: instr.keys.map(key => key.pubkey.toBase58()),
-        data: instr.data.toString('hex'),
-      })));
-      return res.status(400).json({
-        success: false,
-        error: `Transaction must contain exactly one instruction, found ${transaction.instructions.length}`,
-      });
-    }
-
-    const transferInstruction = transaction.instructions[0];
-    if (!transferInstruction.programId.equals(SystemProgram.programId)) {
-      console.log('DEBUG - Invalid program ID:', transferInstruction.programId.toBase58());
-      return res.status(400).json({ success: false, error: 'Instruction must be a SystemProgram.transfer' });
-    }
-
-    if (
-      transferInstruction.keys.length !== 2 ||
-      transferInstruction.keys[0].pubkey.toBase58() !== playerAddress ||
-      transferInstruction.keys[1].pubkey.toBase58() !== wallet.publicKey.toBase58()
-    ) {
-      console.log('DEBUG - Invalid instruction keys');
-      return res.status(400).json({ success: false, error: 'Invalid instruction keys' });
-    }
-
-    const instructionData = transferInstruction.data;
-    if (instructionData.length < 12) {
-      console.log('DEBUG - Invalid instruction data length:', instructionData.length);
-      return res.status(400).json({ success: false, error: 'Invalid instruction data length' });
-    }
-
-    const lamports = instructionData.readBigInt64LE(4);
-    if (lamports !== BigInt(betInLamports)) {
-      console.log('DEBUG - Mismatch in lamports:', { expected: betInLamports, actual: Number(lamports) });
-      return res.status(400).json({ success: false, error: 'Transaction lamports do not match bet amount' });
-    }
-
     const signature = await connection.sendRawTransaction(transaction.serialize());
-    console.log('DEBUG - Transaction signature:', signature);
-
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    console.log(`Transferred ${betAmount} SOL from ${playerAddress} to tax wallet for ${gameType}`);
+    // Reindirizza la logica al gioco specifico
+    const endpointMap = {
+      memeSlots: '/play-meme-slots',
+      coinFlip: '/play-coin-flip',
+      crazyWheel: '/play-crazy-wheel',
+      solanaCardDuel: '/play-solana-card-duel',
+    };
 
-    res.json({ success: true, signature });
+    res.json({ success: true, redirectTo: endpointMap[gameType] });
   } catch (err) {
-    console.error('Error in process-transaction:', err.message, err.stack);
+    console.error('Error in process-transaction:', err);
     res.status(500).json({ success: false, error: `Failed to process transaction: ${err.message}` });
   }
 });
