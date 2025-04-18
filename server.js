@@ -431,6 +431,15 @@ app.post('/play-coin-flip', async (req, res) => {
   }
 });
 
+app.get('/get-crazy-wheel', (req, res) => {
+  try {
+    res.json({ success: true, wheel: crazyTimeWheel });
+  } catch (err) {
+    console.error('Error fetching crazyTimeWheel:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch wheel data' });
+  }
+});
+
 // Endpoint per Crazy Wheel
 app.post('/play-crazy-wheel', async (req, res) => {
   const { playerAddress, bets, signedTransaction } = req.body;
@@ -478,6 +487,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
       .map((segment, index) => (betSegments.includes(String(segment.value)) ? index : -1))
       .filter(index => index !== -1);
 
+    // Logica allineata con il vecchio codice
     if (Math.random() < COMPUTER_WIN_CHANCE.crazyWheel) {
       const nonBetIndices = crazyTimeWheel
         .map((segment, index) => (betIndices.includes(index) ? -1 : index))
@@ -494,12 +504,14 @@ app.post('/play-crazy-wheel', async (req, res) => {
     const result = crazyTimeWheel[resultIndex];
     let totalWin = 0;
     let bonusResult = null;
+    let bonusMessage = '';
 
     if (result.type === 'number') {
       const betOnResult = bets[result.value] || 0;
       if (betOnResult > 0) {
         let multiplier = parseInt(result.value);
-        if (String(topSlotSegment) === String(result.value)) {
+        let topSlotApplied = String(topSlotSegment) === String(result.value);
+        if (topSlotApplied) {
           multiplier *= topSlotMultiplier;
         }
         totalWin = betOnResult * multiplier;
@@ -510,16 +522,75 @@ app.post('/play-crazy-wheel', async (req, res) => {
         const blueMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
         const side = Math.random() < 0.5 ? 'red' : 'blue';
         let multiplier = side === 'red' ? redMultiplier : blueMultiplier;
-        if (String(topSlotSegment) === 'Coin Flip') {
+        let topSlotApplied = String(topSlotSegment) === 'Coin Flip';
+        if (topSlotApplied) {
           multiplier *= topSlotMultiplier;
         }
         bonusResult = { type: 'Coin Flip', side, redMultiplier, blueMultiplier, multiplier };
         const betOnBonus = bets['Coin Flip'] || 0;
         if (betOnBonus > 0) {
           totalWin = betOnBonus * multiplier;
+          bonusMessage = topSlotApplied
+            ? `Coin Flip: ${side} vince! Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
+            : `Coin Flip: ${side} vince! Hai vinto ${totalWin.toFixed(2)} SOL!`;
+        } else {
+          bonusMessage = 'Hai attivato Coin Flip, ma non hai scommesso su di esso.';
+        }
+      } else if (result.value === 'Pachinko') {
+        const multipliers = [2, 3, 5, 10, 20];
+        const slotIndex = Math.floor(Math.random() * multipliers.length);
+        let multiplier = multipliers[slotIndex];
+        let topSlotApplied = String(topSlotSegment) === 'Pachinko';
+        if (topSlotApplied) {
+          multiplier *= topSlotMultiplier;
+        }
+        bonusResult = { type: 'Pachinko', slotIndex, multiplier };
+        const betOnBonus = bets['Pachinko'] || 0;
+        if (betOnBonus > 0) {
+          totalWin = betOnBonus * multiplier;
+          bonusMessage = topSlotApplied
+            ? `Pachinko: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
+            : `Pachinko: Hai vinto ${totalWin.toFixed(2)} SOL!`;
+        } else {
+          bonusMessage = 'Hai attivato Pachinko, ma non hai scommesso su di esso.';
+        }
+      } else if (result.value === 'Cash Hunt') {
+        const multipliers = Array(10).fill().map(() => Math.floor(Math.random() * 50) + 1);
+        const chosenMultiplier = multipliers[Math.floor(Math.random() * multipliers.length)];
+        let multiplier = chosenMultiplier;
+        let topSlotApplied = String(topSlotSegment) === 'Cash Hunt';
+        if (topSlotApplied) {
+          multiplier *= topSlotMultiplier;
+        }
+        bonusResult = { type: 'Cash Hunt', multipliers, chosenMultiplier, multiplier };
+        const betOnBonus = bets['Cash Hunt'] || 0;
+        if (betOnBonus > 0) {
+          totalWin = betOnBonus * multiplier;
+          bonusMessage = topSlotApplied
+            ? `Cash Hunt: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
+            : `Cash Hunt: Hai vinto ${totalWin.toFixed(2)} SOL!`;
+        } else {
+          bonusMessage = 'Hai attivato Cash Hunt, ma non hai scommesso su di esso.';
+        }
+      } else if (result.value === 'Crazy Time') {
+        const multipliers = [10, 20, 50, 100, 200];
+        const chosenMultiplier = multipliers[Math.floor(Math.random() * multipliers.length)];
+        let multiplier = chosenMultiplier;
+        let topSlotApplied = String(topSlotSegment) === 'Crazy Time';
+        if (topSlotApplied) {
+          multiplier *= topSlotMultiplier;
+        }
+        bonusResult = { type: 'Crazy Time', multiplier };
+        const betOnBonus = bets['Crazy Time'] || 0;
+        if (betOnBonus > 0) {
+          totalWin = betOnBonus * multiplier;
+          bonusMessage = topSlotApplied
+            ? `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
+            : `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL!`;
+        } else {
+          bonusMessage = 'Hai attivato Crazy Time, ma non hai scommesso su di esso.';
         }
       }
-      // Aggiungi logica per Pachinko, Cash Hunt, Crazy Time se necessario
     }
 
     // Distribuisci le vincite
@@ -547,6 +618,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
       result,
       topSlot: { segment: topSlotSegment, multiplier: topSlotMultiplier },
       bonusResult,
+      bonusMessage,
       totalWin,
     });
   } catch (err) {
@@ -554,6 +626,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to play crazy wheel' });
   }
 });
+
 
 // Funzione per creare il mazzo
 const createDeck = () => {
