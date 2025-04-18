@@ -487,7 +487,6 @@ app.post('/play-crazy-wheel', async (req, res) => {
       .map((segment, index) => (betSegments.includes(String(segment.value)) ? index : -1))
       .filter(index => index !== -1);
 
-    // Logica allineata con il vecchio codice
     if (Math.random() < COMPUTER_WIN_CHANCE.crazyWheel) {
       const nonBetIndices = crazyTimeWheel
         .map((segment, index) => (betIndices.includes(index) ? -1 : index))
@@ -505,6 +504,14 @@ app.post('/play-crazy-wheel', async (req, res) => {
     let totalWin = 0;
     let bonusResult = null;
     let bonusMessage = '';
+
+    console.log('DEBUG - Crazy Wheel result:', {
+      resultIndex,
+      result: result.value,
+      type: result.type,
+      topSlotSegment,
+      topSlotMultiplier,
+    });
 
     if (result.type === 'number') {
       const betOnResult = bets[result.value] || 0;
@@ -585,7 +592,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
         if (betOnBonus > 0) {
           totalWin = betOnBonus * multiplier;
           bonusMessage = topSlotApplied
-            ? `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
+            ? `Crazy Time: Hai vinto ${totalWin.window.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
             : `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL!`;
         } else {
           bonusMessage = 'Hai attivato Crazy Time, ma non hai scommesso su di esso.';
@@ -626,7 +633,6 @@ app.post('/play-crazy-wheel', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to play crazy wheel' });
   }
 });
-
 
 // Funzione per creare il mazzo
 const createDeck = () => {
