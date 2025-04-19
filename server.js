@@ -501,183 +501,53 @@ app.get('/get-crazy-wheel', (req, res) => {
 
 
 
-// Funzione per creare il mazzo
-const createDeck = () => {
-  const suits = ['spades', 'hearts', 'diamonds', 'clubs'];
-  const values = Array.from({ length: 13 }, (_, i) => i + 1);
-  const deck = [];
-  for (const suit of suits) {
-    for (const value of values) {
-      let cardName;
-      if (value === 1) cardName = 'A';
-      else if (value === 10) cardName = '0';
-      else if (value === 11) cardName = 'J';
-      else if (value === 12) cardName = 'Q';
-      else if (value === 13) cardName = 'K';
-      else cardName = value;
-      deck.push({
-        value: Math.min(value, 10),
-        suit,
-        image: `https://deckofcardsapi.com/static/img/${cardName}${suit[0].toUpperCase()}.png`,
-      });
-    }
-  }
-  return deck;
-};
+
 
 
 // Endpoint aggiornato
 app.post('/play-solana-card-duel', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction, action, playerCards, opponentCards, gameId } = req.body;
+  const { playerAddress, betAmount, signedTransaction, action } = req.body;
 
   if (!playerAddress || !action) {
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or action' });
   }
 
+  if (action !== 'start') {
+    // Ignora azioni diverse da 'start', poiché la logica di gioco è gestita nel frontend
+    return res.json({ success: true });
+  }
+
+  if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    return res.status(400).json({ success: false, error: 'Invalid betAmount or signedTransaction' });
+  }
+
   try {
     const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Gestione dell'azione 'start'
-    if (action === 'start') {
-      if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
-        return res.status(400).json({ success: false, error: 'Invalid betAmount or signedTransaction' });
-      }
-
-      const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-      const userBalance = await connection.getBalance(userPublicKey);
-      if (userBalance < betInLamports) {
-        return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-      }
-
-      // Valida e processa la transazione
-      const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-      const transaction = Transaction.from(transactionBuffer);
-      if (!transaction.verifySignatures()) {
-        return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-      }
-
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-      if (confirmation.value.err) {
-        return res.status(500).json({ success: false, error: 'Transaction failed' });
-      }
-
-      // Inizializza una nuova partita
-      const newGameId = `${playerAddress}-${Date.now()}`;
-      const deck = shuffleArray(createDeck());
-      gameStates[newGameId] = {
-        deck,
-        playerCards: [deck.pop(), deck.pop()],
-        opponentCards: [deck.pop(), deck.pop()],
-        betAmount,
-      };
-
-      res.json({
-        success: true,
-        gameId: newGameId,
-        playerCards: gameStates[newGameId].playerCards,
-        opponentCards: gameStates[newGameId].opponentCards,
-        message: 'Bet placed! Your turn: Hit or Stand.',
-      });
+    // Verifica il saldo SOL
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
-    // Gestione delle azioni 'hit' e 'stand'
-    else if (action === 'hit' || action === 'stand') {
-      if (!gameId || !gameStates[gameId]) {
-        return res.status(400).json({ success: false, error: 'Invalid or expired gameId' });
-      }
 
-      const game = gameStates[gameId];
-      let newPlayerCards = playerCards || game.playerCards;
-      let newOpponentCards = opponentCards || game.opponentCards;
-      let message = '';
-      let outcome = '';
-      let totalWin = 0;
-
-      const drawCard = (isComputer = false) => {
-        if (game.deck.length === 0) {
-          throw new Error('Deck is empty');
-        }
-        if (isComputer && Math.random() < COMPUTER_WIN_CHANCE.solanaCardDuel) {
-          const highValueCards = game.deck.filter(card => card.value === 10 || card.value === 1);
-          const card = highValueCards[Math.floor(Math.random() * highValueCards.length)] || game.deck[0];
-          game.deck = game.deck.filter(c => c !== card);
-          return card;
-        }
-        return game.deck.pop();
-      };
-
-      if (action === 'hit') {
-        newPlayerCards = [...newPlayerCards, drawCard()];
-        const playerScore = newPlayerCards.reduce((sum, card) => sum + card.value, 0);
-        if (playerScore > 21) {
-          message = 'Bust! Dealer wins.';
-          outcome = 'lose';
-          delete gameStates[gameId];
-        } else {
-          message = 'Hit! Your turn: Hit or Stand.';
-          game.playerCards = newPlayerCards;
-        }
-      } else if (action === 'stand') {
-        let dealerScore = newOpponentCards.reduce((sum, card) => sum + card.value, 0);
-        while (dealerScore < 17) {
-          newOpponentCards = [...newOpponentCards, drawCard(true)];
-          dealerScore = newOpponentCards.reduce((sum, card) => sum + card.value, 0);
-        }
-
-        const playerScore = newPlayerCards.reduce((sum, card) => sum + card.value, 0);
-        if (playerScore > 21) {
-          message = 'Player busts! Dealer wins.';
-          outcome = 'lose';
-        } else if (dealerScore > 21) {
-          message = 'Dealer busts! You win!';
-          outcome = 'win';
-          totalWin = game.betAmount * 2;
-        } else if (playerScore > dealerScore) {
-          message = 'You win!';
-          outcome = 'win';
-          totalWin = game.betAmount * 2;
-        } else if (playerScore < dealerScore) {
-          message = 'Dealer wins!';
-          outcome = 'lose';
-        } else {
-          message = 'Push! It\'s a tie.';
-          outcome = 'tie';
-          totalWin = game.betAmount;
-        }
-
-        if (totalWin > 0) {
-          const transaction = new Transaction().add(
-            SystemProgram.transfer({
-              fromPubkey: wallet.publicKey,
-              toPubkey: userPublicKey,
-              lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
-            })
-          );
-
-          const { blockhash } = await connection.getLatestBlockhash();
-          transaction.recentBlockhash = blockhash;
-          transaction.feePayer = wallet.publicKey;
-          transaction.partialSign(wallet);
-
-          const winSignature = await connection.sendRawTransaction(transaction.serialize());
-          await connection.confirmTransaction(winSignature);
-          console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
-        }
-
-        delete gameStates[gameId]; // Pulisci lo stato dopo la partita
-      }
-
-      res.json({
-        success: true,
-        playerCards: newPlayerCards,
-        opponentCards: newOpponentCards,
-        message,
-        outcome,
-        totalWin,
-      });
-    } else {
-      return res.status(400).json({ success: false, error: 'Invalid action' });
+    // Valida e processa la transazione
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Bet placed successfully',
+    });
   } catch (err) {
     console.error('Error in play-solana-card-duel:', err);
     res.status(500).json({ success: false, error: `Failed to play solana card duel: ${err.message}` });
