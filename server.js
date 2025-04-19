@@ -151,9 +151,9 @@ const removeCircularReferences = (obj, seen = new WeakSet()) => {
 
 // Costanti per i minigiochi
 const COMPUTER_WIN_CHANCE = {
-  solanaCardDuel: 0.92,
-  memeSlots: 0.92,
-  coinFlip: 0.92,
+  solanaCardDuel: 0.9,
+  memeSlots: 0.8,
+  coinFlip: 0.65,
   crazyWheel: 0.95,
 };
 
@@ -534,28 +534,10 @@ app.post('/play-solana-card-duel', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or action' });
   }
 
-  const calculateScore = (cards) => {
-    let score = 0;
-    let aces = 0;
-    cards.forEach(card => {
-      if (card.value === 1) {
-        aces += 1;
-      } else {
-        score += Math.min(card.value, 10);
-      }
-    });
-    score += aces;
-    for (let i = 0; i < aces; i++) {
-      if (score + 10 <= 21) {
-        score += 10;
-      }
-    }
-    return score;
-  };
-
   try {
     const userPublicKey = new PublicKey(playerAddress);
 
+    // Gestione dell'azione 'start'
     if (action === 'start') {
       if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
         return res.status(400).json({ success: false, error: 'Invalid betAmount or signedTransaction' });
@@ -567,6 +549,7 @@ app.post('/play-solana-card-duel', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
       }
 
+      // Valida e processa la transazione
       const transactionBuffer = Buffer.from(signedTransaction, 'base64');
       const transaction = Transaction.from(transactionBuffer);
       if (!transaction.verifySignatures()) {
@@ -579,6 +562,7 @@ app.post('/play-solana-card-duel', async (req, res) => {
         return res.status(500).json({ success: false, error: 'Transaction failed' });
       }
 
+      // Inizializza una nuova partita
       const newGameId = `${playerAddress}-${Date.now()}`;
       const deck = shuffleArray(createDeck());
       gameStates[newGameId] = {
@@ -595,7 +579,9 @@ app.post('/play-solana-card-duel', async (req, res) => {
         opponentCards: gameStates[newGameId].opponentCards,
         message: 'Bet placed! Your turn: Hit or Stand.',
       });
-    } else if (action === 'hit' || action === 'stand') {
+    }
+    // Gestione delle azioni 'hit' e 'stand'
+    else if (action === 'hit' || action === 'stand') {
       if (!gameId || !gameStates[gameId]) {
         return res.status(400).json({ success: false, error: 'Invalid or expired gameId' });
       }
@@ -607,16 +593,22 @@ app.post('/play-solana-card-duel', async (req, res) => {
       let outcome = '';
       let totalWin = 0;
 
-      const drawCard = () => {
+      const drawCard = (isComputer = false) => {
         if (game.deck.length === 0) {
           throw new Error('Deck is empty');
+        }
+        if (isComputer && Math.random() < COMPUTER_WIN_CHANCE.solanaCardDuel) {
+          const highValueCards = game.deck.filter(card => card.value === 10 || card.value === 1);
+          const card = highValueCards[Math.floor(Math.random() * highValueCards.length)] || game.deck[0];
+          game.deck = game.deck.filter(c => c !== card);
+          return card;
         }
         return game.deck.pop();
       };
 
       if (action === 'hit') {
         newPlayerCards = [...newPlayerCards, drawCard()];
-        const playerScore = calculateScore(newPlayerCards);
+        const playerScore = newPlayerCards.reduce((sum, card) => sum + card.value, 0);
         if (playerScore > 21) {
           message = 'Bust! Dealer wins.';
           outcome = 'lose';
@@ -626,13 +618,13 @@ app.post('/play-solana-card-duel', async (req, res) => {
           game.playerCards = newPlayerCards;
         }
       } else if (action === 'stand') {
-        let dealerScore = calculateScore(newOpponentCards);
+        let dealerScore = newOpponentCards.reduce((sum, card) => sum + card.value, 0);
         while (dealerScore < 17) {
-          newOpponentCards = [...newOpponentCards, drawCard()];
-          dealerScore = calculateScore(newOpponentCards);
+          newOpponentCards = [...newOpponentCards, drawCard(true)];
+          dealerScore = newOpponentCards.reduce((sum, card) => sum + card.value, 0);
         }
 
-        const playerScore = calculateScore(newPlayerCards);
+        const playerScore = newPlayerCards.reduce((sum, card) => sum + card.value, 0);
         if (playerScore > 21) {
           message = 'Player busts! Dealer wins.';
           outcome = 'lose';
@@ -640,10 +632,6 @@ app.post('/play-solana-card-duel', async (req, res) => {
           message = 'Dealer busts! You win!';
           outcome = 'win';
           totalWin = game.betAmount * 2;
-        } else if (playerScore === 21 && newPlayerCards.length === 2 && !(dealerScore === 21 && newOpponentCards.length === 2)) {
-          message = 'Blackjack! You win!';
-          outcome = 'win';
-          totalWin = game.betAmount * 2.5;
         } else if (playerScore > dealerScore) {
           message = 'You win!';
           outcome = 'win';
@@ -653,7 +641,7 @@ app.post('/play-solana-card-duel', async (req, res) => {
           outcome = 'lose';
         } else {
           message = 'Push! It\'s a tie.';
-          outcome = 'push';
+          outcome = 'tie';
           totalWin = game.betAmount;
         }
 
@@ -676,7 +664,7 @@ app.post('/play-solana-card-duel', async (req, res) => {
           console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
         }
 
-        delete gameStates[gameId];
+        delete gameStates[gameId]; // Pulisci lo stato dopo la partita
       }
 
       res.json({
@@ -695,7 +683,6 @@ app.post('/play-solana-card-duel', async (req, res) => {
     res.status(500).json({ success: false, error: `Failed to play solana card duel: ${err.message}` });
   }
 });
-       
 
 // Funzione di rimborso per una partita
 const refundBetsForGame = async (gameId) => {
