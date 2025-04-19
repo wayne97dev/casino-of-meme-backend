@@ -152,7 +152,7 @@ const removeCircularReferences = (obj, seen = new WeakSet()) => {
 // Costanti per i minigiochi
 const COMPUTER_WIN_CHANCE = {
   solanaCardDuel: 0.92,
-  memeSlots: 0.85,
+  memeSlots: 0.9,
   coinFlip: 0.92,
   crazyWheel: 0.95,
 };
