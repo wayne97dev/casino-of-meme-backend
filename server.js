@@ -446,6 +446,14 @@ app.post('/play-crazy-wheel', async (req, res) => {
     return res.status(400).json({ success: false, error: 'No bets placed' });
   }
 
+  // Valida le scommesse
+  const validSegments = ['1', '2', '5', '10', 'Coin Flip', 'Pachinko', 'Cash Hunt', 'Crazy Time'];
+  for (const segment in bets) {
+    if (!validSegments.includes(segment) || isNaN(bets[segment]) || bets[segment] < 0) {
+      return res.status(400).json({ success: false, error: 'Invalid bet segment or amount' });
+    }
+  }
+
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(totalBet * LAMPORTS_PER_SOL);
@@ -470,190 +478,11 @@ app.post('/play-crazy-wheel', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    // Genera il risultato della ruota basato sul colore
-    const betSegments = Object.keys(bets).filter(segment => bets[segment] > 0);
-    const topSlotSegment = betSegments[Math.floor(Math.random() * betSegments.length)] || '1';
-    const topSlotMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
-
-    let resultIndex;
-    const colorMap = {};
-
-    // Crea una mappa di segmenti per colore
-    crazyTimeWheel.forEach((segment, index) => {
-      const key = `${segment.value}-${segment.type}-${segment.colorName}`;
-      if (!colorMap[key]) {
-        colorMap[key] = [];
-      }
-      colorMap[key].push(index);
-    });
-
-    const betColorKeys = [];
-    betSegments.forEach(segment => {
-      crazyTimeWheel
-        .filter(seg => String(seg.value) === segment)
-        .forEach(seg => {
-          const key = `${seg.value}-${seg.type}-${seg.colorName}`;
-          if (colorMap[key]) {
-            betColorKeys.push(key);
-          }
-        });
-    });
-
-    if (Math.random() < COMPUTER_WIN_CHANCE.crazyWheel) {
-      // Scegli un segmento non scommesso
-      const nonBetKeys = Object.keys(colorMap).filter(key => !betColorKeys.includes(key));
-      const selectedKey = nonBetKeys.length > 0
-        ? nonBetKeys[Math.floor(Math.random() * nonBetKeys.length)]
-        : Object.keys(colorMap)[Math.floor(Math.random() * Object.keys(colorMap).length)];
-      const indices = colorMap[selectedKey];
-      resultIndex = indices[Math.floor(Math.random() * indices.length)];
-    } else {
-      // Scegli un segmento scommesso
-      const selectedKey = betColorKeys.length > 0
-        ? betColorKeys[Math.floor(Math.random() * betColorKeys.length)]
-        : Object.keys(colorMap)[Math.floor(Math.random() * Object.keys(colorMap).length)];
-      const indices = colorMap[selectedKey];
-      resultIndex = indices[Math.floor(Math.random() * indices.length)];
-    }
-
-    const result = crazyTimeWheel[resultIndex];
-    let totalWin = 0;
-    let bonusResult = null;
-    let bonusMessage = '';
-
-    console.log('DEBUG - Crazy Wheel result:', {
-      resultIndex,
-      result: result.value,
-      type: result.type,
-      color: result.color,
-      colorName: result.colorName,
-      topSlotSegment,
-      topSlotMultiplier,
-      betSegments,
-      betColorKeys,
-      crazyTimeWheelLength: crazyTimeWheel.length,
-      crazyTimeWheelSample: crazyTimeWheel.slice(0, 5),
-    });
-
-    if (result.type === 'number') {
-      const betOnResult = bets[result.value] || 0;
-      if (betOnResult > 0) {
-        let multiplier = parseInt(result.value);
-        let topSlotApplied = String(topSlotSegment) === String(result.value);
-        if (topSlotApplied) {
-          multiplier *= topSlotMultiplier;
-        }
-        totalWin = betOnResult * multiplier;
-      }
-    } else {
-      if (result.value === 'Coin Flip') {
-        const redMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
-        const blueMultiplier = [2, 3, 5, 10][Math.floor(Math.random() * 4)];
-        const side = Math.random() < 0.5 ? 'red' : 'blue';
-        let multiplier = side === 'red' ? redMultiplier : blueMultiplier;
-        let topSlotApplied = String(topSlotSegment) === 'Coin Flip';
-        if (topSlotApplied) {
-          multiplier *= topSlotMultiplier;
-        }
-        bonusResult = { type: 'Coin Flip', side, redMultiplier, blueMultiplier, multiplier };
-        const betOnBonus = bets['Coin Flip'] || 0;
-        if (betOnBonus > 0) {
-          totalWin = betOnBonus * multiplier;
-          bonusMessage = topSlotApplied
-            ? `Coin Flip: ${side} vince! Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
-            : `Coin Flip: ${side} vince! Hai vinto ${totalWin.toFixed(2)} SOL!`;
-        } else {
-          bonusMessage = 'Hai attivato Coin Flip, ma non hai scommesso su di esso.';
-        }
-      } else if (result.value === 'Pachinko') {
-        const multipliers = [2, 3, 5, 10, 20];
-        const slotIndex = Math.floor(Math.random() * multipliers.length);
-        let multiplier = multipliers[slotIndex];
-        let topSlotApplied = String(topSlotSegment) === 'Pachinko';
-        if (topSlotApplied) {
-          multiplier *= topSlotMultiplier;
-        }
-        bonusResult = { type: 'Pachinko', slotIndex, multiplier };
-        const betOnBonus = bets['Pachinko'] || 0;
-        if (betOnBonus > 0) {
-          totalWin = betOnBonus * multiplier;
-          bonusMessage = topSlotApplied
-            ? `Pachinko: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
-            : `Pachinko: Hai vinto ${totalWin.toFixed(2)} SOL!`;
-        } else {
-          bonusMessage = 'Hai attivato Pachinko, ma non hai scommesso su di esso.';
-        }
-      } else if (result.value === 'Cash Hunt') {
-        const multipliers = Array(10).fill().map(() => Math.floor(Math.random() * 50) + 1);
-        const chosenMultiplier = multipliers[Math.floor(Math.random() * multipliers.length)];
-        let multiplier = chosenMultiplier;
-        let topSlotApplied = String(topSlotSegment) === 'Cash Hunt';
-        if (topSlotApplied) {
-          multiplier *= topSlotMultiplier;
-        }
-        bonusResult = { type: 'Cash Hunt', multipliers, chosenMultiplier, multiplier };
-        const betOnBonus = bets['Cash Hunt'] || 0;
-        if (betOnBonus > 0) {
-          totalWin = betOnBonus * multiplier;
-          bonusMessage = topSlotApplied
-            ? `Cash Hunt: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
-            : `Cash Hunt: Hai vinto ${totalWin.toFixed(2)} SOL!`;
-        } else {
-          bonusMessage = 'Hai attivato Cash Hunt, ma non hai scommesso su di esso.';
-        }
-      } else if (result.value === 'Crazy Time') {
-        const multipliers = [10, 20, 50, 100, 200];
-        const chosenMultiplier = multipliers[Math.floor(Math.random() * multipliers.length)];
-        let multiplier = chosenMultiplier;
-        let topSlotApplied = String(topSlotSegment) === 'Crazy Time';
-        if (topSlotApplied) {
-          multiplier *= topSlotMultiplier;
-        }
-        bonusResult = { type: 'Crazy Time', multiplier };
-        const betOnBonus = bets['Crazy Time'] || 0;
-        if (betOnBonus > 0) {
-          totalWin = betOnBonus * multiplier;
-          bonusMessage = topSlotApplied
-            ? `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL con il moltiplicatore Top Slot ${topSlotMultiplier}x!`
-            : `Crazy Time: Hai vinto ${totalWin.toFixed(2)} SOL!`;
-        } else {
-          bonusMessage = 'Hai attivato Crazy Time, ma non hai scommesso su di esso.';
-        }
-      }
-    }
-
-    // Distribuisci le vincite
-    if (totalWin > 0) {
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: userPublicKey,
-          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
-        })
-      );
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-
-      const winSignature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(winSignature);
-      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
-    }
-
-    res.json({
-      success: true,
-      resultIndex, // Aggiunto per il frontend
-      result,
-      topSlot: { segment: topSlotSegment, multiplier: topSlotMultiplier },
-      bonusResult,
-      bonusMessage,
-      totalWin,
-    });
+    // Non genera il risultato del gioco, lascia che il frontend lo gestisca
+    res.json({ success: true });
   } catch (err) {
     console.error('Error in play-crazy-wheel:', err);
-    res.status(500).json({ success: false, error: 'Failed to play crazy wheel' });
+    res.status(500).json({ success: false, error: 'Failed to process transaction' });
   }
 });
 
