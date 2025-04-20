@@ -958,10 +958,16 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 
 // Endpoint per unirsi a una partita di Poker PvP (invariato)
 app.post('/join-poker-game', async (req, res) => {
-  const { playerAddress, betAmount } = req.body;
+  const { playerAddress, betAmount, signedTransaction } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0) {
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress or betAmount' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    console.log('Invalid parameters:', { playerAddress, betAmount, signedTransaction });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
+  }
+
+  if (betAmount < MIN_BET) {
+    console.log(`Bet ${betAmount} COM is below minimum ${MIN_BET} COM`);
+    return res.status(400).json({ success: false, error: `Bet must be at least ${MIN_BET} COM` });
   }
 
   try {
@@ -969,28 +975,7 @@ app.post('/join-poker-game', async (req, res) => {
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    let userAccountExists = false;
-    try {
-      await getAccount(connection, userATA);
-      userAccountExists = true;
-    } catch (err) {
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          userATA,
-          userPublicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log(`Created user ATA for ${playerAddress}`);
-    }
-
+    // Verifica se l'ATA del casinò esiste, altrimenti crealo
     let casinoAccountExists = false;
     try {
       await getAccount(connection, casinoATA);
@@ -1013,33 +998,36 @@ app.post('/join-poker-game', async (req, res) => {
       console.log('Created casino ATA');
     }
 
-    const userBalance = await connection.getTokenAccountBalance(userATA);
+    // Verifica il saldo COM dell'utente
+    const userBalance = await connection.getTokenAccountBalance(userATA).catch(() => ({
+      value: { uiAmount: 0 },
+    }));
     if (userBalance.value.uiAmount < betAmount) {
+      console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${betAmount}`);
       return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
 
-    const transaction = new Transaction().add(
-      createTransferInstruction(
-        userATA,
-        casinoATA,
-        userPublicKey,
-        betAmount * 1e9
-      )
-    );
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
 
-    const { blockhash } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = wallet.publicKey;
-    transaction.partialSign(wallet);
+    if (!transaction.verifySignatures()) {
+      console.log('Invalid transaction signatures for:', playerAddress);
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
 
     const signature = await connection.sendRawTransaction(transaction.serialize());
-    await connection.confirmTransaction(signature);
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
     console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error in join-poker-game:', err);
-    res.status(500).json({ success: false, error: 'Failed to join game' });
+    console.error('Error in join-poker-game:', err.message, err.stack);
+    res.status(500).json({ success: false, error: 'Failed to join game: ' + err.message });
   }
 });
 
