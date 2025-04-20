@@ -1167,11 +1167,17 @@ app.get('/leaderboard', async (req, res) => {
 });
 
 // Gestione delle connessioni WebSocket per Poker PvP (invariato)
+// ... (importazioni e configurazioni iniziali invariate)
+
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id);
+  console.log('Client origin:', socket.handshake.headers.origin);
+  console.log('Socket rooms:', socket.rooms);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
+    console.log('Socket ID:', socket.id);
+    console.log('Current waitingPlayers:', waitingPlayers);
 
     // Validazione della scommessa
     const minBet = MIN_BET;
@@ -1186,6 +1192,7 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // Controllo duplicati
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
@@ -1195,9 +1202,13 @@ io.on('connection', (socket) => {
       console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
     }
 
+    // Emetti eventi per aggiornare il frontend
     socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
     io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
 
+    console.log('Current waitingPlayers after emit:', waitingPlayers);
+
+    // Avvia una partita se ci sono abbastanza giocatori
     if (waitingPlayers.length >= 2) {
       const gameId = Date.now().toString();
       const players = waitingPlayers.splice(0, 2);
@@ -1223,7 +1234,6 @@ io.on('connection', (socket) => {
         timeLeft: 30,
       };
 
-      // Salva la partita nel database
       try {
         const game = new Game({
           gameId,
@@ -1238,7 +1248,7 @@ io.on('connection', (socket) => {
         await game.save();
         console.log(`Saved game ${gameId} to database`);
       } catch (err) {
-        console.error(`Error saving game ${gameId}:`, err);
+        console.error(`Error saving game ${gameId}:`, err.message, err.stack);
         socket.emit('error', { message: 'Error starting game' });
         await refundBetsForGame(gameId);
         return;
@@ -1248,6 +1258,9 @@ io.on('connection', (socket) => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
           playerSocket.join(gameId);
+          console.log(`Player ${player.address} joined room ${gameId}`);
+        } else {
+          console.error(`Player socket not found for ${player.address}`);
         }
       });
 
@@ -1263,16 +1276,12 @@ io.on('connection', (socket) => {
       waitingPlayers.splice(playerIndex, 1);
       console.log(`Player ${playerAddress} left the waiting list`);
 
-      // Invia il rimborso al giocatore
       socket.emit('refund', {
         message: 'You left the waiting list. Your bet has been refunded.',
         amount: player.bet,
       });
 
-      // Aggiorna gli altri giocatori nella lista d'attesa
-      io.emit('waitingPlayers', { 
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
-      });
+      io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
       socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
     } else {
       socket.emit('error', { message: 'You are not in the waiting list.' });
@@ -1293,7 +1302,6 @@ io.on('connection', (socket) => {
           game.currentTurn = socket.id;
           console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
         }
-        // Aggiorna il socket.id nel database
         try {
           await Game.updateOne(
             { gameId, 'players.address': playerAddress },
@@ -1377,7 +1385,6 @@ io.on('connection', (socket) => {
       } else {
         startTurnTimer(gameId, opponent.id);
       }
-      // Aggiorna il pot nel database
       try {
         await Game.updateOne({ gameId }, { pot: game.pot });
         console.log(`Updated pot for game ${gameId} to ${game.pot}`);
@@ -1402,7 +1409,6 @@ io.on('connection', (socket) => {
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       game.currentTurn = opponent.id;
       game.bettingRoundComplete = false;
-      // Aggiorna il pot nel database
       try {
         await Game.updateOne({ gameId }, { pot: game.pot });
         console.log(`Updated pot for game ${gameId} to ${game.pot}`);
