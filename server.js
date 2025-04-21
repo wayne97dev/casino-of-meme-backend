@@ -1107,34 +1107,66 @@ app.get('/leaderboard', async (req, res) => {
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
 
-  socket.on('joinGame', async ({ playerAddress, betAmount }) => {
-    console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
+  socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
+    console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM, socket.id: ${socket.id}`);
+
+    // Validazione dei parametri
+    if (!playerAddress || !betAmount || isNaN(betAmount)) {
+      const errorMsg = 'Invalid playerAddress or betAmount';
+      console.log(`Join rejected: ${errorMsg}`);
+      socket.emit('error', { message: errorMsg });
+      if (callback) callback({ success: false, error: errorMsg });
+      return;
+    }
 
     const minBet = MIN_BET;
     if (betAmount < minBet) {
-      socket.emit('error', { message: `Bet must be at least ${minBet.toFixed(2)} COM` });
+      const errorMsg = `Bet must be at least ${minBet.toFixed(2)} COM`;
+      socket.emit('error', { message: errorMsg });
       console.log(`Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
+      if (callback) callback({ success: false, error: errorMsg });
       return;
     }
     if (betAmount <= 0) {
-      socket.emit('error', { message: 'Bet amount must be positive' });
+      const errorMsg = 'Bet amount must be positive';
+      socket.emit('error', { message: errorMsg });
       console.log(`Bet ${betAmount} COM rejected: non-positive`);
+      if (callback) callback({ success: false, error: errorMsg });
       return;
     }
 
+    // Verifica se il giocatore è già nella lista
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
-      console.log(`Updated player ${playerAddress} socket.id to ${socket.id}`);
+      waitingPlayers[existingPlayerIndex].bet = betAmount;
+      console.log(`Updated player ${playerAddress} in waiting list: socket.id=${socket.id}, bet=${betAmount}`);
     } else {
       waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
       console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
     }
 
-    socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
-    io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+    // Log dello stato attuale della waiting list
+    console.log('Current waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet, socketId: p.id })));
 
+    // Emetti evento waiting al giocatore
+    socket.emit('waiting', { 
+      message: 'You have joined the game! Waiting for another player...', 
+      players: waitingPlayers 
+    });
+    // Emetti evento waitingPlayers a tutti i client
+    io.emit('waitingPlayers', { 
+      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+    });
+
+    // Rispondi al client con un acknowledgment
+    if (callback) {
+      callback({ success: true, message: 'Joined waiting list successfully' });
+    }
+
+    // Avvia una partita se ci sono almeno 2 giocatori
     if (waitingPlayers.length >= 2) {
+      console.log(`Enough players (${waitingPlayers.length}), starting game...`);
       const gameId = Date.now().toString();
       const players = waitingPlayers.splice(0, 2);
       games[gameId] = {
@@ -1176,6 +1208,7 @@ io.on('connection', (socket) => {
         console.error(`Error saving game ${gameId}:`, err);
         socket.emit('error', { message: 'Error starting game' });
         await refundBetsForGame(gameId);
+        if (callback) callback({ success: false, error: 'Error starting game' });
         return;
       }
 
@@ -1183,10 +1216,18 @@ io.on('connection', (socket) => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
           playerSocket.join(gameId);
+          console.log(`Player ${player.address} joined room ${gameId}`);
+        } else {
+          console.error(`Socket for player ${player.address} not found`);
         }
       });
 
-      io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+      // Aggiorna la lista d'attesa per tutti i client
+      io.emit('waitingPlayers', { 
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+      });
+      console.log(`Game ${gameId} started with players:`, players.map(p => p.address));
+
       startGame(gameId);
     }
   });
@@ -1241,106 +1282,6 @@ io.on('connection', (socket) => {
       }
     } else {
       console.error(`Game ${gameId} not found during reconnection`);
-    }
-  });
-
-  socket.on('makeMove', async ({ gameId, move, amount }) => {
-    const game = games[gameId];
-    if (!game || game.currentTurn !== socket.id) {
-      return;
-    }
-
-    if (game.turnTimer) {
-      clearInterval(game.turnTimer);
-    }
-    game.timeLeft = 30;
-
-    const playerAddress = game.players.find(p => p.id === socket.id)?.address;
-    const opponent = game.players.find(p => p.id !== socket.id);
-    if (!playerAddress || !opponent) {
-      await refundBetsForGame(gameId);
-      return;
-    }
-    const currentPlayerBet = game.playerBets[playerAddress] || 0;
-
-    if (move === 'fold') {
-      game.status = 'finished';
-      game.opponentCardsVisible = true;
-      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
-      game.dealerMessage = 'The dealer announces the winner!';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-      await updateLeaderboard(opponent.address, game.pot);
-      try {
-        await Game.updateOne({ gameId }, { status: 'finished' });
-        await Game.deleteOne({ gameId });
-        console.log(`Deleted game ${gameId} from database`);
-      } catch (err) {
-        console.error(`Error updating/deleting game ${gameId}:`, err);
-      }
-      delete games[gameId];
-    } else if (move === 'check') {
-      if (game.currentBet > currentPlayerBet) {
-        game.message = 'You cannot check, you must call or raise!';
-        game.dealerMessage = 'The dealer reminds: You must call or raise!';
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } else {
-        game.message = 'You checked.';
-        game.dealerMessage = 'The dealer says: Player checked.';
-        if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
-          game.bettingRoundComplete = true;
-          advanceGamePhase(gameId);
-        } else {
-          game.currentTurn = opponent.id;
-          startTurnTimer(gameId, opponent.id);
-        }
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      }
-    } else if (move === 'call') {
-      const amountToCall = game.currentBet - currentPlayerBet;
-      game.pot += amountToCall;
-      game.playerBets[playerAddress] = game.currentBet;
-      game.message = `You called ${amountToCall.toFixed(2)} COM.`;
-      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
-      game.currentTurn = opponent.id;
-      if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
-        game.bettingRoundComplete = true;
-        advanceGamePhase(gameId);
-      } else {
-        startTurnTimer(gameId, opponent.id);
-      }
-      try {
-        await Game.updateOne({ gameId }, { pot: game.pot });
-        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
-      } catch (err) {
-        console.error(`Error updating pot for game ${gameId}:`, err);
-      }
-      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-    } else if (move === 'bet' || move === 'raise') {
-      const minBet = MIN_BET;
-      const newBet = move === 'bet' ? amount : game.currentBet + amount;
-      if (newBet <= game.currentBet || amount < minBet) {
-        game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
-        game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        return;
-      }
-      const additionalBet = newBet - currentPlayerBet;
-      game.pot += additionalBet;
-      game.playerBets[playerAddress] = newBet;
-      game.currentBet = newBet;
-      game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
-      game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
-      game.currentTurn = opponent.id;
-      game.bettingRoundComplete = false;
-      try {
-        await Game.updateOne({ gameId }, { pot: game.pot });
-        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
-      } catch (err) {
-        console.error(`Error updating pot for game ${gameId}:`, err);
-      }
-      startTurnTimer(gameId, opponent.id);
-      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }
   });
 
