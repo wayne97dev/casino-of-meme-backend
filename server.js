@@ -1036,9 +1036,10 @@ app.post('/distribute-winnings', async (req, res) => {
 
     // Verifica se l'ATA del casinò esiste, altrimenti crealo
     let casinoAccountExists = false;
+    let casinoATAInfo;
     try {
       console.log('Checking if casino ATA exists...');
-      await getAccount(connection, casinoATA);
+      casinoATAInfo = await getAccount(connection, casinoATA);
       casinoAccountExists = true;
       console.log('Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
@@ -1058,6 +1059,16 @@ app.post('/distribute-winnings', async (req, res) => {
       const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
       await retry(() => connection.confirmTransaction(signature));
       console.log('Created casino ATA:', casinoATA.toBase58());
+      casinoATAInfo = await getAccount(connection, casinoATA);
+    }
+
+    // Verifica il proprietario dell'ATA del casinò
+    console.log('Checking casino ATA owner...');
+    const casinoATAOwner = casinoATAInfo.owner.toBase58();
+    const expectedOwner = wallet.publicKey.toBase58();
+    if (casinoATAOwner !== expectedOwner) {
+      console.log('Casino ATA owner mismatch:', { actualOwner: casinoATAOwner, expectedOwner });
+      return res.status(400).json({ success: false, error: `Casino ATA owner mismatch: expected ${expectedOwner}, found ${casinoATAOwner}` });
     }
 
     // Verifica il saldo COM del casinò
