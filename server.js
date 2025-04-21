@@ -988,6 +988,18 @@ app.post('/process-transaction', async (req, res) => {
 });
 
 // Endpoint per distribuire vincite in SOL (usato per tutti i minigiochi escluso Poker PvP)
+const retry = async (fn, retries = 3, delay = 1000) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      console.log(`Retry attempt ${i + 1}/${retries} failed, retrying in ${delay}ms...`, err.message);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+};
+
 app.post('/distribute-winnings', async (req, res) => {
   const { winnerAddress, amount } = req.body;
 
@@ -998,9 +1010,16 @@ app.post('/distribute-winnings', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid winnerAddress or amount' });
   }
 
+  let winnerPublicKey;
   try {
-    console.log('Creating PublicKey for winnerAddress:', winnerAddress);
-    const winnerPublicKey = new PublicKey(winnerAddress);
+    console.log('Validating winnerAddress:', winnerAddress);
+    winnerPublicKey = new PublicKey(winnerAddress);
+  } catch (err) {
+    console.error('Invalid winnerAddress:', err.message);
+    return res.status(400).json({ success: false, error: `Invalid winnerAddress: ${err.message}` });
+  }
+
+  try {
     console.log('Getting casino ATA...');
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
     console.log('Getting winner ATA...');
@@ -1008,7 +1027,7 @@ app.post('/distribute-winnings', async (req, res) => {
 
     // Verifica il saldo SOL del casinò per le fee
     console.log('Checking casino SOL balance...');
-    const casinoSolBalance = await connection.getBalance(wallet.publicKey);
+    const casinoSolBalance = await retry(() => connection.getBalance(wallet.publicKey));
     const minSolBalance = 0.01 * LAMPORTS_PER_SOL; // Minimo 0.01 SOL per le fee
     if (casinoSolBalance < minSolBalance) {
       console.log('Insufficient SOL balance in casino wallet for fees:', { balance: casinoSolBalance / LAMPORTS_PER_SOL, required: minSolBalance / LAMPORTS_PER_SOL });
@@ -1032,24 +1051,30 @@ app.post('/distribute-winnings', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await retry(() => connection.getLatestBlockhash());
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
+      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+      await retry(() => connection.confirmTransaction(signature));
       console.log('Created casino ATA:', casinoATA.toBase58());
     }
 
     // Verifica il saldo COM del casinò
     console.log('Checking casino COM balance...');
-    const casinoBalance = await connection.getTokenAccountBalance(casinoATA).catch(() => ({
-      value: { uiAmount: 0 },
-    }));
-    if (casinoBalance.value.uiAmount < amount) {
-      console.log('Insufficient COM balance in casino ATA:', { balance: casinoBalance.value.uiAmount, required: amount });
-      return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
+    let casinoBalance;
+    try {
+      casinoBalance = await retry(() => connection.getTokenAccountBalance(casinoATA));
+    } catch (err) {
+      console.error('Failed to fetch casino COM balance:', err.message);
+      return res.status(500).json({ success: false, error: `Failed to fetch casino COM balance: ${err.message}` });
     }
+    if (!casinoBalance || !casinoBalance.value || casinoBalance.value.uiAmount < amount) {
+      const balance = casinoBalance?.value?.uiAmount || 0;
+      console.log('Insufficient COM balance in casino ATA:', { balance, required: amount });
+      return res.status(400).json({ success: false, error: `Insufficient COM balance in casino wallet: ${balance} COM available, ${amount} COM required` });
+    }
+    console.log('Casino COM balance sufficient:', casinoBalance.value.uiAmount);
 
     // Verifica se l'ATA del vincitore esiste, altrimenti crealo
     let winnerAccountExists = false;
@@ -1068,12 +1093,12 @@ app.post('/distribute-winnings', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await retry(() => connection.getLatestBlockhash());
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
+      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+      await retry(() => connection.confirmTransaction(signature));
       console.log('Created winner ATA:', winnerATA.toBase58());
     }
 
@@ -1089,15 +1114,22 @@ app.post('/distribute-winnings', async (req, res) => {
     );
 
     console.log('Getting latest blockhash...');
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await retry(() => connection.getLatestBlockhash());
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
+    console.log('Estimating transaction fee...');
+    const fee = await transaction.getEstimatedFee(connection);
+    console.log('Estimated transaction fee:', fee / LAMPORTS_PER_SOL, 'SOL');
+    if (casinoSolBalance < fee) {
+      console.log('Insufficient SOL balance for transaction fee:', { balance: casinoSolBalance / LAMPORTS_PER_SOL, required: fee / LAMPORTS_PER_SOL });
+      return res.status(400).json({ success: false, error: `Insufficient SOL balance for transaction fee: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${fee / LAMPORTS_PER_SOL} SOL required` });
+    }
     transaction.partialSign(wallet);
 
     console.log('Sending transaction to transfer winnings:', { winnerAddress, amount });
-    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
     console.log('Confirming transaction:', signature);
-    await connection.confirmTransaction(signature);
+    await retry(() => connection.confirmTransaction(signature));
     console.log(`Sent ${amount} COM to the Winner ${winnerAddress}`);
 
     res.json({ success: true });
