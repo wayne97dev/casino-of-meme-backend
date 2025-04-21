@@ -1,4 +1,4 @@
-equire('dotenv').config(); // Carica le variabili d'ambiente dal file .env
+require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
 
 
 
