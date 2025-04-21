@@ -1,5 +1,4 @@
-
-require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
+equire('dotenv').config(); // Carica le variabili d'ambiente dal file .env
 
 
 
@@ -958,11 +957,11 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 
 // Endpoint per unirsi a una partita di Poker PvP (invariato)
 app.post('/join-poker-game', async (req, res) => {
-  const { playerAddress, betAmount } = req.body;
+  const { playerAddress, betAmount, signedTransaction } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0) {
-    console.log('Invalid parameters:', { playerAddress, betAmount });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress or betAmount' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    console.log('Invalid parameters:', { playerAddress, betAmount, signedTransaction });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
   }
 
   if (betAmount < MIN_BET) {
@@ -980,15 +979,13 @@ app.post('/join-poker-game', async (req, res) => {
     try {
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
-          wallet.publicKey, // Payer
-          casinoATA, // ATA da creare
-          wallet.publicKey, // Owner
-          MINT_ADDRESS // Mint del token
+          wallet.publicKey,
+          casinoATA,
+          wallet.publicKey,
+          MINT_ADDRESS
         )
       );
       const { blockhash } = await connection.getLatestBlockhash();
@@ -997,61 +994,36 @@ app.post('/join-poker-game', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
-    }
-
-    // Verifica se l'ATA dell'utente esiste, altrimenti crealo
-    let userAccountExists = false;
-    try {
-      await getAccount(connection, userATA);
-      userAccountExists = true;
-      console.log('User ATA exists:', userATA.toBase58());
-    } catch (err) {
-      console.log('User ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey, // Payer (il casinò paga)
-          userATA, // ATA da creare
-          userPublicKey, // Owner
-          MINT_ADDRESS // Mint del token
-        )
-      );
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log('Created user ATA:', userATA.toBase58());
+      console.log('Created casino ATA');
     }
 
     // Verifica il saldo COM dell'utente
-    console.log('Fetching user COM balance for:', playerAddress);
-    const userBalance = await connection.getTokenAccountBalance(userATA);
+    const userBalance = await connection.getTokenAccountBalance(userATA).catch(() => ({
+      value: { uiAmount: 0 },
+    }));
     if (userBalance.value.uiAmount < betAmount) {
       console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${betAmount}`);
       return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
-    console.log('User COM balance:', userBalance.value.uiAmount);
 
-    // Crea la transazione per trasferire COM
-    const transaction = new Transaction().add(
-      createTransferInstruction(
-        userATA,
-        casinoATA,
-        userPublicKey,
-        betAmount * 1e6 // Converti in unità base (6 decimali)
-      )
-    );
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
 
-    const { blockhash } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = userPublicKey;
+    if (!transaction.verifySignatures()) {
+      console.log('Invalid transaction signatures for:', playerAddress);
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
 
-    // Serializza la transazione senza firmarla
-    const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+    console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
 
-    res.json({ success: true, transaction: serializedTransaction });
+    res.json({ success: true });
   } catch (err) {
     console.error('Error in join-poker-game:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to join game: ' + err.message });
@@ -1063,7 +1035,6 @@ app.post('/make-poker-move', async (req, res) => {
   const { playerAddress, gameId, move, amount } = req.body;
 
   if (!playerAddress || !gameId || !move || amount === undefined || isNaN(amount) || amount < 0) {
-    console.log('Invalid parameters:', { playerAddress, gameId, move, amount });
     return res.status(400).json({ success: false, error: 'Invalid required fields' });
   }
 
@@ -1073,68 +1044,34 @@ app.post('/make-poker-move', async (req, res) => {
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
     if (amount > 0) {
-      console.log('Fetching user COM balance for move:', move);
       const userBalance = await connection.getTokenAccountBalance(userATA);
       if (userBalance.value.uiAmount < amount) {
-        console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${amount}`);
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
       }
-      console.log('User COM balance:', userBalance.value.uiAmount);
 
-      // Crea la transazione per trasferire COM
       const transaction = new Transaction().add(
         createTransferInstruction(
           userATA,
           casinoATA,
           userPublicKey,
-          amount * 1e6 // Converti in unità base (6 decimali)
+          amount * 1e9
         )
       );
 
       const { blockhash } = await connection.getLatestBlockhash();
       transaction.recentBlockhash = blockhash;
-      transaction.feePayer = userPublicKey;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
 
-      // Serializza la transazione senza firmarla
-      const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
-
-      res.json({ success: true, transaction: serializedTransaction });
-    } else {
-      // Per mosse senza importo (es. check, fold)
-      res.json({ success: true });
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
     }
-  } catch (err) {
-    console.error('Error in make-poker-move:', err.message, err.stack);
-    res.status(500).json({ success: false, error: 'Failed to process move: ' + err.message });
-  }
-});
-
-
-app.post('/confirm-transaction', async (req, res) => {
-  const { signedTransaction } = req.body;
-
-  if (!signedTransaction) {
-    console.log('Missing signedTransaction');
-    return res.status(400).json({ success: false, error: 'Missing signedTransaction' });
-  }
-
-  try {
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-
-    if (!transaction.verifySignatures()) {
-      console.log('Invalid transaction signatures');
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    await connection.confirmTransaction(signature, 'confirmed');
-    console.log('Transaction confirmed:', signature);
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error in confirm-transaction:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to confirm transaction: ${err.message}` });
+    console.error('Error in make-poker-move:', err);
+    res.status(500).json({ success: false, error: 'Failed to process move' });
   }
 });
 
@@ -1167,19 +1104,12 @@ app.get('/leaderboard', async (req, res) => {
 });
 
 // Gestione delle connessioni WebSocket per Poker PvP (invariato)
-// ... (importazioni e configurazioni iniziali invariate)
-
 io.on('connection', (socket) => {
-  console.log('A player connected:', socket.id);
-  console.log('Client origin:', socket.handshake.headers.origin);
-  console.log('Socket rooms:', socket.rooms);
+  console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM`);
-    console.log('Socket ID:', socket.id);
-    console.log('Current waitingPlayers:', waitingPlayers);
 
-    // Validazione della scommessa
     const minBet = MIN_BET;
     if (betAmount < minBet) {
       socket.emit('error', { message: `Bet must be at least ${minBet.toFixed(2)} COM` });
@@ -1192,7 +1122,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Controllo duplicati
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
@@ -1202,13 +1131,9 @@ io.on('connection', (socket) => {
       console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
     }
 
-    // Emetti eventi per aggiornare il frontend
     socket.emit('waiting', { message: 'You have joined the game! Waiting for another player...', players: waitingPlayers });
     io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
 
-    console.log('Current waitingPlayers after emit:', waitingPlayers);
-
-    // Avvia una partita se ci sono abbastanza giocatori
     if (waitingPlayers.length >= 2) {
       const gameId = Date.now().toString();
       const players = waitingPlayers.splice(0, 2);
@@ -1248,7 +1173,7 @@ io.on('connection', (socket) => {
         await game.save();
         console.log(`Saved game ${gameId} to database`);
       } catch (err) {
-        console.error(`Error saving game ${gameId}:`, err.message, err.stack);
+        console.error(`Error saving game ${gameId}:`, err);
         socket.emit('error', { message: 'Error starting game' });
         await refundBetsForGame(gameId);
         return;
@@ -1258,9 +1183,6 @@ io.on('connection', (socket) => {
         const playerSocket = io.sockets.sockets.get(player.id);
         if (playerSocket) {
           playerSocket.join(gameId);
-          console.log(`Player ${player.address} joined room ${gameId}`);
-        } else {
-          console.error(`Player socket not found for ${player.address}`);
         }
       });
 
@@ -1281,7 +1203,9 @@ io.on('connection', (socket) => {
         amount: player.bet,
       });
 
-      io.emit('waitingPlayers', { players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) });
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
+      });
       socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
     } else {
       socket.emit('error', { message: 'You are not in the waiting list.' });
@@ -1428,8 +1352,8 @@ io.on('connection', (socket) => {
       const player = waitingPlayers[waitingIndex];
       waitingPlayers.splice(waitingIndex, 1);
       console.log(`Player ${player.address} removed from waiting list due to disconnect`);
-      io.emit('waitingPlayers', { 
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
       });
     }
 
