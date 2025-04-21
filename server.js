@@ -1034,6 +1034,32 @@ app.post('/distribute-winnings', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance in casino wallet for transaction fees' });
     }
 
+    // Verifica lo stato del mint del token COM
+    console.log('Checking token mint state...');
+    const mintInfo = await connection.getParsedAccountInfo(MINT_ADDRESS);
+    if (!mintInfo.value) {
+      console.log('Failed to fetch token mint info');
+      return res.status(500).json({ success: false, error: 'Failed to fetch token mint info' });
+    }
+    const mintData = mintInfo.value.data.parsed.info;
+    if (mintData.isInitialized === false) {
+      console.log('Token mint is not initialized');
+      return res.status(400).json({ success: false, error: 'Token mint is not initialized' });
+    }
+    if (mintData.freezeAuthority) {
+      console.log('Token mint has freeze authority:', mintData.freezeAuthority);
+      const casinoAccountInfo = await getAccount(connection, casinoATA);
+      if (casinoAccountInfo.isFrozen) {
+        console.log('Casino ATA is frozen');
+        return res.status(400).json({ success: false, error: 'Casino ATA is frozen' });
+      }
+      const winnerAccountInfo = await getAccount(connection, winnerATA);
+      if (winnerAccountInfo.isFrozen) {
+        console.log('Winner ATA is frozen');
+        return res.status(400).json({ success: false, error: 'Winner ATA is frozen' });
+      }
+    }
+
     // Verifica se l'ATA del casinò esiste, altrimenti crealo
     let casinoAccountExists = false;
     let casinoATAInfo;
