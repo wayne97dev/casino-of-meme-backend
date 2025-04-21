@@ -991,17 +991,23 @@ app.post('/process-transaction', async (req, res) => {
 app.post('/distribute-winnings', async (req, res) => {
   const { winnerAddress, amount } = req.body;
 
+  console.log('Received request to /distribute-winnings:', { winnerAddress, amount });
+
   if (!winnerAddress || !amount || isNaN(amount) || amount <= 0) {
     console.log('Invalid parameters:', { winnerAddress, amount });
     return res.status(400).json({ success: false, error: 'Invalid winnerAddress or amount' });
   }
 
   try {
+    console.log('Creating PublicKey for winnerAddress:', winnerAddress);
     const winnerPublicKey = new PublicKey(winnerAddress);
+    console.log('Getting casino ATA...');
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    console.log('Getting winner ATA...');
     const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
 
     // Verifica il saldo SOL del casinò per le fee
+    console.log('Checking casino SOL balance...');
     const casinoSolBalance = await connection.getBalance(wallet.publicKey);
     const minSolBalance = 0.01 * LAMPORTS_PER_SOL; // Minimo 0.01 SOL per le fee
     if (casinoSolBalance < minSolBalance) {
@@ -1009,9 +1015,10 @@ app.post('/distribute-winnings', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance in casino wallet for transaction fees' });
     }
 
-    // Verifica se l'ATA del casinò esiste,ya altrimenti crealo
+    // Verifica se l'ATA del casinò esiste, altrimenti crealo
     let casinoAccountExists = false;
     try {
+      console.log('Checking if casino ATA exists...');
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
       console.log('Casino ATA exists:', casinoATA.toBase58());
@@ -1035,6 +1042,7 @@ app.post('/distribute-winnings', async (req, res) => {
     }
 
     // Verifica il saldo COM del casinò
+    console.log('Checking casino COM balance...');
     const casinoBalance = await connection.getTokenAccountBalance(casinoATA).catch(() => ({
       value: { uiAmount: 0 },
     }));
@@ -1046,6 +1054,7 @@ app.post('/distribute-winnings', async (req, res) => {
     // Verifica se l'ATA del vincitore esiste, altrimenti crealo
     let winnerAccountExists = false;
     try {
+      console.log('Checking if winner ATA exists...');
       await getAccount(connection, winnerATA);
       winnerAccountExists = true;
       console.log('Winner ATA exists:', winnerATA.toBase58());
@@ -1069,6 +1078,7 @@ app.post('/distribute-winnings', async (req, res) => {
     }
 
     // Crea la transazione per trasferire il premio
+    console.log('Creating transaction to transfer winnings...');
     const transaction = new Transaction().add(
       createTransferInstruction(
         casinoATA,
@@ -1078,6 +1088,7 @@ app.post('/distribute-winnings', async (req, res) => {
       )
     );
 
+    console.log('Getting latest blockhash...');
     const { blockhash } = await connection.getLatestBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
@@ -1085,6 +1096,7 @@ app.post('/distribute-winnings', async (req, res) => {
 
     console.log('Sending transaction to transfer winnings:', { winnerAddress, amount });
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('Confirming transaction:', signature);
     await connection.confirmTransaction(signature);
     console.log(`Sent ${amount} COM to the Winner ${winnerAddress}`);
 
