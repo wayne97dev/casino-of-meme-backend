@@ -570,6 +570,7 @@ const refundBetsForGame = async (gameId) => {
         playerSocket.emit('refund', {
           message: 'Game crashed or interrupted. Your bet has been refunded.',
           amount: player.bet,
+          isRefund: true, // Aggiunto flag
         });
         console.log(`Refunded ${player.bet} COM to ${player.address} for game ${gameId}`);
       } else {
@@ -1305,12 +1306,14 @@ io.on('connection', (socket) => {
       const player = waitingPlayers[playerIndex];
       waitingPlayers.splice(playerIndex, 1);
       console.log(`Player ${playerAddress} left the waiting list`);
-
+  
+      // Emetti l'evento refund con un flag isRefund per indicare che non è una vincita
       socket.emit('refund', {
         message: 'You left the waiting list. Your bet has been refunded.',
         amount: player.bet,
+        isRefund: true, // Aggiunto flag
       });
-
+  
       io.emit('waitingPlayers', {
         players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
       });
@@ -1349,6 +1352,118 @@ io.on('connection', (socket) => {
       }
     } else {
       console.error(`Game ${gameId} not found during reconnection`);
+    }
+  });
+
+  socket.on('makeMove', async ({ gameId, move, amount }) => {
+    const game = games[gameId];
+    if (!game || game.currentTurn !== socket.id) {
+      console.log(`Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
+      return;
+    }
+  
+    if (game.turnTimer) {
+      clearInterval(game.turnTimer);
+    }
+    game.timeLeft = 30;
+  
+    const playerAddress = game.players.find(p => p.id === socket.id)?.address;
+    const opponent = game.players.find(p => p.id !== socket.id);
+    if (!playerAddress || !opponent) {
+      console.log(`Player or opponent not found: playerAddress=${playerAddress}, opponent=${opponent}`);
+      await refundBetsForGame(gameId);
+      return;
+    }
+    const currentPlayerBet = game.playerBets[playerAddress] || 0;
+    console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+  
+    if (move === 'fold') {
+      game.status = 'finished';
+      game.opponentCardsVisible = true;
+      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
+      game.dealerMessage = 'The dealer announces the winner!';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot, isRefund: false });
+      await updateLeaderboard(opponent.address, game.pot);
+      try {
+        await Game.updateOne({ gameId }, { status: 'finished' });
+        await Game.deleteOne({ gameId });
+        console.log(`Deleted game ${gameId} from database`);
+      } catch (err) {
+        console.error(`Error updating/deleting game ${gameId}:`, err);
+      }
+      delete games[gameId];
+    } else if (move === 'check') {
+      if (game.currentBet > currentPlayerBet) {
+        game.message = 'You cannot check, you must call or raise!';
+        game.dealerMessage = 'The dealer reminds: You must call or raise!';
+        console.log(`Check not allowed: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } else {
+        game.message = 'You checked.';
+        game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
+        console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+        if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+          game.bettingRoundComplete = true;
+          console.log(`Betting round complete, advancing game phase`);
+          advanceGamePhase(gameId);
+        } else {
+          game.currentTurn = opponent.id;
+          console.log(`Passing turn to opponent: ${opponent.id}`);
+          startTurnTimer(gameId, opponent.id);
+        }
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      }
+    } else if (move === 'call') {
+      const amountToCall = game.currentBet - currentPlayerBet;
+      game.pot += amountToCall;
+      game.playerBets[playerAddress] = game.currentBet;
+      game.message = `You called ${amountToCall.toFixed(2)} COM.`;
+      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
+      console.log(`Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
+      game.currentTurn = opponent.id;
+      if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+        game.bettingRoundComplete = true;
+        console.log(`Betting round complete, advancing game phase`);
+        advanceGamePhase(gameId);
+      } else {
+        console.log(`Passing turn to opponent: ${opponent.id}`);
+        startTurnTimer(gameId, opponent.id);
+      }
+      try {
+        await Game.updateOne({ gameId }, { pot: game.pot });
+        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
+      } catch (err) {
+        console.error(`Error updating pot for game ${gameId}:`, err);
+      }
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } else if (move === 'bet' || move === 'raise') {
+      const minBet = MIN_BET;
+      const newBet = move === 'bet' ? amount : game.currentBet + amount;
+      if (newBet <= game.currentBet || amount < minBet) {
+        game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
+        game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
+        console.log(`Invalid ${move}: newBet=${newBet}, currentBet=${game.currentBet}, minBet=${minBet}`);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+        return;
+      }
+      const additionalBet = newBet - currentPlayerBet;
+      game.pot += additionalBet;
+      game.playerBets[playerAddress] = newBet;
+      game.currentBet = newBet;
+      game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+      game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+      console.log(`${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
+      game.currentTurn = opponent.id;
+      game.bettingRoundComplete = false;
+      try {
+        await Game.updateOne({ gameId }, { pot: game.pot });
+        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
+      } catch (err) {
+        console.error(`Error updating pot for game ${gameId}:`, err);
+      }
+      startTurnTimer(gameId, opponent.id);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }
   });
 
@@ -1563,16 +1678,21 @@ const startGame = async (gameId) => {
     }
 
     game.currentTurn = game.players[0].id;
-    game.pot = game.players[0].bet + game.players[1].bet; // Corretto: usa game.players[1] invece di players[1]
-    game.playerBets[game.players[0].address] = game.players[0].bet;
-    game.playerBets[game.players[1].address] = game.players[1].bet;
-    game.currentBet = game.players[0].bet;
+    game.pot = game.players[0].bet + game.players[1].bet;
+    game.playerBets[game.players[0].address] = 0; // Inizializza a 0 per il round corrente
+    game.playerBets[game.players[1].address] = 0; // Inizializza a 0 per il round corrente
+    game.currentBet = 0; // Inizializza a 0, le scommesse iniziali sono già nel pot
     game.status = 'playing';
     game.message = 'Pre-Flop: Place your bets.';
     game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
 
     console.log(`Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
     console.log(`Player 0 socket.id: ${game.players[0].id}, Player 1 socket.id: ${game.players[1].id}`);
+    console.log(`Initial game state:`, {
+      pot: game.pot,
+      playerBets: game.playerBets,
+      currentBet: game.currentBet,
+    });
 
     // Avvia il timer del turno
     startTurnTimer(gameId, game.players[0].id);
@@ -1873,12 +1993,12 @@ const endGame = async (gameId) => {
 
   if (isTie) {
     const splitAmount = game.pot / 2;
-    io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount });
-    io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount });
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount, isRefund: false });
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount, isRefund: false });
     await updateLeaderboard(player1.address, splitAmount);
     await updateLeaderboard(player2.address, splitAmount);
   } else {
-    io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot });
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot, isRefund: false });
     await updateLeaderboard(winner.address, game.pot);
   }
 
