@@ -45,22 +45,35 @@ app.use((req, res, next) => {
   next();
 });
 
+
 // Middleware CORS ottimizzato
 app.use(cors({
   origin: (origin, callback) => {
-    console.log(`CORS check for origin: ${origin}`);
+    console.log(`CORS check - Origin received: ${origin}`);
     if (!origin || allowedOrigins.includes(origin)) {
-      console.log(`Allowing origin: ${origin}`);
+      console.log(`CORS allowed - Origin: ${origin}`);
       callback(null, true);
     } else {
-      console.log(`Blocking origin: ${origin}`);
+      console.log(`CORS blocked - Origin: ${origin} not in allowedOrigins: ${allowedOrigins}`);
       callback(new Error(`Origin ${origin} not allowed by CORS`));
     }
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'], // Metodi consentiti
+  allowedHeaders: ['Content-Type', 'Authorization'], // Header consentiti
+  credentials: true, // Consenti i cookie e altre credenziali
+  preflightContinue: false, // Assicurati che la risposta preflight sia gestita correttamente
+  optionsSuccessStatus: 204, // Stato di successo per le richieste OPTIONS
 }));
+
+// Gestore esplicito per richieste OPTIONS (aggiunto come precauzione)
+app.options('*', (req, res) => {
+  console.log(`Handling OPTIONS request from origin: ${req.headers.origin}`);
+  res.header('Access-Control-Allow-Origin', req.headers.origin);
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.sendStatus(204);
+});
 
 // Gestore esplicito per richieste OPTIONS
 app.options('*', cors());
