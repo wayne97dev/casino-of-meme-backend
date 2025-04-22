@@ -355,9 +355,10 @@ app.post('/play-meme-slots', async (req, res) => {
 
 // Endpoint per Coin Flip
 app.post('/play-coin-flip', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction, choice } = req.body;
+  const { playerAddress, betAmount, signature, choice } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !choice || !['blue', 'red'].includes(choice)) {
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signature || !choice || !['blue', 'red'].includes(choice)) {
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, betAmount, signature, choice });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
@@ -366,24 +367,22 @@ app.post('/play-coin-flip', async (req, res) => {
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
     // Verifica il saldo SOL
+    console.log('DEBUG - Checking user balance for:', userPublicKey.toString());
     const userBalance = await connection.getBalance(userPublicKey);
+    console.log('DEBUG - User balance:', userBalance);
     if (userBalance < betInLamports) {
+      console.log('DEBUG - Insufficient balance:', { userBalance, required: betInLamports });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Valida e processa la transazione firmata
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-
-    if (!transaction.verifySignatures()) {
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
+    // Verifica la transazione usando la firma
+    console.log('DEBUG - Confirming transaction with signature:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
+    console.log('DEBUG - Transaction confirmed successfully');
 
     // Genera il risultato del Coin Flip
     let flipResult;
@@ -396,34 +395,17 @@ app.post('/play-coin-flip', async (req, res) => {
     let totalWin = 0;
     if (choice === flipResult) {
       totalWin = betAmount * 2;
-
-      // Distribuisci la vincita
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: userPublicKey,
-          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
-        })
-      );
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-
-      const winSignature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(winSignature);
-      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
+    console.log('DEBUG - Coin Flip result:', { flipResult, totalWin });
     res.json({
       success: true,
       flipResult,
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-coin-flip:', err);
-    res.status(500).json({ success: false, error: 'Failed to play coin flip' });
+    console.error('Error in play-coin-flip:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to play coin flip: ${err.message}` });
   }
 });
 
