@@ -203,66 +203,37 @@ const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 // Endpoint per Meme Slots
 app.post('/play-meme-slots', async (req, res) => {
-  const { playerAddress, betAmount, signature } = req.body;
+  const { playerAddress, betAmount, signedTransaction } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signature) {
-    console.log('DEBUG - Invalid parameters received:', { playerAddress, betAmount, signature });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
-    console.log('DEBUG - Processing play-meme-slots request:', { playerAddress, betAmount, signature });
-
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
     // Verifica il saldo SOL
-    console.log('DEBUG - Checking user balance for:', userPublicKey.toString());
     const userBalance = await connection.getBalance(userPublicKey);
-    console.log('DEBUG - User balance:', userBalance);
     if (userBalance < betInLamports) {
-      console.log('DEBUG - Insufficient balance:', { userBalance, required: betInLamports });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Verifica la transazione usando la firma
-    console.log('DEBUG - Confirming transaction with signature:', signature);
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-    console.log('DEBUG - Transaction confirmed successfully');
 
-    // Recupera la transazione per verificarne il contenuto
-    console.log('DEBUG - Fetching transaction details for signature:', signature);
-    const transactionDetails = await connection.getTransaction(signature, { commitment: 'confirmed' });
-    if (!transactionDetails) {
-      console.error('DEBUG - Transaction details not found for signature:', signature);
-      return res.status(500).json({ success: false, error: 'Transaction not found' });
-    }
-    console.log('DEBUG - Transaction details fetched:', transactionDetails);
-
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      instr => instr.programId.toString() === SystemProgram.programId.toString()
-    );
-
-    if (
-      !transferInstruction ||
-      transferInstruction.parsed.type !== 'transfer' ||
-      transferInstruction.parsed.info.destination !== TAX_WALLET_ADDRESS ||
-      transferInstruction.parsed.info.lamports !== betInLamports
-    ) {
-      console.error('DEBUG - Invalid transaction details:', {
-        transferInstruction,
-        expectedDestination: TAX_WALLET_ADDRESS,
-        expectedLamports: betInLamports,
-      });
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
-    console.log('DEBUG - Transaction details verified successfully');
-
-    // Genera il risultato della slot (logica esistente)
+    // Genera il risultato della slot
     let result;
     const winLines = [
       [0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24],
@@ -271,6 +242,7 @@ app.post('/play-meme-slots', async (req, res) => {
     ];
 
     if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
+      // Computer vince: genera un risultato senza linee vincenti
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       let attempts = 0;
       while (attempts < 20) {
@@ -298,6 +270,7 @@ app.post('/play-meme-slots', async (req, res) => {
         attempts++;
       }
     } else {
+      // Giocatore vince: genera una linea vincente
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
       const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
@@ -321,6 +294,7 @@ app.post('/play-meme-slots', async (req, res) => {
       }
     }
 
+    // Calcola le vincite
     const winningLinesFound = [];
     const winningIndices = new Set();
     let totalWin = 0;
@@ -362,7 +336,26 @@ app.post('/play-meme-slots', async (req, res) => {
       }
     }
 
-    console.log('DEBUG - Meme Slots result generated:', { totalWin, winningLines: winningLinesFound });
+    // Distribuisci le vincite
+    if (totalWin > 0) {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature);
+      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
+    }
+
     res.json({
       success: true,
       result: result.map(item => ({ name: item.name, image: item.image })),
@@ -371,8 +364,8 @@ app.post('/play-meme-slots', async (req, res) => {
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-meme-slots:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
+    console.error('Error in play-meme-slots:', err);
+    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
   }
 });
 
