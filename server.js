@@ -631,17 +631,15 @@ const refundAllActiveGames = async () => {
   }
 };
 
-// Endpoint per il saldo del tax wallet
 app.get('/tax-wallet-balance', async (req, res) => {
   try {
-    console.log('Fetching tax wallet balance for:', wallet.publicKey.toBase58());
-    const balance = await connection.getBalance(wallet.publicKey);
-    console.log('Balance fetched:', balance);
-    const taxWalletBalance = balance / LAMPORTS_PER_SOL;
-    res.json({ success: true, balance: taxWalletBalance });
+    console.log('Fetching tax wallet balance...');
+    const balance = await connection.getBalance(taxWallet.publicKey); // Usa taxWallet invece di wallet
+    console.log('Tax wallet balance:', balance / LAMPORTS_PER_SOL, 'SOL');
+    res.json({ success: true, balance: balance / LAMPORTS_PER_SOL });
   } catch (err) {
-    console.error('Error fetching tax wallet balance:', err);
-    res.status(500).json({ success: false, error: 'Failed to fetch tax wallet balance' });
+    console.error('Error fetching tax wallet balance:', err.message, err.stack);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
