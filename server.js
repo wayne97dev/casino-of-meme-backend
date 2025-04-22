@@ -104,14 +104,26 @@ if (!WALLET_PRIVATE_KEY) {
 }
 console.log('DEBUG - WALLET_PRIVATE_KEY:', WALLET_PRIVATE_KEY ? 'Present' : 'Missing');
 
-// Crea il wallet dal backend
-let wallet;
+// Crea il wallet del casinò (tax wallet)
+let taxWallet;
 try {
-  wallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
+  taxWallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
+  console.log('Tax wallet public key:', taxWallet.publicKey.toBase58());
 } catch (err) {
   console.error('ERROR - Invalid WALLET_PRIVATE_KEY:', err.message);
   process.exit(1);
 }
+
+// Definisci l'ATA del tax wallet per COM
+let taxWalletATA;
+try {
+  taxWalletATA = await getAssociatedTokenAddress(MINT_ADDRESS, taxWallet.publicKey);
+  console.log('Tax wallet ATA:', taxWalletATA.toBase58());
+} catch (err) {
+  console.error('ERROR - Failed to get tax wallet ATA:', err.message);
+  process.exit(1);
+}
+
 
 // Stato del gioco
 const games = {};
@@ -727,6 +739,9 @@ app.post('/distribute-winnings', async (req, res) => {
 app.post('/refund', async (req, res) => {
   const { playerAddress, amount } = req.body;
 
+  console.log('Received request to /refund:', { playerAddress, amount });
+
+  // Validazione dei parametri
   if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
     console.log('Invalid refund parameters:', { playerAddress, amount });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
@@ -734,91 +749,158 @@ app.post('/refund', async (req, res) => {
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
     const playerATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    console.log('Player ATA:', playerATA.toBase58());
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
-    let casinoAccountExists = false;
-    try {
-      await getAccount(connection, casinoATA);
-      casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
-    } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
+    // Verifica il saldo SOL del tax wallet per le fee
+    console.log('Checking tax wallet SOL balance...');
+    const taxWalletSolBalance = await retry(() => connection.getBalance(taxWallet.publicKey));
+    const minSolBalance = 0.01 * LAMPORTS_PER_SOL; // Minimo 0.01 SOL per le fee
+    console.log('Tax wallet SOL balance:', taxWalletSolBalance / LAMPORTS_PER_SOL, 'SOL');
+    if (taxWalletSolBalance < minSolBalance) {
+      console.log('Insufficient SOL balance in tax wallet for fees:', {
+        balance: taxWalletSolBalance / LAMPORTS_PER_SOL,
+        required: minSolBalance / LAMPORTS_PER_SOL,
+      });
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient SOL balance in tax wallet for transaction fees: ${taxWalletSolBalance / LAMPORTS_PER_SOL} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
+      });
     }
 
-    // Verifica il saldo del casinò
-    const casinoBalance = await connection.getTokenAccountBalance(casinoATA).catch(() => ({
-      value: { uiAmount: 0 },
-    }));
-    if (casinoBalance.value.uiAmount < amount) {
-      console.log('Insufficient COM balance in casino ATA:', { balance: casinoBalance.value.uiAmount, required: amount });
-      return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
+    // Verifica se l'ATA del tax wallet esiste
+    let taxWalletAccountExists = false;
+    try {
+      await getAccount(connection, taxWalletATA);
+      taxWalletAccountExists = true;
+      console.log('Tax wallet ATA exists:', taxWalletATA.toBase58());
+    } catch (err) {
+      console.log('Tax wallet ATA does not exist, creating...');
+      try {
+        const transaction = new Transaction().add(
+          createAssociatedTokenAccountInstruction(
+            taxWallet.publicKey,
+            taxWalletATA,
+            taxWallet.publicKey,
+            MINT_ADDRESS
+          )
+        );
+        const { blockhash } = await retry(() => connection.getLatestBlockhash());
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = taxWallet.publicKey;
+        transaction.partialSign(taxWallet);
+        const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+        await retry(() => connection.confirmTransaction(signature));
+        console.log('Created tax wallet ATA:', taxWalletATA.toBase58());
+      } catch (err) {
+        console.error('Failed to create tax wallet ATA:', err.message);
+        return res.status(500).json({ success: false, error: `Failed to create tax wallet ATA: ${err.message}` });
+      }
+    }
+
+    // Verifica il saldo del tax wallet
+    console.log('Checking tax wallet COM balance...');
+    let taxWalletBalance;
+    try {
+      taxWalletBalance = await retry(() => connection.getTokenAccountBalance(taxWalletATA));
+    } catch (err) {
+      console.error('Failed to fetch tax wallet COM balance:', err.message);
+      return res.status(500).json({
+        success: false,
+        error: `Failed to fetch tax wallet COM balance: ${err.message}`,
+      });
+    }
+    console.log('Tax wallet COM balance:', taxWalletBalance.value.uiAmount, 'COM');
+    if (!taxWalletBalance || !taxWalletBalance.value || taxWalletBalance.value.uiAmount < amount) {
+      const balance = taxWalletBalance?.value?.uiAmount || 0;
+      console.log('Insufficient COM balance in tax wallet:', {
+        balance: taxWalletBalance.value.uiAmount,
+        required: amount,
+      });
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient COM balance in tax wallet: ${balance} COM available, ${amount} COM required`,
+      });
     }
 
     // Verifica se l'ATA del giocatore esiste, altrimenti crealo
     let playerAccountExists = false;
     try {
+      console.log('Checking if player ATA exists...');
       await getAccount(connection, playerATA);
       playerAccountExists = true;
       console.log('Player ATA exists:', playerATA.toBase58());
     } catch (err) {
       console.log('Player ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          playerATA,
-          userPublicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log('Created player ATA:', playerATA.toBase58());
+      try {
+        const transaction = new Transaction().add(
+          createAssociatedTokenAccountInstruction(
+            taxWallet.publicKey,
+            playerATA,
+            userPublicKey,
+            MINT_ADDRESS
+          )
+        );
+        const { blockhash } = await retry(() => connection.getLatestBlockhash());
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = taxWallet.publicKey;
+        transaction.partialSign(taxWallet);
+        const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+        await retry(() => connection.confirmTransaction(signature));
+        console.log('Created player ATA:', playerATA.toBase58());
+      } catch (err) {
+        console.error('Failed to create player ATA:', err.message);
+        return res.status(500).json({ success: false, error: `Failed to create player ATA: ${err.message}` });
+      }
     }
 
     // Crea la transazione di rimborso
+    console.log('Creating transaction to refund...');
     const transaction = new Transaction().add(
       createTransferInstruction(
-        casinoATA,
+        taxWalletATA,
         playerATA,
-        wallet.publicKey,
-        amount * 1e6 // Converti in token base (COM usa 6 decimali)
+        taxWallet.publicKey,
+        Math.round(amount * 1e6) // Converti in token base (COM usa 6 decimali)
       )
     );
 
-    const { blockhash } = await connection.getLatestBlockhash();
+    console.log('Getting latest blockhash...');
+    let blockhash;
+    try {
+      const blockhashResult = await retry(() => connection.getLatestBlockhash());
+      blockhash = blockhashResult.blockhash;
+    } catch (err) {
+      console.error('Failed to get latest blockhash:', err.message);
+      return res.status(500).json({ success: false, error: `Failed to get latest blockhash: ${err.message}` });
+    }
     transaction.recentBlockhash = blockhash;
-    transaction.feePayer = wallet.publicKey;
-    transaction.partialSign(wallet);
+    transaction.feePayer = taxWallet.publicKey;
+    transaction.partialSign(taxWallet);
 
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    await connection.confirmTransaction(signature);
-    console.log(`Refunded ${amount} COM to ${playerAddress}`);
+    console.log('Sending refund transaction...');
+    let signature;
+    try {
+      signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+      console.log('Refund transaction sent, signature:', signature);
+    } catch (err) {
+      console.error('Failed to send refund transaction:', err.message);
+      return res.status(500).json({ success: false, error: `Failed to send refund transaction: ${err.message}` });
+    }
+
+    console.log('Confirming refund transaction:', signature);
+    try {
+      await retry(() => connection.confirmTransaction(signature));
+      console.log(`Successfully refunded ${amount} COM to ${playerAddress}`);
+    } catch (err) {
+      console.error('Failed to confirm refund transaction:', err.message);
+      return res.status(500).json({ success: false, error: `Failed to confirm refund transaction: ${err.message}` });
+    }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error processing refund:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to process refund: ${err.message}` });
+    console.error('Unexpected error in /refund:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Unexpected error in /refund: ${err.message}` });
   }
 });
 
@@ -1021,27 +1103,24 @@ app.post('/distribute-winnings', async (req, res) => {
   }
 
   try {
-    console.log('Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
-    console.log('Casino ATA:', casinoATA.toBase58());
-
+    console.log('Tax wallet ATA (escrow):', taxWalletATA.toBase58());
     console.log('Getting winner ATA...');
     const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
     console.log('Winner ATA:', winnerATA.toBase58());
 
-    // Verifica il saldo SOL del casinò per le fee
-    console.log('Checking casino SOL balance...');
-    const casinoSolBalance = await retry(() => connection.getBalance(wallet.publicKey));
+    // Verifica il saldo SOL del tax wallet per le fee
+    console.log('Checking tax wallet SOL balance...');
+    const taxWalletSolBalance = await retry(() => connection.getBalance(taxWallet.publicKey));
     const minSolBalance = 0.01 * LAMPORTS_PER_SOL; // Minimo 0.01 SOL per le fee
-    console.log('Casino SOL balance:', casinoSolBalance / LAMPORTS_PER_SOL, 'SOL');
-    if (casinoSolBalance < minSolBalance) {
-      console.log('Insufficient SOL balance in casino wallet for fees:', {
-        balance: casinoSolBalance / LAMPORTS_PER_SOL,
+    console.log('Tax wallet SOL balance:', taxWalletSolBalance / LAMPORTS_PER_SOL, 'SOL');
+    if (taxWalletSolBalance < minSolBalance) {
+      console.log('Insufficient SOL balance in tax wallet for fees:', {
+        balance: taxWalletSolBalance / LAMPORTS_PER_SOL,
         required: minSolBalance / LAMPORTS_PER_SOL,
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
+        error: `Insufficient SOL balance in tax wallet for transaction fees: ${taxWalletSolBalance / LAMPORTS_PER_SOL} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
       });
     }
 
@@ -1061,10 +1140,10 @@ app.post('/distribute-winnings', async (req, res) => {
     if (mintData.freezeAuthority) {
       console.log('Token mint has freeze authority:', mintData.freezeAuthority);
       try {
-        const casinoAccountInfo = await getAccount(connection, casinoATA);
-        if (casinoAccountInfo.isFrozen) {
-          console.error('Casino ATA is frozen:', casinoATA.toBase58());
-          return res.status(400).json({ success: false, error: 'Casino ATA is frozen' });
+        const taxWalletAccountInfo = await getAccount(connection, taxWalletATA);
+        if (taxWalletAccountInfo.isFrozen) {
+          console.error('Tax wallet ATA is frozen:', taxWalletATA.toBase58());
+          return res.status(400).json({ success: false, error: 'Tax wallet ATA is frozen' });
         }
         const winnerAccountInfo = await getAccount(connection, winnerATA);
         if (winnerAccountInfo.isFrozen) {
@@ -1077,70 +1156,25 @@ app.post('/distribute-winnings', async (req, res) => {
       }
     }
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
-    let casinoAccountExists = false;
-    let casinoATAInfo;
+    // Verifica il saldo COM del tax wallet
+    console.log('Checking tax wallet COM balance...');
+    let taxWalletBalance;
     try {
-      console.log('Checking if casino ATA exists...');
-      casinoATAInfo = await getAccount(connection, casinoATA);
-      casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
+      taxWalletBalance = await retry(() => connection.getTokenAccountBalance(taxWalletATA));
     } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
-      try {
-        const transaction = new Transaction().add(
-          createAssociatedTokenAccountInstruction(
-            wallet.publicKey,
-            casinoATA,
-            wallet.publicKey,
-            MINT_ADDRESS
-          )
-        );
-        const { blockhash } = await retry(() => connection.getLatestBlockhash());
-        transaction.recentBlockhash = blockhash;
-        transaction.feePayer = wallet.publicKey;
-        transaction.partialSign(wallet);
-        const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
-        await retry(() => connection.confirmTransaction(signature));
-        console.log('Created casino ATA:', casinoATA.toBase58());
-        casinoATAInfo = await getAccount(connection, casinoATA);
-      } catch (err) {
-        console.error('Failed to create casino ATA:', err.message);
-        return res.status(500).json({ success: false, error: `Failed to create casino ATA: ${err.message}` });
-      }
-    }
-
-    // Verifica il proprietario dell'ATA del casinò
-    console.log('Checking casino ATA owner...');
-    const casinoATAOwner = casinoATAInfo.owner.toBase58();
-    const expectedOwner = wallet.publicKey.toBase58();
-    if (casinoATAOwner !== expectedOwner) {
-      console.error('Casino ATA owner mismatch:', { actualOwner: casinoATAOwner, expectedOwner });
-      return res.status(400).json({
-        success: false,
-        error: `Casino ATA owner mismatch: expected ${expectedOwner}, found ${casinoATAOwner}`,
-      });
-    }
-
-    // Verifica il saldo COM del casinò
-    console.log('Checking casino COM balance...');
-    let casinoBalance;
-    try {
-      casinoBalance = await retry(() => connection.getTokenAccountBalance(casinoATA));
-    } catch (err) {
-      console.error('Failed to fetch casino COM balance:', err.message);
+      console.error('Failed to fetch tax wallet COM balance:', err.message);
       return res.status(500).json({
         success: false,
-        error: `Failed to fetch casino COM balance: ${err.message}`,
+        error: `Failed to fetch tax wallet COM balance: ${err.message}`,
       });
     }
-    console.log('Casino COM balance:', casinoBalance.value.uiAmount, 'COM');
-    if (!casinoBalance || !casinoBalance.value || casinoBalance.value.uiAmount < amount) {
-      const balance = casinoBalance?.value?.uiAmount || 0;
-      console.error('Insufficient COM balance in casino ATA:', { balance, required: amount });
+    console.log('Tax wallet COM balance:', taxWalletBalance.value.uiAmount, 'COM');
+    if (!taxWalletBalance || !taxWalletBalance.value || taxWalletBalance.value.uiAmount < amount) {
+      const balance = taxWalletBalance?.value?.uiAmount || 0;
+      console.error('Insufficient COM balance in tax wallet:', { balance, required: amount });
       return res.status(400).json({
         success: false,
-        error: `Insufficient COM balance in casino wallet: ${balance} COM available, ${amount} COM required`,
+        error: `Insufficient COM balance in tax wallet: ${balance} COM available, ${amount} COM required`,
       });
     }
 
@@ -1156,7 +1190,7 @@ app.post('/distribute-winnings', async (req, res) => {
       try {
         const transaction = new Transaction().add(
           createAssociatedTokenAccountInstruction(
-            wallet.publicKey,
+            taxWallet.publicKey, // Usa taxWallet come payer
             winnerATA,
             winnerPublicKey,
             MINT_ADDRESS
@@ -1164,8 +1198,8 @@ app.post('/distribute-winnings', async (req, res) => {
         );
         const { blockhash } = await retry(() => connection.getLatestBlockhash());
         transaction.recentBlockhash = blockhash;
-        transaction.feePayer = wallet.publicKey;
-        transaction.partialSign(wallet);
+        transaction.feePayer = taxWallet.publicKey;
+        transaction.partialSign(taxWallet);
         const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
         await retry(() => connection.confirmTransaction(signature));
         console.log('Created winner ATA:', winnerATA.toBase58());
@@ -1179,17 +1213,17 @@ app.post('/distribute-winnings', async (req, res) => {
     console.log('Creating transaction to transfer winnings...');
     const transaction = new Transaction().add(
       createTransferInstruction(
-        casinoATA,
+        taxWalletATA, // Da taxWalletATA
         winnerATA,
-        wallet.publicKey,
-        Math.round(amount * 1e6) // COM ha 6 decimali, arrotonda per evitare errori di precisione
+        taxWallet.publicKey,
+        Math.round(amount * 1e6) // COM ha 6 decimali
       )
     );
 
     console.log('Getting latest blockhash...');
     const { blockhash } = await retry(() => connection.getLatestBlockhash());
     transaction.recentBlockhash = blockhash;
-    transaction.feePayer = wallet.publicKey;
+    transaction.feePayer = taxWallet.publicKey;
 
     console.log('Estimating transaction fee...');
     let fee;
@@ -1201,18 +1235,18 @@ app.post('/distribute-winnings', async (req, res) => {
       return res.status(500).json({ success: false, error: `Failed to estimate transaction fee: ${err.message}` });
     }
 
-    if (casinoSolBalance < fee) {
-      console.error('Insufficient SOL balance for transaction fee:', {
-        balance: casinoSolBalance / LAMPORTS_PER_SOL,
+    if (taxWalletSolBalance < fee) {
+      console.error('Insufficient SOL balance in tax wallet for transaction fee:', {
+        balance: taxWalletSolBalance / LAMPORTS_PER_SOL,
         required: fee / LAMPORTS_PER_SOL,
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient SOL balance for transaction fee: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${fee / LAMPORTS_PER_SOL} SOL required`,
+        error: `Insufficient SOL balance in tax wallet for transaction fee: ${taxWalletSolBalance / LAMPORTS_PER_SOL} SOL available, ${fee / LAMPORTS_PER_SOL} SOL required`,
       });
     }
 
-    transaction.partialSign(wallet);
+    transaction.partialSign(taxWallet);
 
     console.log('Sending transaction to transfer winnings:', { winnerAddress, amount });
     let signature;
@@ -1257,29 +1291,30 @@ app.post('/join-poker-game', async (req, res) => {
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
-    let casinoAccountExists = false;
+    // Verifica se l'ATA del tax wallet esiste, altrimenti crealo
+    let taxWalletAccountExists = false;
     try {
-      await getAccount(connection, casinoATA);
-      casinoAccountExists = true;
+      await getAccount(connection, taxWalletATA);
+      taxWalletAccountExists = true;
+      console.log('Tax wallet ATA exists:', taxWalletATA.toBase58());
     } catch (err) {
+      console.log('Tax wallet ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
+          taxWallet.publicKey,
+          taxWalletATA,
+          taxWallet.publicKey,
           MINT_ADDRESS
         )
       );
       const { blockhash } = await connection.getLatestBlockhash();
       transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
+      transaction.feePayer = taxWallet.publicKey;
+      transaction.partialSign(taxWallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA');
+      console.log('Created tax wallet ATA:', taxWalletATA.toBase58());
     }
 
     // Verifica il saldo COM dell'utente
@@ -1300,13 +1335,28 @@ app.post('/join-poker-game', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    // Sostituisci casinoATA con taxWalletATA
+    transaction.add(
+      createTransferInstruction(
+        userATA,
+        taxWalletATA,
+        userPublicKey,
+        betAmount * 1e6
+      )
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = taxWallet.publicKey; // Usa taxWallet come feePayer
+    transaction.partialSign(taxWallet);
+
     const signature = await connection.sendRawTransaction(transaction.serialize());
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
       console.log('Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-    console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
+    console.log(`Transferred ${betAmount} COM from ${playerAddress} to tax wallet`);
 
     res.json({ success: true });
   } catch (err) {
@@ -1327,31 +1377,30 @@ app.post('/make-poker-move', async (req, res) => {
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
-    let casinoAccountExists = false;
+    // Verifica se l'ATA del tax wallet esiste
+    let taxWalletAccountExists = false;
     try {
-      await getAccount(connection, casinoATA);
-      casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
+      await getAccount(connection, taxWalletATA);
+      taxWalletAccountExists = true;
+      console.log('Tax wallet ATA exists:', taxWalletATA.toBase58());
     } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
+      console.log('Tax wallet ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
+          taxWallet.publicKey,
+          taxWalletATA,
+          taxWallet.publicKey,
           MINT_ADDRESS
         )
       );
       const { blockhash } = await connection.getLatestBlockhash();
       transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
+      transaction.feePayer = taxWallet.publicKey;
+      transaction.partialSign(taxWallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
+      console.log('Created tax wallet ATA:', taxWalletATA.toBase58());
     }
 
     // Verifica se l'ATA del giocatore esiste, altrimenti crealo
@@ -1364,7 +1413,7 @@ app.post('/make-poker-move', async (req, res) => {
       console.log('Player ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
+          taxWallet.publicKey, // Usa taxWallet come payer
           userATA,
           userPublicKey,
           MINT_ADDRESS
@@ -1372,8 +1421,8 @@ app.post('/make-poker-move', async (req, res) => {
       );
       const { blockhash } = await connection.getLatestBlockhash();
       transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
+      transaction.feePayer = taxWallet.publicKey;
+      transaction.partialSign(taxWallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
       console.log('Created player ATA:', userATA.toBase58());
@@ -1389,7 +1438,7 @@ app.post('/make-poker-move', async (req, res) => {
       const transaction = new Transaction().add(
         createTransferInstruction(
           userATA,
-          casinoATA,
+          taxWalletATA, // Usa taxWalletATA come destinazione
           userPublicKey,
           amount * 1e6 // COM ha 6 decimali
         )
@@ -1397,12 +1446,12 @@ app.post('/make-poker-move', async (req, res) => {
 
       const { blockhash } = await connection.getLatestBlockhash();
       transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
+      transaction.feePayer = taxWallet.publicKey; // Usa taxWallet come feePayer
+      transaction.partialSign(taxWallet);
 
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
+      console.log(`Transferred ${amount} COM from ${playerAddress} to tax wallet for move ${move}`);
     }
 
     res.json({ success: true });
