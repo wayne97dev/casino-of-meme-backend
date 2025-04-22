@@ -1116,107 +1116,64 @@ const retry = async (fn, retries = 3, delay = 1000) => {
   }
 };
 
-app.post('/distribute-winnings', async (req, res) => {
-  const { winnerAddress, amount } = req.body;
+app.post('/distribute-winnings-sol', async (req, res) => {
+  const { playerAddress, amount } = req.body;
 
-  if (!winnerAddress || !amount || isNaN(amount) || amount <= 0) {
-    console.log('Invalid parameters:', { winnerAddress, amount });
-    return res.status(400).json({ success: false, error: 'Invalid winnerAddress or amount' });
+  console.log('DEBUG - /distribute-winnings-sol called:', { playerAddress, amount });
+
+  if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, amount });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
   }
 
   try {
-    const winnerPublicKey = new PublicKey(winnerAddress);
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
-    const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
+    console.log('DEBUG - Validating player address...');
+    const userPublicKey = new PublicKey(playerAddress);
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
-    let casinoAccountExists = false;
-    try {
-      await getAccount(connection, casinoATA);
-      casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
-    } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
-    }
-
-    // Verifica il saldo COM del casinò
-    const casinoBalance = await connection.getTokenAccountBalance(casinoATA).catch(() => ({
-      value: { uiAmount: 0 },
-    }));
-    if (casinoBalance.value.uiAmount < amount) {
-      console.log('Insufficient COM balance in casino ATA:', {
-        balance: casinoBalance.value.uiAmount,
-        required: amount,
+    // Verifica il saldo SOL del casinò
+    console.log('DEBUG - Checking casino SOL balance...');
+    const casinoSolBalance = await connection.getBalance(wallet.publicKey);
+    const requiredBalance = amount * LAMPORTS_PER_SOL + 0.01 * LAMPORTS_PER_SOL; // Importo + fee minime
+    if (casinoSolBalance < requiredBalance) {
+      console.log('DEBUG - Insufficient SOL balance in casino wallet:', {
+        balance: casinoSolBalance / LAMPORTS_PER_SOL,
+        required: requiredBalance / LAMPORTS_PER_SOL,
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient COM balance in casino wallet: ${casinoBalance.value.uiAmount} COM available, ${amount} COM required`,
+        error: `Insufficient SOL balance in casino wallet: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${(requiredBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL required`,
       });
     }
 
-    // Verifica se l'ATA del vincitore esiste, altrimenti crealo
-    let winnerAccountExists = false;
-    try {
-      await getAccount(connection, winnerATA);
-      winnerAccountExists = true;
-      console.log('Winner ATA exists:', winnerATA.toBase58());
-    } catch (err) {
-      console.log('Winner ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          winnerATA,
-          winnerPublicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log('Created winner ATA:', winnerATA.toBase58());
-    }
-
     // Crea la transazione di trasferimento
+    console.log('DEBUG - Creating SOL transfer transaction for', amount, 'SOL...');
     const transaction = new Transaction().add(
-      createTransferInstruction(
-        casinoATA,
-        winnerATA,
-        wallet.publicKey,
-        amount * 1e6 // Usa 6 decimali per COM
-      )
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: userPublicKey,
+        lamports: Math.round(amount * LAMPORTS_PER_SOL),
+      })
     );
 
+    console.log('DEBUG - Getting latest blockhash...');
     const { blockhash } = await connection.getLatestBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
     transaction.partialSign(wallet);
 
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    await connection.confirmTransaction(signature);
-    console.log(`Sent ${amount} COM to the Winner ${winnerAddress}`);
+    console.log('DEBUG - Sending transaction...');
+    const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()), 3, 1000);
+    console.log('DEBUG - Confirming transaction...');
+    await connection.confirmTransaction(signature, 'confirmed');
+    console.log(`DEBUG - Distributed ${amount} SOL to ${playerAddress}, signature: ${signature}`);
 
-    res.json({ success: true });
+    res.json({ success: true, transactionSignature: signature });
   } catch (err) {
-    console.error('Error distributing winnings:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to distribute winnings: ${err.message}` });
+    console.error('DEBUG - Error distributing SOL winnings:', err.message, err.stack);
+    return res.status(500).json({
+      success: false,
+      error: `Failed to distribute SOL winnings: ${err.message || 'Unknown error'}`,
+    });
   }
 });
 
