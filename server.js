@@ -96,14 +96,6 @@ mongoose.connect(MONGODB_URI, {
 // Connessione a Solana
 const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
 
-// Scommessa minima in COM per Poker PvP
-const MIN_BET = 1000; // 1000 COM
-
-// Indirizzo del mint COM
-const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
-console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
-const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
-
 // Carica la private key in formato base58
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
 if (!WALLET_PRIVATE_KEY) {
@@ -112,24 +104,32 @@ if (!WALLET_PRIVATE_KEY) {
 }
 console.log('DEBUG - WALLET_PRIVATE_KEY:', WALLET_PRIVATE_KEY ? 'Present' : 'Missing');
 
-// Crea il wallet del casinò (tax wallet)
-let taxWallet;
+// Crea il wallet del casinò
+let wallet;
 try {
-  taxWallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
-  console.log('Tax wallet public key:', taxWallet.publicKey.toBase58());
+  wallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
+  console.log('Wallet public key:', wallet.publicKey.toBase58());
 } catch (err) {
   console.error('ERROR - Invalid WALLET_PRIVATE_KEY:', err.message);
   process.exit(1);
 }
 
-// Definisci l'ATA del tax wallet per COM in una funzione async
+// Scommessa minima in COM per Poker PvP
+const MIN_BET = 1000; // 1000 COM
+
+// Indirizzo del mint COM
+const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
+console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
+const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
+
+// Definisci l'ATA del wallet per COM in una funzione async
 let taxWalletATA;
 (async () => {
   try {
     console.log('DEBUG - Defining taxWalletATA...');
     console.log('DEBUG - MINT_ADDRESS:', MINT_ADDRESS.toBase58());
-    console.log('DEBUG - taxWallet.publicKey:', taxWallet.publicKey.toBase58());
-    taxWalletATA = await getAssociatedTokenAddress(MINT_ADDRESS, taxWallet.publicKey);
+    console.log('DEBUG - wallet.publicKey:', wallet.publicKey.toBase58());
+    taxWalletATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
     console.log('Tax wallet ATA:', taxWalletATA.toBase58());
   } catch (err) {
     console.error('ERROR - Failed to get tax wallet ATA:', err.message, err.stack);
@@ -634,7 +634,7 @@ const refundAllActiveGames = async () => {
 app.get('/tax-wallet-balance', async (req, res) => {
   try {
     console.log('Fetching tax wallet balance...');
-    const balance = await connection.getBalance(taxWallet.publicKey); // Usa taxWallet invece di wallet
+    const balance = await connection.getBalance(wallet.publicKey); // Usa wallet
     console.log('Tax wallet balance:', balance / LAMPORTS_PER_SOL, 'SOL');
     res.json({ success: true, balance: balance / LAMPORTS_PER_SOL });
   } catch (err) {
