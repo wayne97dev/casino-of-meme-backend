@@ -109,6 +109,9 @@ mongoose.connect(MONGODB_URI, {
 // Connessione a Solana
 const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
 
+
+const TAX_WALLET_ADDRESS = '2E1LhcV3pze6Q6P7MEsxUoNYK3KECm2rTS2D18eSRTn9';
+
 // Carica la private key in formato base58
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
 if (!WALLET_PRIVATE_KEY) {
@@ -202,6 +205,8 @@ const shuffleArray = (array) => {
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 // Endpoint per Meme Slots
+
+
 app.post('/play-meme-slots', async (req, res) => {
   const { playerAddress, betAmount, signature } = req.body;
 
