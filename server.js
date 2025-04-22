@@ -1585,7 +1585,7 @@ io.on('connection', (socket) => {
       return;
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
-    console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+    console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
   
     if (move === 'fold') {
       game.status = 'finished';
@@ -1613,16 +1613,17 @@ io.on('connection', (socket) => {
         game.message = 'You checked.';
         game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
         console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
-        game.actionsCompleted += 1; // Incrementa il contatore delle azioni
+        game.actionsCompleted += 1;
         console.log(`Actions completed: ${game.actionsCompleted}`);
-    
+  
         if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
-          game.actionsCompleted = 0; // Resetta per il prossimo round
-          console.log(`Betting round complete, advancing game phase`);
+          game.actionsCompleted = 0;
+          console.log(`Betting round complete in phase ${game.gamePhase}, advancing game phase`);
           advanceGamePhase(gameId);
         } else {
           game.currentTurn = opponent.id;
+          game.bettingRoundComplete = false;
           console.log(`Passing turn to opponent: ${opponent.id}`);
           startTurnTimer(gameId, opponent.id);
         }
@@ -1635,12 +1636,17 @@ io.on('connection', (socket) => {
       game.message = `You called ${amountToCall.toFixed(2)} COM.`;
       game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
       console.log(`Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
-      game.currentTurn = opponent.id;
-      if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+      game.actionsCompleted += 1;
+      console.log(`Actions completed: ${game.actionsCompleted}`);
+  
+      if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
-        console.log(`Betting round complete, advancing game phase`);
+        game.actionsCompleted = 0;
+        console.log(`Betting round complete in phase ${game.gamePhase}, advancing game phase`);
         advanceGamePhase(gameId);
       } else {
+        game.currentTurn = opponent.id;
+        game.bettingRoundComplete = false;
         console.log(`Passing turn to opponent: ${opponent.id}`);
         startTurnTimer(gameId, opponent.id);
       }
@@ -1668,8 +1674,10 @@ io.on('connection', (socket) => {
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       console.log(`${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
+      game.actionsCompleted += 1;
       game.currentTurn = opponent.id;
       game.bettingRoundComplete = false;
+      game.actionsCompleted = 1; // Resetta a 1, poiché l'avversario deve rispondere
       try {
         await Game.updateOne({ gameId }, { pot: game.pot });
         console.log(`Updated pot for game ${gameId} to ${game.pot}`);
@@ -1763,9 +1771,11 @@ const startTurnTimer = async (gameId, playerId) => {
   game.currentTurn = playerId;
   game.timeLeft = 30;
 
+  // Cancella qualsiasi timer precedente
   if (game.turnTimer) {
     console.log(`Clearing previous timer for game ${gameId}`);
-    clearInterval(game.turnTimer);
+    clearTimeout(game.turnTimer);
+    game.turnTimer = null;
   }
 
   io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
@@ -1779,6 +1789,13 @@ const startTurnTimer = async (gameId, playerId) => {
       if (!games[gameId]) {
         console.log(`Game ${gameId} no longer exists, stopping timer`);
         await refundBetsForGame(gameId);
+        return;
+      }
+
+      if (game.status !== 'playing') {
+        console.log(`Game ${gameId} is not in playing state, stopping timer`);
+        clearTimeout(game.turnTimer);
+        game.turnTimer = null;
         return;
       }
 
@@ -1943,10 +1960,29 @@ const advanceGamePhase = async (gameId) => {
     return;
   }
 
+  if (game.status !== 'playing') {
+    console.log(`Game ${gameId} is not in playing state, aborting phase advance`);
+    return;
+  }
+
+  // Cancella qualsiasi timer attivo
+  if (game.turnTimer) {
+    clearTimeout(game.turnTimer);
+    game.turnTimer = null;
+    console.log(`Cleared timer for game ${gameId} before advancing phase`);
+  }
+
   const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
   const nextPlayer = game.players.find(p => p.id === game.currentTurn);
 
-  game.actionsCompleted = 0; // Resetta il contatore delle azioni
+  if (!lastPlayer || !nextPlayer) {
+    console.error(`Players not found in game ${gameId}`);
+    await refundBetsForGame(gameId);
+    return;
+  }
+
+  game.actionsCompleted = 0;
+  game.bettingRoundComplete = false;
 
   if (game.gamePhase === 'pre-flop') {
     game.message = 'The dealer is dealing the Flop...';
@@ -1955,12 +1991,14 @@ const advanceGamePhase = async (gameId) => {
     setTimeout(() => {
       try {
         const newCards = Array(3).fill().map(() => drawCard());
+        if (!newCards.every(card => card && card.value && card.suit && card.image)) {
+          throw new Error('Invalid flop cards drawn');
+        }
         game.tableCards = newCards;
         game.gamePhase = 'flop';
         game.message = 'Flop: Place your bets.';
         game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
         game.currentTurn = lastPlayer.id;
-        game.bettingRoundComplete = false;
         game.currentBet = 0;
         game.playerBets[lastPlayer.address] = 0;
         game.playerBets[nextPlayer.address] = 0;
@@ -1969,12 +2007,82 @@ const advanceGamePhase = async (gameId) => {
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } catch (err) {
         console.error(`Error advancing to flop in game ${gameId}:`, err);
+        game.message = 'Error dealing flop. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        refundBetsForGame(gameId);
+      }
+    }, 1000);
+  } else if (game.gamePhase === 'flop') {
+    game.message = 'The dealer is dealing the Turn...';
+    game.dealerMessage = 'The dealer is dealing the Turn card.';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    setTimeout(() => {
+      try {
+        const newCard = drawCard();
+        if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
+          throw new Error('Invalid turn card drawn');
+        }
+        game.tableCards.push(newCard);
+        game.gamePhase = 'turn';
+        game.message = 'Turn: Place your bets.';
+        game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to turn in game ${gameId}:`, err);
+        game.message = 'Error dealing turn. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        refundBetsForGame(gameId);
+      }
+    }, 1000);
+  } else if (game.gamePhase === 'turn') {
+    game.message = 'The dealer is dealing the River...';
+    game.dealerMessage = 'The dealer is dealing the River card.';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    setTimeout(() => {
+      try {
+        const newCard = drawCard();
+        if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
+          throw new Error('Invalid river card drawn');
+        }
+        game.tableCards.push(newCard);
+        game.gamePhase = 'river';
+        game.message = 'River: Place your bets.';
+        game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to river in game ${gameId}:`, err);
+        game.message = 'Error dealing river. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
         refundBetsForGame(gameId);
       }
     }, 1000);
   } else if (game.gamePhase === 'river') {
     game.gamePhase = 'showdown';
-    endGame(gameId);
+    game.message = 'Showdown: Evaluating hands...';
+    game.dealerMessage = 'The dealer is evaluating the hands...';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    setTimeout(() => {
+      try {
+        endGame(gameId);
+      } catch (err) {
+        console.error(`Error advancing to showdown in game ${gameId}:`, err);
+        game.message = 'Error evaluating hands. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        refundBetsForGame(gameId);
+      }
+    }, 1000);
   }
 };
 
