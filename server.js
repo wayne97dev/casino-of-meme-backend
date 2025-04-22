@@ -96,6 +96,14 @@ mongoose.connect(MONGODB_URI, {
 // Connessione a Solana
 const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
 
+// Scommessa minima in COM per Poker PvP
+const MIN_BET = 1000; // 1000 COM
+
+// Indirizzo del mint COM
+const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
+console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
+const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
+
 // Carica la private key in formato base58
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
 if (!WALLET_PRIVATE_KEY) {
@@ -134,13 +142,6 @@ let taxWalletATA;
 const games = {};
 const waitingPlayers = [];
 
-// Indirizzo del mint COM
-const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
-console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
-const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
-
-// Scommessa minima in COM per Poker PvP
-const MIN_BET = 1000; // 1000 COM
 
 // Funzione per rimuovere riferimenti circolari
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
