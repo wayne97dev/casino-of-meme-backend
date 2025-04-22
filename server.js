@@ -484,9 +484,10 @@ app.get('/get-crazy-wheel', (req, res) => {
 
 // Endpoint aggiornato
 app.post('/play-solana-card-duel', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction, action } = req.body;
+  const { playerAddress, betAmount, signature, action } = req.body;
 
   if (!playerAddress || !action) {
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, action });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or action' });
   }
 
@@ -495,8 +496,9 @@ app.post('/play-solana-card-duel', async (req, res) => {
     return res.json({ success: true });
   }
 
-  if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
-    return res.status(400).json({ success: false, error: 'Invalid betAmount or signedTransaction' });
+  if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !signature) {
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, betAmount, signature });
+    return res.status(400).json({ success: false, error: 'Invalid betAmount or signature' });
   }
 
   try {
@@ -504,30 +506,29 @@ app.post('/play-solana-card-duel', async (req, res) => {
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
     // Verifica il saldo SOL
+    console.log('DEBUG - Checking user balance for:', userPublicKey.toString());
     const userBalance = await connection.getBalance(userPublicKey);
+    console.log('DEBUG - User balance:', userBalance);
     if (userBalance < betInLamports) {
+      console.log('DEBUG - Insufficient balance:', { userBalance, required: betInLamports });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Valida e processa la transazione
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-    if (!transaction.verifySignatures()) {
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
+    // Verifica la transazione usando la firma
+    console.log('DEBUG - Confirming transaction with signature:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
+    console.log('DEBUG - Transaction confirmed successfully');
 
     res.json({
       success: true,
       message: 'Bet placed successfully',
     });
   } catch (err) {
-    console.error('Error in play-solana-card-duel:', err);
+    console.error('Error in play-solana-card-duel:', err.message, err.stack);
     res.status(500).json({ success: false, error: `Failed to play solana card duel: ${err.message}` });
   }
 });
