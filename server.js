@@ -205,8 +205,6 @@ const shuffleArray = (array) => {
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 // Endpoint per Meme Slots
-
-
 app.post('/play-meme-slots', async (req, res) => {
   const { playerAddress, betAmount, signature } = req.body;
 
@@ -238,41 +236,6 @@ app.post('/play-meme-slots', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
     console.log('DEBUG - Transaction confirmed successfully');
-
-    // Recupera la transazione per verificarne il contenuto
-    console.log('DEBUG - Fetching transaction details for signature:', signature);
-    const transactionDetails = await connection.getTransaction(signature, { commitment: 'confirmed' });
-    if (!transactionDetails) {
-      console.error('DEBUG - Transaction details not found for signature:', signature);
-      return res.status(500).json({ success: false, error: 'Transaction not found' });
-    }
-    console.log('DEBUG - Transaction details fetched:', transactionDetails);
-
-    // Verifica che transactionDetails contenga le istruzioni attese
-    if (!transactionDetails.transaction || !transactionDetails.transaction.message || !Array.isArray(transactionDetails.transaction.message.instructions)) {
-      console.error('DEBUG - Transaction instructions not found:', transactionDetails);
-      return res.status(500).json({ success: false, error: 'Invalid transaction format: missing instructions' });
-    }
-
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      instr => instr && instr.programId && instr.programId.toString() === SystemProgram.programId.toString()
-    );
-
-    if (
-      !transferInstruction ||
-      !transferInstruction.parsed ||
-      transferInstruction.parsed.type !== 'transfer' ||
-      transferInstruction.parsed.info.destination !== TAX_WALLET_ADDRESS ||
-      transferInstruction.parsed.info.lamports !== betInLamports
-    ) {
-      console.error('DEBUG - Invalid transaction details:', {
-        transferInstruction,
-        expectedDestination: TAX_WALLET_ADDRESS,
-        expectedLamports: betInLamports,
-      });
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
-    console.log('DEBUG - Transaction details verified successfully');
 
     // Genera il risultato della slot
     let result;
@@ -387,6 +350,8 @@ app.post('/play-meme-slots', async (req, res) => {
     res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
   }
 });
+
+
 
 // Endpoint per Coin Flip
 app.post('/play-coin-flip', async (req, res) => {
