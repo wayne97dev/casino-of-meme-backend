@@ -1254,11 +1254,16 @@ app.post('/join-poker-game', async (req, res) => {
 
 // Endpoint per gestire le mosse in Poker PvP (invariato)
 app.post('/make-poker-move', async (req, res) => {
-  const { playerAddress, gameId, move, amount } = req.body;
+  const { playerAddress, gameId, move, amount, signedTransaction } = req.body;
 
   if (!playerAddress || !gameId || !move || amount === undefined || isNaN(amount) || amount < 0) {
     console.log('Invalid parameters:', { playerAddress, gameId, move, amount });
     return res.status(400).json({ success: false, error: 'Invalid required fields' });
+  }
+
+  if (amount > 0 && !signedTransaction) {
+    console.log('Missing signed transaction for move:', move);
+    return res.status(400).json({ success: false, error: 'Missing signed transaction' });
   }
 
   try {
@@ -1266,7 +1271,7 @@ app.post('/make-poker-move', async (req, res) => {
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
+    // Verifica e crea ATA del casinò
     let casinoAccountExists = false;
     try {
       await getAccount(connection, casinoATA);
@@ -1291,7 +1296,7 @@ app.post('/make-poker-move', async (req, res) => {
       console.log('Created casino ATA:', casinoATA.toBase58());
     }
 
-    // Verifica se l'ATA del giocatore esiste, altrimenti crealo
+    // Verifica e crea ATA del giocatore
     let playerAccountExists = false;
     try {
       await getAccount(connection, userATA);
@@ -1323,22 +1328,21 @@ app.post('/make-poker-move', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
       }
 
-      const transaction = new Transaction().add(
-        createTransferInstruction(
-          userATA,
-          casinoATA,
-          userPublicKey,
-          amount * 1e6 // COM ha 6 decimali
-        )
-      );
+      // Valida e processa la transazione firmata
+      const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+      const transaction = Transaction.from(transactionBuffer);
 
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
+      if (!transaction.verifySignatures()) {
+        console.log('Invalid transaction signatures for:', playerAddress);
+        return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+      }
 
       const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
+      const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+      if (confirmation.value.err) {
+        console.log('Transaction failed:', confirmation.value.err);
+        return res.status(500).json({ success: false, error: 'Transaction failed' });
+      }
       console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
     }
 
@@ -1609,8 +1613,12 @@ io.on('connection', (socket) => {
         game.message = 'You checked.';
         game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
         console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
-        if (game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+        game.actionsCompleted += 1; // Incrementa il contatore delle azioni
+        console.log(`Actions completed: ${game.actionsCompleted}`);
+    
+        if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
+          game.actionsCompleted = 0; // Resetta per il prossimo round
           console.log(`Betting round complete, advancing game phase`);
           advanceGamePhase(gameId);
         } else {
@@ -1840,6 +1848,7 @@ const startTurnTimer = async (gameId, playerId) => {
   game.turnTimer = setTimeout(runTimer, 1000);
 };
 
+// In startGame
 const startGame = async (gameId) => {
   const game = games[gameId];
   if (!game) {
@@ -1876,7 +1885,6 @@ const startGame = async (gameId) => {
     game.playerCards[game.players[0].address] = player1Cards;
     game.playerCards[game.players[1].address] = player2Cards;
 
-    // Verifica che i socket dei giocatori siano ancora connessi
     const player1Socket = io.sockets.sockets.get(game.players[0].id);
     const player2Socket = io.sockets.sockets.get(game.players[1].id);
     if (!player1Socket || !player2Socket) {
@@ -1885,22 +1893,15 @@ const startGame = async (gameId) => {
 
     game.currentTurn = game.players[0].id;
     game.pot = game.players[0].bet + game.players[1].bet;
-    game.playerBets[game.players[0].address] = 0; // Inizializza a 0 per il round corrente
-    game.playerBets[game.players[1].address] = 0; // Inizializza a 0 per il round corrente
-    game.currentBet = 0; // Inizializza a 0, le scommesse iniziali sono già nel pot
+    game.playerBets[game.players[0].address] = 0;
+    game.playerBets[game.players[1].address] = 0;
+    game.currentBet = 0;
     game.status = 'playing';
     game.message = 'Pre-Flop: Place your bets.';
     game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
+    game.actionsCompleted = 0; // Inizializza il contatore delle azioni
 
     console.log(`Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
-    console.log(`Player 0 socket.id: ${game.players[0].id}, Player 1 socket.id: ${game.players[1].id}`);
-    console.log(`Initial game state:`, {
-      pot: game.pot,
-      playerBets: game.playerBets,
-      currentBet: game.currentBet,
-    });
-
-    // Avvia il timer del turno
     startTurnTimer(gameId, game.players[0].id);
     io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
   } catch (err) {
@@ -1910,6 +1911,7 @@ const startGame = async (gameId) => {
     await refundBetsForGame(gameId);
   }
 };
+
 
 const drawCard = () => {
   const cardNumber = Math.floor(Math.random() * 13) + 1;
@@ -1944,6 +1946,8 @@ const advanceGamePhase = async (gameId) => {
   const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
   const nextPlayer = game.players.find(p => p.id === game.currentTurn);
 
+  game.actionsCompleted = 0; // Resetta il contatore delle azioni
+
   if (game.gamePhase === 'pre-flop') {
     game.message = 'The dealer is dealing the Flop...';
     game.dealerMessage = 'The dealer is dealing the Flop cards.';
@@ -1965,54 +1969,6 @@ const advanceGamePhase = async (gameId) => {
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } catch (err) {
         console.error(`Error advancing to flop in game ${gameId}:`, err);
-        refundBetsForGame(gameId);
-      }
-    }, 1000);
-  } else if (game.gamePhase === 'flop') {
-    game.message = 'The dealer is dealing the Turn...';
-    game.dealerMessage = 'The dealer is dealing the Turn card.';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-    setTimeout(() => {
-      try {
-        const newCard = drawCard();
-        game.tableCards.push(newCard);
-        game.gamePhase = 'turn';
-        game.message = 'Turn: Place your bets.';
-        game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-        game.currentTurn = lastPlayer.id;
-        game.bettingRoundComplete = false;
-        game.currentBet = 0;
-        game.playerBets[lastPlayer.address] = 0;
-        game.playerBets[nextPlayer.address] = 0;
-        console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
-        startTurnTimer(gameId, lastPlayer.id);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } catch (err) {
-        console.error(`Error advancing to turn in game ${gameId}:`, err);
-        refundBetsForGame(gameId);
-      }
-    }, 1000);
-  } else if (game.gamePhase === 'turn') {
-    game.message = 'The dealer is dealing the River...';
-    game.dealerMessage = 'The dealer is dealing the River card.';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-    setTimeout(() => {
-      try {
-        const newCard = drawCard();
-        game.tableCards.push(newCard);
-        game.gamePhase = 'river';
-        game.message = 'River: Place your bets.';
-        game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-        game.currentTurn = lastPlayer.id;
-        game.bettingRoundComplete = false;
-        game.currentBet = 0;
-        game.playerBets[lastPlayer.address] = 0;
-        game.playerBets[nextPlayer.address] = 0;
-        console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
-        startTurnTimer(gameId, lastPlayer.id);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } catch (err) {
-        console.error(`Error advancing to river in game ${gameId}:`, err);
         refundBetsForGame(gameId);
       }
     }, 1000);
