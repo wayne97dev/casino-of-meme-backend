@@ -206,27 +206,43 @@ app.post('/play-meme-slots', async (req, res) => {
   const { playerAddress, betAmount, signature } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signature) {
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, betAmount, signature });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
+    console.log('DEBUG - Processing play-meme-slots request:', { playerAddress, betAmount, signature });
+
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
     // Verifica il saldo SOL
+    console.log('DEBUG - Checking user balance for:', userPublicKey.toString());
     const userBalance = await connection.getBalance(userPublicKey);
+    console.log('DEBUG - User balance:', userBalance);
     if (userBalance < betInLamports) {
+      console.log('DEBUG - Insufficient balance:', { userBalance, required: betInLamports });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
     // Verifica la transazione usando la firma
+    console.log('DEBUG - Confirming transaction with signature:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
+    console.log('DEBUG - Transaction confirmed successfully');
 
     // Recupera la transazione per verificarne il contenuto
+    console.log('DEBUG - Fetching transaction details for signature:', signature);
     const transactionDetails = await connection.getTransaction(signature, { commitment: 'confirmed' });
+    if (!transactionDetails) {
+      console.error('DEBUG - Transaction details not found for signature:', signature);
+      return res.status(500).json({ success: false, error: 'Transaction not found' });
+    }
+    console.log('DEBUG - Transaction details fetched:', transactionDetails);
+
     const transferInstruction = transactionDetails.transaction.message.instructions.find(
       instr => instr.programId.toString() === SystemProgram.programId.toString()
     );
@@ -237,8 +253,14 @@ app.post('/play-meme-slots', async (req, res) => {
       transferInstruction.parsed.info.destination !== TAX_WALLET_ADDRESS ||
       transferInstruction.parsed.info.lamports !== betInLamports
     ) {
+      console.error('DEBUG - Invalid transaction details:', {
+        transferInstruction,
+        expectedDestination: TAX_WALLET_ADDRESS,
+        expectedLamports: betInLamports,
+      });
       return res.status(400).json({ success: false, error: 'Invalid transaction details' });
     }
+    console.log('DEBUG - Transaction details verified successfully');
 
     // Genera il risultato della slot (logica esistente)
     let result;
@@ -340,6 +362,7 @@ app.post('/play-meme-slots', async (req, res) => {
       }
     }
 
+    console.log('DEBUG - Meme Slots result generated:', { totalWin, winningLines: winningLinesFound });
     res.json({
       success: true,
       result: result.map(item => ({ name: item.name, image: item.image })),
@@ -348,8 +371,8 @@ app.post('/play-meme-slots', async (req, res) => {
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-meme-slots:', err);
-    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
+    console.error('Error in play-meme-slots:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
   }
 });
 
