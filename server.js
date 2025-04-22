@@ -118,10 +118,13 @@ try {
 let taxWalletATA;
 (async () => {
   try {
+    console.log('DEBUG - Defining taxWalletATA...');
+    console.log('DEBUG - MINT_ADDRESS:', MINT_ADDRESS.toBase58());
+    console.log('DEBUG - taxWallet.publicKey:', taxWallet.publicKey.toBase58());
     taxWalletATA = await getAssociatedTokenAddress(MINT_ADDRESS, taxWallet.publicKey);
     console.log('Tax wallet ATA:', taxWalletATA.toBase58());
   } catch (err) {
-    console.error('ERROR - Failed to get tax wallet ATA:', err.message);
+    console.error('ERROR - Failed to get tax wallet ATA:', err.message, err.stack);
     process.exit(1);
   }
 })();
