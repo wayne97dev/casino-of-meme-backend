@@ -1005,6 +1005,7 @@ app.post('/distribute-winnings', async (req, res) => {
 
   console.log('Received request to /distribute-winnings:', { winnerAddress, amount });
 
+  // Validazione dei parametri
   if (!winnerAddress || !amount || isNaN(amount) || amount <= 0) {
     console.log('Invalid parameters:', { winnerAddress, amount });
     return res.status(400).json({ success: false, error: 'Invalid winnerAddress or amount' });
@@ -1022,13 +1023,17 @@ app.post('/distribute-winnings', async (req, res) => {
   try {
     console.log('Getting casino ATA...');
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    console.log('Casino ATA:', casinoATA.toBase58());
+
     console.log('Getting winner ATA...');
     const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
+    console.log('Winner ATA:', winnerATA.toBase58());
 
     // Verifica il saldo SOL del casinò per le fee
     console.log('Checking casino SOL balance...');
     const casinoSolBalance = await retry(() => connection.getBalance(wallet.publicKey));
     const minSolBalance = 0.01 * LAMPORTS_PER_SOL; // Minimo 0.01 SOL per le fee
+    console.log('Casino SOL balance:', casinoSolBalance / LAMPORTS_PER_SOL, 'SOL');
     if (casinoSolBalance < minSolBalance) {
       console.log('Insufficient SOL balance in casino wallet for fees:', {
         balance: casinoSolBalance / LAMPORTS_PER_SOL,
@@ -1036,7 +1041,7 @@ app.post('/distribute-winnings', async (req, res) => {
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available`,
+        error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
       });
     }
 
@@ -1044,12 +1049,13 @@ app.post('/distribute-winnings', async (req, res) => {
     console.log('Checking token mint state...');
     const mintInfo = await connection.getParsedAccountInfo(MINT_ADDRESS);
     if (!mintInfo.value) {
-      console.log('Failed to fetch token mint info');
+      console.error('Failed to fetch token mint info for MINT_ADDRESS:', MINT_ADDRESS.toBase58());
       return res.status(500).json({ success: false, error: 'Failed to fetch token mint info' });
     }
     const mintData = mintInfo.value.data.parsed.info;
+    console.log('Mint info:', mintData);
     if (mintData.isInitialized === false) {
-      console.log('Token mint is not initialized');
+      console.error('Token mint is not initialized:', MINT_ADDRESS.toBase58());
       return res.status(400).json({ success: false, error: 'Token mint is not initialized' });
     }
     if (mintData.freezeAuthority) {
@@ -1057,16 +1063,16 @@ app.post('/distribute-winnings', async (req, res) => {
       try {
         const casinoAccountInfo = await getAccount(connection, casinoATA);
         if (casinoAccountInfo.isFrozen) {
-          console.log('Casino ATA is frozen');
+          console.error('Casino ATA is frozen:', casinoATA.toBase58());
           return res.status(400).json({ success: false, error: 'Casino ATA is frozen' });
         }
         const winnerAccountInfo = await getAccount(connection, winnerATA);
         if (winnerAccountInfo.isFrozen) {
-          console.log('Winner ATA is frozen');
+          console.error('Winner ATA is frozen:', winnerATA.toBase58());
           return res.status(400).json({ success: false, error: 'Winner ATA is frozen' });
         }
       } catch (err) {
-        console.log('Error checking ATA freeze status:', err.message);
+        console.error('Error checking ATA freeze status:', err.message);
         return res.status(400).json({ success: false, error: `Error checking ATA status: ${err.message}` });
       }
     }
@@ -1081,22 +1087,27 @@ app.post('/distribute-winnings', async (req, res) => {
       console.log('Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
       console.log('Casino ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await retry(() => connection.getLatestBlockhash());
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
-      await retry(() => connection.confirmTransaction(signature));
-      console.log('Created casino ATA:', casinoATA.toBase58());
-      casinoATAInfo = await getAccount(connection, casinoATA);
+      try {
+        const transaction = new Transaction().add(
+          createAssociatedTokenAccountInstruction(
+            wallet.publicKey,
+            casinoATA,
+            wallet.publicKey,
+            MINT_ADDRESS
+          )
+        );
+        const { blockhash } = await retry(() => connection.getLatestBlockhash());
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = wallet.publicKey;
+        transaction.partialSign(wallet);
+        const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+        await retry(() => connection.confirmTransaction(signature));
+        console.log('Created casino ATA:', casinoATA.toBase58());
+        casinoATAInfo = await getAccount(connection, casinoATA);
+      } catch (err) {
+        console.error('Failed to create casino ATA:', err.message);
+        return res.status(500).json({ success: false, error: `Failed to create casino ATA: ${err.message}` });
+      }
     }
 
     // Verifica il proprietario dell'ATA del casinò
@@ -1104,7 +1115,7 @@ app.post('/distribute-winnings', async (req, res) => {
     const casinoATAOwner = casinoATAInfo.owner.toBase58();
     const expectedOwner = wallet.publicKey.toBase58();
     if (casinoATAOwner !== expectedOwner) {
-      console.log('Casino ATA owner mismatch:', { actualOwner: casinoATAOwner, expectedOwner });
+      console.error('Casino ATA owner mismatch:', { actualOwner: casinoATAOwner, expectedOwner });
       return res.status(400).json({
         success: false,
         error: `Casino ATA owner mismatch: expected ${expectedOwner}, found ${casinoATAOwner}`,
@@ -1123,15 +1134,15 @@ app.post('/distribute-winnings', async (req, res) => {
         error: `Failed to fetch casino COM balance: ${err.message}`,
       });
     }
+    console.log('Casino COM balance:', casinoBalance.value.uiAmount, 'COM');
     if (!casinoBalance || !casinoBalance.value || casinoBalance.value.uiAmount < amount) {
       const balance = casinoBalance?.value?.uiAmount || 0;
-      console.log('Insufficient COM balance in casino ATA:', { balance, required: amount });
+      console.error('Insufficient COM balance in casino ATA:', { balance, required: amount });
       return res.status(400).json({
         success: false,
         error: `Insufficient COM balance in casino wallet: ${balance} COM available, ${amount} COM required`,
       });
     }
-    console.log('Casino COM balance sufficient:', casinoBalance.value.uiAmount);
 
     // Verifica se l'ATA del vincitore esiste, altrimenti crealo
     let winnerAccountExists = false;
@@ -1142,21 +1153,26 @@ app.post('/distribute-winnings', async (req, res) => {
       console.log('Winner ATA exists:', winnerATA.toBase58());
     } catch (err) {
       console.log('Winner ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          winnerATA,
-          winnerPublicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await retry(() => connection.getLatestBlockhash());
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
-      await retry(() => connection.confirmTransaction(signature));
-      console.log('Created winner ATA:', winnerATA.toBase58());
+      try {
+        const transaction = new Transaction().add(
+          createAssociatedTokenAccountInstruction(
+            wallet.publicKey,
+            winnerATA,
+            winnerPublicKey,
+            MINT_ADDRESS
+          )
+        );
+        const { blockhash } = await retry(() => connection.getLatestBlockhash());
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = wallet.publicKey;
+        transaction.partialSign(wallet);
+        const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+        await retry(() => connection.confirmTransaction(signature));
+        console.log('Created winner ATA:', winnerATA.toBase58());
+      } catch (err) {
+        console.error('Failed to create winner ATA:', err.message);
+        return res.status(500).json({ success: false, error: `Failed to create winner ATA: ${err.message}` });
+      }
     }
 
     // Crea la transazione per trasferire il premio
@@ -1174,11 +1190,19 @@ app.post('/distribute-winnings', async (req, res) => {
     const { blockhash } = await retry(() => connection.getLatestBlockhash());
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
+
     console.log('Estimating transaction fee...');
-    const fee = await transaction.getEstimatedFee(connection);
-    console.log('Estimated transaction fee:', fee / LAMPORTS_PER_SOL, 'SOL');
+    let fee;
+    try {
+      fee = await transaction.getEstimatedFee(connection);
+      console.log('Estimated transaction fee:', fee / LAMPORTS_PER_SOL, 'SOL');
+    } catch (err) {
+      console.error('Failed to estimate transaction fee:', err.message);
+      return res.status(500).json({ success: false, error: `Failed to estimate transaction fee: ${err.message}` });
+    }
+
     if (casinoSolBalance < fee) {
-      console.log('Insufficient SOL balance for transaction fee:', {
+      console.error('Insufficient SOL balance for transaction fee:', {
         balance: casinoSolBalance / LAMPORTS_PER_SOL,
         required: fee / LAMPORTS_PER_SOL,
       });
@@ -1187,18 +1211,32 @@ app.post('/distribute-winnings', async (req, res) => {
         error: `Insufficient SOL balance for transaction fee: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${fee / LAMPORTS_PER_SOL} SOL required`,
       });
     }
+
     transaction.partialSign(wallet);
 
     console.log('Sending transaction to transfer winnings:', { winnerAddress, amount });
-    const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+    let signature;
+    try {
+      signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+      console.log('Transaction sent, signature:', signature);
+    } catch (err) {
+      console.error('Failed to send transaction:', err.message);
+      return res.status(500).json({ success: false, error: `Failed to send transaction: ${err.message}` });
+    }
+
     console.log('Confirming transaction:', signature);
-    await retry(() => connection.confirmTransaction(signature));
-    console.log(`Successfully sent ${amount} COM to the winner ${winnerAddress}`);
+    try {
+      await retry(() => connection.confirmTransaction(signature));
+      console.log(`Successfully sent ${amount} COM to the winner ${winnerAddress}`);
+    } catch (err) {
+      console.error('Failed to confirm transaction:', err.message);
+      return res.status(500).json({ success: false, error: `Failed to confirm transaction: ${err.message}` });
+    }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error distributing winnings:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to distribute winnings: ${err.message}` });
+    console.error('Unexpected error in /distribute-winnings:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Unexpected error: ${err.message}` });
   }
 });
 
