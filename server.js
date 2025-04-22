@@ -114,15 +114,17 @@ try {
   process.exit(1);
 }
 
-// Definisci l'ATA del tax wallet per COM
+// Definisci l'ATA del tax wallet per COM in una funzione async
 let taxWalletATA;
-try {
-  taxWalletATA = await getAssociatedTokenAddress(MINT_ADDRESS, taxWallet.publicKey);
-  console.log('Tax wallet ATA:', taxWalletATA.toBase58());
-} catch (err) {
-  console.error('ERROR - Failed to get tax wallet ATA:', err.message);
-  process.exit(1);
-}
+(async () => {
+  try {
+    taxWalletATA = await getAssociatedTokenAddress(MINT_ADDRESS, taxWallet.publicKey);
+    console.log('Tax wallet ATA:', taxWalletATA.toBase58());
+  } catch (err) {
+    console.error('ERROR - Failed to get tax wallet ATA:', err.message);
+    process.exit(1);
+  }
+})();
 
 
 // Stato del gioco
