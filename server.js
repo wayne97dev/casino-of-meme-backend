@@ -1,4 +1,3 @@
-
 require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
 
 const express = require('express');
@@ -490,15 +489,10 @@ app.post('/play-coin-flip', async (req, res) => {
 });
 
 // Endpoint per Crazy Wheel
-
-
-
-
-// Endpoint per Crazy Wheel
 app.post('/play-crazy-wheel', async (req, res) => {
-  const { playerAddress, bets, signedTransaction } = req.body;
+  const { playerAddress, bets, transactionSignature } = req.body;
 
-  if (!playerAddress || !bets || !signedTransaction) {
+  if (!playerAddress || !bets || !transactionSignature) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
@@ -519,27 +513,32 @@ app.post('/play-crazy-wheel', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(totalBet * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo SOL
-    const userBalance = await connection.getBalance(userPublicKey);
-    if (userBalance < betInLamports) {
-      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-    }
-
-    // Valida e processa la transazione firmata
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-
-    if (!transaction.verifySignatures()) {
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    // Verifica la transazione
+    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
     if (confirmation.value.err) {
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    // Non genera il risultato del gioco, lascia che il frontend lo gestisca
+    const transactionDetails = await connection.getTransaction(transactionSignature, {
+      commitment: 'confirmed',
+    });
+    if (!transactionDetails) {
+      return res.status(400).json({ success: false, error: 'Transaction not found' });
+    }
+
+    const transferInstruction = transactionDetails.transaction.message.instructions.find(
+      (instr) => instr.programId.toBase58() === SystemProgram.programId.toBase58()
+    );
+    if (
+      !transferInstruction ||
+      transferInstruction.parsed.info.lamports !== betInLamports ||
+      transferInstruction.parsed.info.destination !== wallet.publicKey.toBase58() ||
+      transferInstruction.parsed.info.source !== userPublicKey.toBase58()
+    ) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
+    }
+
+    // La logica del gioco è gestita nel frontend
     res.json({ success: true });
   } catch (err) {
     console.error('Error in play-crazy-wheel:', err);
@@ -1304,247 +1303,224 @@ io.on('connection', (socket) => {
     }
 
     const minBet = MIN_BET;
-      if (betAmount < minBet) {
-        const errorMsg = `Bet must be at least ${minBet.toFixed(2)} COM`;
-        socket.emit('error', { message: errorMsg });
-        console.log(`Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
-        if (callback) callback({ success: false, error: errorMsg });
+    if (betAmount < minBet) {
+      const errorMsg = `Bet must be at least ${minBet.toFixed(2)} COM`;
+      socket.emit('error', { message: errorMsg });
+      console.log(`Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
+      if (callback) callback({ success: false, error: errorMsg });
+      return;
+    }
+    if (betAmount <= 0) {
+      const errorMsg = 'Bet amount must be positive';
+      socket.emit('error', { message: errorMsg });
+      console.log(`Bet ${betAmount} COM rejected: non-positive`);
+      if (callback) callback({ success: false, error: errorMsg });
+      return;
+    }
+
+    // Verifica se il giocatore è già nella lista
+    const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
+    if (existingPlayerIndex !== -1) {
+      waitingPlayers[existingPlayerIndex].id = socket.id;
+      waitingPlayers[existingPlayerIndex].bet = betAmount;
+      console.log(`Updated player ${playerAddress} in waiting list: socket.id=${socket.id}, bet=${betAmount}`);
+    } else {
+      waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
+      console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
+    }
+
+    // Log dello stato attuale della waiting list
+    console.log('Current waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet, socketId: p.id })));
+
+    // Emetti evento waiting al giocatore
+    socket.emit('waiting', { 
+      message: 'You have joined the game! Waiting for another player...', 
+      players: waitingPlayers 
+    });
+    // Emetti evento waitingPlayers a tutti i client
+    io.emit('waitingPlayers', { 
+      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+    });
+
+    // Rispondi al client con un acknowledgment
+    if (callback) {
+      callback({ success: true, message: 'Joined waiting list successfully' });
+    }
+
+    // Avvia una partita se ci sono almeno 2 giocatori
+    if (waitingPlayers.length >= 2) {
+      console.log(`Enough players (${waitingPlayers.length}), starting game...`);
+      const gameId = Date.now().toString();
+      const players = waitingPlayers.splice(0, 2);
+      games[gameId] = {
+        players,
+        tableCards: [],
+        playerCards: {},
+        currentTurn: null,
+        pot: players[0].bet + players[1].bet,
+        currentBet: 0,
+        playerBets: {
+          [players[0].address]: players[0].bet,
+          [players[1].address]: players[1].bet,
+        },
+        gamePhase: 'pre-flop',
+        status: 'waiting',
+        message: 'The dealer is preparing the game...',
+        opponentCardsVisible: false,
+        gameId,
+        dealerMessage: '',
+        bettingRoundComplete: false,
+        turnTimer: null,
+        timeLeft: 30,
+      };
+
+      try {
+        const game = new Game({
+          gameId,
+          players: players.map(p => ({
+            id: p.id,
+            address: p.address,
+            bet: p.bet,
+          })),
+          pot: players[0].bet + players[1].bet,
+          status: 'waiting',
+        });
+        await game.save();
+        console.log(`Saved game ${gameId} to database`);
+      } catch (err) {
+        console.error(`Error saving game ${gameId}:`, err);
+        socket.emit('error', { message: 'Error starting game' });
+        await refundBetsForGame(gameId);
+        if (callback) callback({ success: false, error: 'Error starting game' });
         return;
       }
-      if (betAmount <= 0) {
-        const errorMsg = 'Bet amount must be positive';
-        socket.emit('error', { message: errorMsg });
-        console.log(`Bet ${betAmount} COM rejected: non-positive`);
-        if (callback) callback({ success: false, error: errorMsg });
-        return;
-      }
-  
-      // Verifica se il giocatore è già nella lista
-      const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
-      if (existingPlayerIndex !== -1) {
-        waitingPlayers[existingPlayerIndex].id = socket.id;
-        waitingPlayers[existingPlayerIndex].bet = betAmount;
-        console.log(`Updated player ${playerAddress} in waiting list: socket.id=${socket.id}, bet=${betAmount}`);
-      } else {
-        waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
-        console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
-      }
-  
-      // Log dello stato attuale della waiting list
-      console.log('Current waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet, socketId: p.id })));
-  
-      // Emetti evento waiting al giocatore
-      socket.emit('waiting', { 
-        message: 'You have joined the game! Waiting for another player...', 
-        players: waitingPlayers 
+
+      players.forEach(player => {
+        const playerSocket = io.sockets.sockets.get(player.id);
+        if (playerSocket) {
+          playerSocket.join(gameId);
+          console.log(`Player ${player.address} joined room ${gameId}`);
+        } else { 
+           console.error(`Socket for player ${player.address} not found`);
+        }
       });
-      // Emetti evento waitingPlayers a tutti i client
+
+      // Aggiorna la lista d'attesa per tutti i client
       io.emit('waitingPlayers', { 
         players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
       });
-  
-      // Rispondi al client con un acknowledgment
-      if (callback) {
-        callback({ success: true, message: 'Joined waiting list successfully' });
-      }
-  
-      // Avvia una partita se ci sono almeno 2 giocatori
-      if (waitingPlayers.length >= 2) {
-        console.log(`Enough players (${waitingPlayers.length}), starting game...`);
-        const gameId = Date.now().toString();
-        const players = waitingPlayers.splice(0, 2);
-        games[gameId] = {
-          players,
-          tableCards: [],
-          playerCards: {},
-          currentTurn: null,
-          pot: players[0].bet + players[1].bet,
-          currentBet: 0,
-          playerBets: {
-            [players[0].address]: players[0].bet,
-            [players[1].address]: players[1].bet,
-          },
-          gamePhase: 'pre-flop',
-          status: 'waiting',
-          message: 'The dealer is preparing the game...',
-          opponentCardsVisible: false,
-          gameId,
-          dealerMessage: '',
-          bettingRoundComplete: false,
-          turnTimer: null,
-          timeLeft: 30,
-        };
-  
+      console.log(`Game ${gameId} started with players:`, players.map(p => p.address));
+
+      startGame(gameId);
+    }
+  });
+
+  socket.on('leaveWaitingList', ({ playerAddress }) => {
+    const playerIndex = waitingPlayers.findIndex(p => p.address === playerAddress && p.id === socket.id);
+    if (playerIndex !== -1) {
+      const player = waitingPlayers[playerIndex];
+      waitingPlayers.splice(playerIndex, 1);
+      console.log(`Player ${playerAddress} left the waiting list`);
+
+      // Emetti l'evento refund con un flag isRefund per indicare che non è una vincita
+      socket.emit('refund', {
+        message: 'You left the waiting list. Your bet has been refunded.',
+        amount: player.bet,
+        isRefund: true,
+      });
+
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
+      });
+      socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
+    } else {
+      socket.emit('error', { message: 'You are not in the waiting list.' });
+      console.log(`Player ${playerAddress} not found in waiting list`);
+    }
+  });
+
+  socket.on('reconnectPlayer', async ({ playerAddress, gameId }) => {
+    const game = games[gameId];
+    if (game) {
+      const player = game.players.find(p => p.address === playerAddress);
+      if (player) {
+        const oldSocketId = player.id;
+        player.id = socket.id;
+        console.log(`Player ${playerAddress} reconnected. Updated socket.id from ${oldSocketId} to ${socket.id}`);
+        socket.join(gameId);
+        if (game.currentTurn === oldSocketId) {
+          game.currentTurn = socket.id;
+          console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
+        }
         try {
-          const game = new Game({
-            gameId,
-            players: players.map(p => ({
-              id: p.id,
-              address: p.address,
-              bet: p.bet,
-            })),
-            pot: players[0].bet + players[1].bet,
-            status: 'waiting',
-          });
-          await game.save();
-          console.log(`Saved game ${gameId} to database`);
+          await Game.updateOne(
+            { gameId, 'players.address': playerAddress },
+            { $set: { 'players.$.id': socket.id } }
+          );
+          console.log(`Updated socket.id for ${playerAddress} in game ${gameId} database`);
         } catch (err) {
-          console.error(`Error saving game ${gameId}:`, err);
-          socket.emit('error', { message: 'Error starting game' });
-          await refundBetsForGame(gameId);
-          if (callback) callback({ success: false, error: 'Error starting game' });
-          return;
+          console.error(`Error updating socket.id for ${playerAddress} in game ${gameId}:`, err);
         }
-  
-        players.forEach(player => {
-          const playerSocket = io.sockets.sockets.get(player.id);
-          if (playerSocket) {
-            playerSocket.join(gameId);
-            console.log(`Player ${player.address} joined room ${gameId}`);
-          } else {
-            console.error(`Socket for player ${player.address} not found`);
-          }
-        });
-  
-        // Aggiorna la lista d'attesa per tutti i client
-        io.emit('waitingPlayers', { 
-          players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
-        });
-        console.log(`Game ${gameId} started with players:`, players.map(p => p.address));
-  
-        startGame(gameId);
-      }
-    });
-  
-    socket.on('leaveWaitingList', ({ playerAddress }) => {
-      const playerIndex = waitingPlayers.findIndex(p => p.address === playerAddress && p.id === socket.id);
-      if (playerIndex !== -1) {
-        const player = waitingPlayers[playerIndex];
-        waitingPlayers.splice(playerIndex, 1);
-        console.log(`Player ${playerAddress} left the waiting list`);
-  
-        // Emetti l'evento refund con un flag isRefund per indicare che non è una vincita
-        socket.emit('refund', {
-          message: 'You left the waiting list. Your bet has been refunded.',
-          amount: player.bet,
-          isRefund: true,
-        });
-  
-        io.emit('waitingPlayers', {
-          players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
-        });
-        socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } else {
-        socket.emit('error', { message: 'You are not in the waiting list.' });
-        console.log(`Player ${playerAddress} not found in waiting list`);
+        console.error(`Player ${playerAddress} not found in game ${gameId}`);
       }
-    });
-  
-    socket.on('reconnectPlayer', async ({ playerAddress, gameId }) => {
-      const game = games[gameId];
-      if (game) {
-        const player = game.players.find(p => p.address === playerAddress);
-        if (player) {
-          const oldSocketId = player.id;
-          player.id = socket.id;
-          console.log(`Player ${playerAddress} reconnected. Updated socket.id from ${oldSocketId} to ${socket.id}`);
-          socket.join(gameId);
-          if (game.currentTurn === oldSocketId) {
-            game.currentTurn = socket.id;
-            console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
-          }
-          try {
-            await Game.updateOne(
-              { gameId, 'players.address': playerAddress },
-              { $set: { 'players.$.id': socket.id } }
-            );
-            console.log(`Updated socket.id for ${playerAddress} in game ${gameId} database`);
-          } catch (err) {
-            console.error(`Error updating socket.id for ${playerAddress} in game ${gameId}:`, err);
-          }
-          io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        } else {
-          console.error(`Player ${playerAddress} not found in game ${gameId}`);
-        }
+    } else {
+      console.error(`Game ${gameId} not found during reconnection`);
+    }
+  });
+
+  socket.on('makeMove', async ({ gameId, move, amount }) => {
+    const game = games[gameId];
+    if (!game || game.currentTurn !== socket.id) {
+      console.log(`Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
+      return;
+    }
+
+    if (game.turnTimer) {
+      clearInterval(game.turnTimer);
+    }
+    game.timeLeft = 30;
+
+    const playerAddress = game.players.find(p => p.id === socket.id)?.address;
+    const opponent = game.players.find(p => p.id !== socket.id);
+    if (!playerAddress || !opponent) {
+      console.log(`Player or opponent not found: playerAddress=${playerAddress}, opponent=${opponent}`);
+      await refundBetsForGame(gameId);
+      return;
+    }
+    const currentPlayerBet = game.playerBets[playerAddress] || 0;
+    console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
+
+    if (move === 'fold') {
+      game.status = 'finished';
+      game.opponentCardsVisible = true;
+      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
+      game.dealerMessage = 'The dealer announces the winner!';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot, isRefund: false });
+      await updateLeaderboard(opponent.address, game.pot);
+      try {
+        await Game.updateOne({ gameId }, { status: 'finished' });
+        await Game.deleteOne({ gameId });
+        console.log(`Deleted game ${gameId} from database`);
+      } catch (err) {
+        console.error(`Error updating/deleting game ${gameId}:`, err);
+      }
+      delete games[gameId];
+    } else if (move === 'check') {
+      if (game.currentBet > currentPlayerBet) {
+        game.message = 'You cannot check, you must call or raise!';
+        game.dealerMessage = 'The dealer reminds: You must call or raise!';
+        console.log(`Check not allowed: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       } else {
-        console.error(`Game ${gameId} not found during reconnection`);
-      }
-    });
-  
-    socket.on('makeMove', async ({ gameId, move, amount }) => {
-      const game = games[gameId];
-      if (!game || game.currentTurn !== socket.id) {
-        console.log(`Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
-        return;
-      }
-  
-      if (game.turnTimer) {
-        clearInterval(game.turnTimer);
-      }
-      game.timeLeft = 30;
-  
-      const playerAddress = game.players.find(p => p.id === socket.id)?.address;
-      const opponent = game.players.find(p => p.id !== socket.id);
-      if (!playerAddress || !opponent) {
-        console.log(`Player or opponent not found: playerAddress=${playerAddress}, opponent=${opponent}`);
-        await refundBetsForGame(gameId);
-        return;
-      }
-      const currentPlayerBet = game.playerBets[playerAddress] || 0;
-      console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
-  
-      if (move === 'fold') {
-        game.status = 'finished';
-        game.opponentCardsVisible = true;
-        game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
-        game.dealerMessage = 'The dealer announces the winner!';
-        io.to(gameId).emit('gameState', removeCircularReferences(game));
-        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot, isRefund: false });
-        await updateLeaderboard(opponent.address, game.pot);
-        try {
-          await Game.updateOne({ gameId }, { status: 'finished' });
-          await Game.deleteOne({ gameId });
-          console.log(`Deleted game ${gameId} from database`);
-        } catch (err) {
-          console.error(`Error updating/deleting game ${gameId}:`, err);
-        }
-        delete games[gameId];
-      } else if (move === 'check') {
-        if (game.currentBet > currentPlayerBet) {
-          game.message = 'You cannot check, you must call or raise!';
-          game.dealerMessage = 'The dealer reminds: You must call or raise!';
-          console.log(`Check not allowed: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
-          io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        } else {
-          game.message = 'You checked.';
-          game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
-          console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
-          game.actionsCompleted += 1;
-          console.log(`Actions completed: ${game.actionsCompleted}`);
-  
-          if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
-            game.bettingRoundComplete = true;
-            game.actionsCompleted = 0;
-            console.log(`Betting round complete in phase ${game.gamePhase}, advancing game phase`);
-            advanceGamePhase(gameId);
-          } else {
-            game.currentTurn = opponent.id;
-            game.bettingRoundComplete = false;
-            console.log(`Passing turn to opponent: ${opponent.id}`);
-            startTurnTimer(gameId, opponent.id);
-          }
-          io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        }
-      } else if (move === 'call') {
-        const amountToCall = game.currentBet - currentPlayerBet;
-        game.pot += amountToCall;
-        game.playerBets[playerAddress] = game.currentBet;
-        game.message = `You called ${amountToCall.toFixed(2)} COM.`;
-        game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
-        console.log(`Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
+        game.message = 'You checked.';
+        game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
+        console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
         game.actionsCompleted += 1;
         console.log(`Actions completed: ${game.actionsCompleted}`);
-  
+
         if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
           game.actionsCompleted = 0;
@@ -1556,198 +1532,94 @@ io.on('connection', (socket) => {
           console.log(`Passing turn to opponent: ${opponent.id}`);
           startTurnTimer(gameId, opponent.id);
         }
-        try {
-          await Game.updateOne({ gameId }, { pot: game.pot });
-          console.log(`Updated pot for game ${gameId} to ${game.pot}`);
-        } catch (err) {
-          console.error(`Error updating pot for game ${gameId}:`, err);
-        }
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } else if (move === 'bet' || move === 'raise') {
-        const minBet = MIN_BET;
-        const newBet = move === 'bet' ? amount : game.currentBet + amount;
-        if (newBet <= game.currentBet || amount < minBet) {
-          game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
-          game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
-          console.log(`Invalid ${move}: newBet=${newBet}, currentBet=${game.currentBet}, minBet=${minBet}`);
-          io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-          return;
-        }
-        const additionalBet = newBet - currentPlayerBet;
-        game.pot += additionalBet;
-        game.playerBets[playerAddress] = newBet;
-        game.currentBet = newBet;
-        game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
-        game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
-        console.log(`${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
-        game.actionsCompleted += 1;
+      }
+    } else if (move === 'call') {
+      const amountToCall = game.currentBet - currentPlayerBet;
+      game.pot += amountToCall;
+      game.playerBets[playerAddress] = game.currentBet;
+      game.message = `You called ${amountToCall.toFixed(2)} COM.`;
+      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
+      console.log(`Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
+      game.actionsCompleted += 1;
+      console.log(`Actions completed: ${game.actionsCompleted}`);
+
+      if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+        game.bettingRoundComplete = true;
+        game.actionsCompleted = 0;
+        console.log(`Betting round complete in phase ${game.gamePhase}, advancing game phase`);
+        advanceGamePhase(gameId);
+      } else {
         game.currentTurn = opponent.id;
         game.bettingRoundComplete = false;
-        game.actionsCompleted = 1; // Resetta a 1, poiché l'avversario deve rispondere
-        try {
-          await Game.updateOne({ gameId }, { pot: game.pot });
-          console.log(`Updated pot for game ${gameId} to ${game.pot}`);
-        } catch (err) {
-          console.error(`Error updating pot for game ${gameId}:`, err);
-        }
+        console.log(`Passing turn to opponent: ${opponent.id}`);
         startTurnTimer(gameId, opponent.id);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
       }
-    });
-  
-    socket.on('disconnect', async () => {
-      console.log('A player disconnected:', socket.id);
-  
-      const waitingIndex = waitingPlayers.findIndex(p => p.id === socket.id);
-      if (waitingIndex !== -1) {
-        const player = waitingPlayers[waitingIndex];
-        waitingPlayers.splice(waitingIndex, 1);
-        console.log(`Player ${player.address} removed from waiting list due to disconnect`);
-        io.emit('waitingPlayers', {
-          players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
-        });
-      }
-  
-      for (const gameId in games) {
-        const game = games[gameId];
-        const playerIndex = game.players.findIndex(p => p.id === socket.id);
-        if (playerIndex !== -1) {
-          const opponent = game.players.find(p => p.id !== socket.id);
-          if (opponent) {
-            if (game.turnTimer) {
-              clearInterval(game.turnTimer);
-            }
-            game.status = 'finished';
-            game.opponentCardsVisible = true;
-            game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
-            game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
-            io.to(gameId).emit('gameState', removeCircularReferences(game));
-            io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-            await updateLeaderboard(opponent.address, game.pot);
-            try {
-              await Game.updateOne({ gameId }, { status: 'finished' });
-              await Game.deleteOne({ gameId });
-              console.log(`Deleted game ${gameId} from database`);
-            } catch (err) {
-              console.error(`Error updating/deleting game ${gameId}:`, err);
-            }
-            delete games[gameId];
-          } else {
-            await refundBetsForGame(gameId);
-          }
-        }
-      }
-    });
-  });
-  
-  const startTurnTimer = async (gameId, playerId) => {
-    const game = games[gameId];
-    if (!game) {
-      console.error(`Game ${gameId} not found in startTurnTimer`);
-      await refundBetsForGame(gameId);
-      return;
-    }
-  
-    const player = game.players.find(p => p.id === playerId);
-    if (!player) {
-      console.error(`Player with socket.id ${playerId} not found in game ${gameId}`);
-      const opponent = game.players.find(p => p.id !== playerId);
-      if (opponent) {
-        game.status = 'finished';
-        game.opponentCardsVisible = true;
-        game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
-        game.dealerMessage = 'The dealer announces: A player is no longer available.';
-        io.to(gameId).emit('gameState', removeCircularReferences(game));
-        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-        await updateLeaderboard(opponent.address, game.pot);
-        try {
-          await Game.updateOne({ gameId }, { status: 'finished' });
-          await Game.deleteOne({ gameId });
-          console.log(`Deleted game ${gameId} from database`);
-        } catch (err) {
-          console.error(`Error updating/deleting game ${gameId}:`, err);
-        }
-        delete games[gameId];
-      } else {
-        await refundBetsForGame(gameId);
-      }
-      return;
-    }
-  
-    game.currentTurn = playerId;
-    game.timeLeft = 30;
-  
-    // Cancella qualsiasi timer precedente
-    if (game.turnTimer) {
-      console.log(`Clearing previous timer for game ${gameId}`);
-      clearTimeout(game.turnTimer);
-      game.turnTimer = null;
-    }
-  
-    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-    console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
-  
-    const clientsInRoom = io.sockets.adapter.rooms.get(gameId);
-    console.log(`Clients in room ${gameId}:`, clientsInRoom ? Array.from(clientsInRoom) : 'No clients');
-  
-    const runTimer = async () => {
       try {
-        if (!games[gameId]) {
-          console.log(`Game ${gameId} no longer exists, stopping timer`);
-          await refundBetsForGame(gameId);
-          return;
-        }
-  
-        if (game.status !== 'playing') {
-          console.log(`Game ${gameId} is not in playing state, stopping timer`);
-          clearTimeout(game.turnTimer);
-          game.turnTimer = null;
-          return;
-        }
-  
-        game.timeLeft -= 1;
-        console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}, currentTurn = ${game.currentTurn}`);
-  
-        const playerSocket = io.sockets.sockets.get(game.currentTurn);
-        if (!playerSocket || !playerSocket.rooms.has(gameId)) {
-          console.error(`Player with socket.id ${game.currentTurn} is not connected or not in room ${gameId}`);
-          const opponent = game.players.find(p => p.id !== game.currentTurn);
-          if (opponent) {
-            game.status = 'finished';
-            game.opponentCardsVisible = true;
-            game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
-            game.dealerMessage = 'The dealer announces: A player is no longer available.';
-            io.to(gameId).emit('gameState', removeCircularReferences(game));
-            io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-            await updateLeaderboard(opponent.address, game.pot);
-            try {
-              await Game.updateOne({ gameId }, { status: 'finished' });
-              await Game.deleteOne({ gameId });
-              console.log(`Deleted game ${gameId} from database`);
-            } catch (err) {
-              console.error(`Error updating/deleting game ${gameId}:`, err);
-            }
-            delete games[gameId];
-          } else {
-            await refundBetsForGame(gameId);
-          }
-          return;
-        }
-  
+        await Game.updateOne({ gameId }, { pot: game.pot });
+        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
+      } catch (err) {
+        console.error(`Error updating pot for game ${gameId}:`, err);
+      }
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } else if (move === 'bet' || move === 'raise') {
+      const minBet = MIN_BET;
+      const newBet = move === 'bet' ? amount : game.currentBet + amount;
+      if (newBet <= game.currentBet || amount < minBet) {
+        game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
+        game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
+        console.log(`Invalid ${move}: newBet=${newBet}, currentBet=${game.currentBet}, minBet=${minBet}`);
         io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-  
-        if (game.timeLeft <= 0) {
-          const playerAddress = game.players.find(p => p.id === playerId)?.address;
-          const opponent = game.players.find(p => p.id !== playerId);
-          if (!playerAddress || !opponent) {
-            console.error(`Player or opponent not found in game ${gameId}`);
-            await refundBetsForGame(gameId);
-            return;
+        return;
+      }
+      const additionalBet = newBet - currentPlayerBet;
+      game.pot += additionalBet;
+      game.playerBets[playerAddress] = newBet;
+      game.currentBet = newBet;
+      game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+      game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+      console.log(`${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
+      game.actionsCompleted += 1;
+      game.currentTurn = opponent.id;
+      game.bettingRoundComplete = false;
+      game.actionsCompleted = 1; // Resetta a 1, poiché l'avversario deve rispondere
+      try {
+        await Game.updateOne({ gameId }, { pot: game.pot });
+        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
+      } catch (err) {
+        console.error(`Error updating pot for game ${gameId}:`, err);
+      }
+      startTurnTimer(gameId, opponent.id);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    console.log('A player disconnected:', socket.id);
+
+    const waitingIndex = waitingPlayers.findIndex(p => p.id === socket.id);
+    if (waitingIndex !== -1) {
+      const player = waitingPlayers[waitingIndex];
+      waitingPlayers.splice(waitingIndex, 1);
+      console.log(`Player ${player.address} removed from waiting list due to disconnect`);
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
+      });
+    }
+
+    for (const gameId in games) {
+      const game = games[gameId];
+      const playerIndex = game.players.findIndex(p => p.id === socket.id);
+      if (playerIndex !== -1) {
+        const opponent = game.players.find(p => p.id !== socket.id);
+        if (opponent) {
+          if (game.turnTimer) {
+            clearInterval(game.turnTimer);
           }
           game.status = 'finished';
           game.opponentCardsVisible = true;
-          game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
-          game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+          game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
+          game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
           await updateLeaderboard(opponent.address, game.pot);
@@ -1760,483 +1632,610 @@ io.on('connection', (socket) => {
           }
           delete games[gameId];
         } else {
-          game.turnTimer = setTimeout(runTimer, 1000);
+          await refundBetsForGame(gameId);
         }
+      }
+    }
+  });
+});
+
+const startTurnTimer = async (gameId, playerId) => {
+  const game = games[gameId];
+  if (!game) {
+    console.error(`Game ${gameId} not found in startTurnTimer`);
+    await refundBetsForGame(gameId);
+    return;
+  }
+
+  const player = game.players.find(p => p.id === playerId);
+  if (!player) {
+    console.error(`Player with socket.id ${playerId} not found in game ${gameId}`);
+    const opponent = game.players.find(p => p.id !== playerId);
+    if (opponent) {
+      game.status = 'finished';
+      game.opponentCardsVisible = true;
+      game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
+      game.dealerMessage = 'The dealer announces: A player is no longer available.';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+      await updateLeaderboard(opponent.address, game.pot);
+      try {
+        await Game.updateOne({ gameId }, { status: 'finished' });
+        await Game.deleteOne({ gameId });
+        console.log(`Deleted game ${gameId} from database`);
       } catch (err) {
-        console.error(`Error in turn timer for game ${gameId}:`, err);
+        console.error(`Error updating/deleting game ${gameId}:`, err);
+      }
+      delete games[gameId];
+    } else {
+      await refundBetsForGame(gameId);
+    }
+    return;
+  }
+
+  game.currentTurn = playerId;
+  game.timeLeft = 30;
+
+  // Cancella qualsiasi timer precedente
+  if (game.turnTimer) {
+    console.log(`Clearing previous timer for game ${gameId}`);
+    clearTimeout(game.turnTimer);
+    game.turnTimer = null;
+  }
+
+  io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+  console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
+
+  const clientsInRoom = io.sockets.adapter.rooms.get(gameId);
+  console.log(`Clients in room ${gameId}:`, clientsInRoom ? Array.from(clientsInRoom) : 'No clients');
+
+  const runTimer = async () => {
+    try {
+      if (!games[gameId]) {
+        console.log(`Game ${gameId} no longer exists, stopping timer`);
         await refundBetsForGame(gameId);
-      }
-    };
-  
-    game.turnTimer = setTimeout(runTimer, 1000);
-  };
-  
-  // In startGame
-  const startGame = async (gameId) => {
-    const game = games[gameId];
-    if (!game) {
-      console.error(`Game ${gameId} not found in startGame`);
-      await refundBetsForGame(gameId);
-      return;
-    }
-    console.log(`Starting game ${gameId} with players:`, game.players.map(p => ({ address: p.address, socketId: p.id })));
-  
-    game.message = 'The dealer is dealing the cards...';
-    game.dealerMessage = 'The dealer is dealing the cards to the players.';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-  
-    try {
-      await Game.updateOne({ gameId }, { status: 'playing' });
-      console.log(`Updated game ${gameId} status to playing`);
-    } catch (err) {
-      console.error(`Error updating game ${gameId} status:`, err.message, err.stack);
-      await refundBetsForGame(gameId);
-      return;
-    }
-  
-    try {
-      const player1Cards = [drawCard(), drawCard()];
-      const player2Cards = [drawCard(), drawCard()];
-      console.log(`Player 1 cards:`, player1Cards);
-      console.log(`Player 2 cards:`, player2Cards);
-  
-      if (!player1Cards.every(card => card && card.value && card.suit && card.image) || 
-          !player2Cards.every(card => card && card.value && card.suit && card.image)) {
-        throw new Error('Invalid cards drawn');
-      }
-  
-      game.playerCards[game.players[0].address] = player1Cards;
-      game.playerCards[game.players[1].address] = player2Cards;
-  
-      const player1Socket = io.sockets.sockets.get(game.players[0].id);
-      const player2Socket = io.sockets.sockets.get(game.players[1].id);
-      if (!player1Socket || !player2Socket) {
-        throw new Error('One or more players disconnected before game start');
-      }
-  
-      game.currentTurn = game.players[0].id;
-      game.pot = game.players[0].bet + game.players[1].bet;
-      game.playerBets[game.players[0].address] = 0;
-      game.playerBets[game.players[1].address] = 0;
-      game.currentBet = 0;
-      game.status = 'playing';
-      game.message = 'Pre-Flop: Place your bets.';
-      game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
-      game.actionsCompleted = 0; // Inizializza il contatore delle azioni
-  
-      console.log(`Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
-      startTurnTimer(gameId, game.players[0].id);
-      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-    } catch (err) {
-      console.error(`Error in startGame ${gameId}:`, err.message, err.stack);
-      game.message = 'Error starting game. Refunding bets...';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      await refundBetsForGame(gameId);
-    }
-  };
-  
-  const drawCard = () => {
-    const cardNumber = Math.floor(Math.random() * 13) + 1;
-    const suits = ['spades', 'hearts', 'diamonds', 'clubs'];
-    const suitChars = ['S', 'H', 'D', 'C'];
-    const suitIndex = Math.floor(Math.random() * 4);
-    const suit = suits[suitIndex];
-    const suitChar = suitChars[suitIndex];
-    let cardName;
-    if (cardNumber === 1) cardName = 'A';
-    else if (cardNumber === 10) cardName = '0';
-    else if (cardNumber === 11) cardName = 'J';
-    else if (cardNumber === 12) cardName = 'Q';
-    else if (cardNumber === 13) cardName = 'K';
-    else cardName = cardNumber.toString();
-    
-    const value = cardNumber === 1 ? 14 : cardNumber;
-    const image = `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`;
-    
-    console.log(`Drawn card: ${cardName}${suitChar} (Value: ${value}, Suit: ${suit})`);
-    return { value, suit, image };
-  };
-  
-  const advanceGamePhase = async (gameId) => {
-    const game = games[gameId];
-    if (!game) {
-      console.error(`Game ${gameId} not found in advanceGamePhase`);
-      await refundBetsForGame(gameId);
-      return;
-    }
-  
-    if (game.status !== 'playing') {
-      console.log(`Game ${gameId} is not in playing state, aborting phase advance`);
-      return;
-    }
-  
-    // Cancella qualsiasi timer attivo
-    if (game.turnTimer) {
-      clearTimeout(game.turnTimer);
-      game.turnTimer = null;
-      console.log(`Cleared timer for game ${gameId} before advancing phase`);
-    }
-  
-    const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
-    const nextPlayer = game.players.find(p => p.id === game.currentTurn);
-  
-    if (!lastPlayer || !nextPlayer) {
-      console.error(`Players not found in game ${gameId}`);
-      await refundBetsForGame(gameId);
-      return;
-    }
-  
-    game.actionsCompleted = 0;
-    game.bettingRoundComplete = false;
-  
-    if (game.gamePhase === 'pre-flop') {
-      game.message = 'The dealer is dealing the Flop...';
-      game.dealerMessage = 'The dealer is dealing the Flop cards.';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      setTimeout(() => {
-        try {
-          const newCards = Array(3).fill().map(() => drawCard());
-          if (!newCards.every(card => card && card.value && card.suit && card.image)) {
-            throw new Error('Invalid flop cards drawn');
-          }
-          game.tableCards = newCards;
-          game.gamePhase = 'flop';
-          game.message = 'Flop: Place your bets.';
-          game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-          game.currentTurn = lastPlayer.id;
-          game.currentBet = 0;
-          game.playerBets[lastPlayer.address] = 0;
-          game.playerBets[nextPlayer.address] = 0;
-          console.log(`Advancing to Flop, turn passed to: ${lastPlayer.id}`);
-          startTurnTimer(gameId, lastPlayer.id);
-          io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        } catch (err) {
-          console.error(`Error advancing to flop in game ${gameId}:`, err);
-          game.message = 'Error dealing flop. Refunding bets...';
-          io.to(gameId).emit('gameState', removeCircularReferences(game));
-          refundBetsForGame(gameId);
-        }
-      }, 1000);
-    } else if (game.gamePhase === 'flop') {
-      game.message = 'The dealer is dealing the Turn...';
-      game.dealerMessage = 'The dealer is dealing the Turn card.';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      setTimeout(() => {
-        try {
-          const newCard = drawCard();
-          if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
-            throw new Error('Invalid turn card drawn');
-          }
-          game.tableCards.push(newCard);
-          game.gamePhase = 'turn';
-          game.message = 'Turn: Place your bets.';
-          game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-          game.currentTurn = lastPlayer.id;
-          game.currentBet = 0;
-          game.playerBets[lastPlayer.address] = 0;
-          game.playerBets[nextPlayer.address] = 0;
-          console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
-          startTurnTimer(gameId, lastPlayer.id);
-          io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        } catch (err) {
-          console.error(`Error advancing to turn in game ${gameId}:`, err);
-          game.message = 'Error dealing turn. Refunding bets...';
-          io.to(gameId).emit('gameState', removeCircularReferences(game));
-          refundBetsForGame(gameId);
-        }
-      }, 1000);
-    } else if (game.gamePhase === 'turn') {
-      game.message = 'The dealer is dealing the River...';
-      game.dealerMessage = 'The dealer is dealing the River card.';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      setTimeout(() => {
-        try {
-          const newCard = drawCard();
-          if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
-            throw new Error('Invalid river card drawn');
-          }
-          game.tableCards.push(newCard);
-          game.gamePhase = 'river';
-          game.message = 'River: Place your bets.';
-          game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-          game.currentTurn = lastPlayer.id;
-          game.currentBet = 0;
-          game.playerBets[lastPlayer.address] = 0;
-          game.playerBets[nextPlayer.address] = 0;
-          console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
-          startTurnTimer(gameId, lastPlayer.id);
-          io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        } catch (err) {
-          console.error(`Error advancing to river in game ${gameId}:`, err);
-          game.message = 'Error dealing river. Refunding bets...';
-          io.to(gameId).emit('gameState', removeCircularReferences(game));
-          refundBetsForGame(gameId);
-        }
-      }, 1000);
-    } else if (game.gamePhase === 'river') {
-      game.gamePhase = 'showdown';
-      game.message = 'Showdown: Evaluating hands...';
-      game.dealerMessage = 'The dealer is evaluating the hands...';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      setTimeout(() => {
-        try {
-          endGame(gameId);
-        } catch (err) {
-          console.error(`Error advancing to showdown in game ${gameId}:`, err);
-          game.message = 'Error evaluating hands. Refunding bets...';
-          io.to(gameId).emit('gameState', removeCircularReferences(game));
-          refundBetsForGame(gameId);
-        }
-      }, 1000);
-    }
-  };
-  
-  const getCombinations = (array, k) => {
-    const result = [];
-    const combine = (start, combo) => {
-      if (combo.length === k) {
-        result.push([...combo]);
         return;
       }
-      for (let i = start; i < array.length; i++) {
-        combine(i + 1, [...combo, array[i]]);
+
+      if (game.status !== 'playing') {
+        console.log(`Game ${gameId} is not in playing state, stopping timer`);
+        clearTimeout(game.turnTimer);
+        game.turnTimer = null;
+        return;
       }
-    };
-    combine(0, []);
-    return result;
-  };
-  
-  const evaluatePokerHand = (hand) => {
-    const combinations = getCombinations(hand, 5);
-    let bestRank = -1;
-    let bestDescription = '';
-    let bestHighCards = [];
-    let bestHand = null;
-  
-    for (const combo of combinations) {
-      const values = combo.map(card => card.value).sort((a, b) => b - a);
-      const suits = combo.map(card => card.suit);
-      const isFlush = suits.every(suit => suit === suits[0]);
-      const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
-      const isLowStraight = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
-      const valueCounts = {};
-      values.forEach(val => {
-        valueCounts[val] = (valueCounts[val] || 0) + 1;
-      });
-      const counts = Object.values(valueCounts).sort((a, b) => b - a);
-  
-      let rank = -1;
-      let description = '';
-      let highCards = [];
-  
-      if (isFlush && (isStraight || isLowStraight)) {
-        rank = 8;
-        description = 'Straight Flush';
-        highCards = isLowStraight ? [5] : [values[0]];
-      } else if (counts[0] === 4) {
-        rank = 7;
-        description = 'Four of a Kind';
-        highCards = [parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 4))];
-      } else if (counts[0] === 3 && counts[1] === 2) {
-        rank = 6;
-        description = 'Full House';
-        highCards = [
-          parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
-          parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2)),
-        ];
-      } else if (isFlush) {
-        rank = 5;
-        description = 'Flush';
-        highCards = values;
-      } else if (isStraight || isLowStraight) {
-        rank = 4;
-        description = 'Straight';
-        highCards = isLowStraight ? [5] : [values[0]];
-      } else if (counts[0] === 3) {
-        rank = 3;
-        description = 'Three of a Kind';
-        highCards = [
-          parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
-          ...values.filter(val => val !== parseInt(Object.keys(valueCounts).find(v => valueCounts[v] === 3))),
-        ];
-      } else if (counts[0] === 2 && counts[1] === 2) {
-        rank = 2;
-        description = 'Two Pair';
-        const pairs = Object.keys(valueCounts).filter(val => valueCounts[val] === 2).map(Number).sort((a, b) => b - a);
-        const kicker = values.find(val => !pairs.includes(val));
-        highCards = [...pairs, kicker];
-      } else if (counts[0] === 2) {
-        rank = 1;
-        description = 'One Pair';
-        const pairValue = parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2));
-        highCards = [
-          pairValue,
-          ...values.filter(val => val !== pairValue),
-        ];
-      } else {
-        rank = 0;
-        description = 'High Card';
-        highCards = values;
-      }
-  
-      if (rank > bestRank) {
-        bestRank = rank;
-        bestDescription = description;
-        bestHighCards = highCards;
-        bestHand = combo;
-      } else if (rank === bestRank) {
-        for (let i = 0; i < bestHighCards.length; i++) {
-          if (bestHighCards[i] < highCards[i]) {
-            bestRank = rank;
-            bestDescription = description;
-            bestHighCards = highCards;
-            bestHand = combo;
-            break;
-          } else if (bestHighCards[i] > highCards[i]) {
-            break;
+
+      game.timeLeft -= 1;
+      console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}, currentTurn = ${game.currentTurn}`);
+
+      const playerSocket = io.sockets.sockets.get(game.currentTurn);
+      if (!playerSocket || !playerSocket.rooms.has(gameId)) {
+        console.error(`Player with socket.id ${game.currentTurn} is not connected or not in room ${gameId}`);
+        const opponent = game.players.find(p => p.id !== game.currentTurn);
+        if (opponent) {
+          game.status = 'finished';
+          game.opponentCardsVisible = true;
+          game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
+          game.dealerMessage = 'The dealer announces: A player is no longer available.';
+          io.to(gameId).emit('gameState', removeCircularReferences(game));
+          io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+          await updateLeaderboard(opponent.address, game.pot);
+          try {
+            await Game.updateOne({ gameId }, { status: 'finished' });
+            await Game.deleteOne({ gameId });
+            console.log(`Deleted game ${gameId} from database`);
+          } catch (err) {
+            console.error(`Error updating/deleting game ${gameId}:`, err);
           }
+          delete games[gameId];
+        } else {
+          await refundBetsForGame(gameId);
         }
+        return;
       }
-    }
-  
-    console.log('Best hand:', bestHand);
-    console.log('Best evaluation:', { rank: bestRank, description: bestDescription, highCards: bestHighCards });
-    return { rank: bestRank, description: bestDescription, highCards: bestHighCards };
-  };
-  
-  const endGame = async (gameId) => {
-    const game = games[gameId];
-    if (!game) {
-      console.error(`Game ${gameId} not found in endGame`);
+
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+
+      if (game.timeLeft <= 0) {
+        const playerAddress = game.players.find(p => p.id === playerId)?.address;
+        const opponent = game.players.find(p => p.id !== playerId);
+        if (!playerAddress || !opponent) {
+          console.error(`Player or opponent not found in game ${gameId}`);
+          await refundBetsForGame(gameId);
+          return;
+        }
+        game.status = 'finished';
+        game.opponentCardsVisible = true;
+        game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
+        game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+        await updateLeaderboard(opponent.address, game.pot);
+        try {
+          await Game.updateOne({ gameId }, { status: 'finished' });
+          await Game.deleteOne({ gameId });
+          console.log(`Deleted game ${gameId} from database`);
+        } catch (err) {
+          console.error(`Error updating/deleting game ${gameId}:`, err);
+        }
+        delete games[gameId];
+      } else {
+        game.turnTimer = setTimeout(runTimer, 1000);
+      }
+    } catch (err) {
+      console.error(`Error in turn timer for game ${gameId}:`, err);
       await refundBetsForGame(gameId);
+    }
+  };
+
+  game.turnTimer = setTimeout(runTimer, 1000);
+};
+
+// In startGame
+const startGame = async (gameId) => {
+  const game = games[gameId];
+  if (!game) {
+    console.error(`Game ${gameId} not found in startGame`);
+    await refundBetsForGame(gameId);
+    return;
+  }
+  console.log(`Starting game ${gameId} with players:`, game.players.map(p => ({ address: p.address, socketId: p.id })));
+
+  game.message = 'The dealer is dealing the cards...';
+  game.dealerMessage = 'The dealer is dealing the cards to the players.';
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
+
+  try {
+    await Game.updateOne({ gameId }, { status: 'playing' });
+    console.log(`Updated game ${gameId} status to playing`);
+  } catch (err) {
+    console.error(`Error updating game ${gameId} status:`, err.message, err.stack);
+    await refundBetsForGame(gameId);
+    return;
+  }
+
+  try {
+    const player1Cards = [drawCard(), drawCard()];
+    const player2Cards = [drawCard(), drawCard()];
+    console.log(`Player 1 cards:`, player1Cards);
+    console.log(`Player 2 cards:`, player2Cards);
+
+    if (!player1Cards.every(card => card && card.value && card.suit && card.image) || 
+        !player2Cards.every(card => card && card.value && card.suit && card.image)) {
+      throw new Error('Invalid cards drawn');
+    }
+
+    game.playerCards[game.players[0].address] = player1Cards;
+    game.playerCards[game.players[1].address] = player2Cards;
+
+    const player1Socket = io.sockets.sockets.get(game.players[0].id);
+    const player2Socket = io.sockets.sockets.get(game.players[1].id);
+    if (!player1Socket || !player2Socket) {
+      throw new Error('One or more players disconnected before game start');
+    }
+
+    game.currentTurn = game.players[0].id;
+    game.pot = game.players[0].bet + game.players[1].bet;
+    game.playerBets[game.players[0].address] = 0;
+    game.playerBets[game.players[1].address] = 0;
+    game.currentBet = 0;
+    game.status = 'playing';
+    game.message = 'Pre-Flop: Place your bets.';
+    game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
+    game.actionsCompleted = 0; // Inizializza il contatore delle azioni
+
+    console.log(`Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
+    startTurnTimer(gameId, game.players[0].id);
+    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+  } catch (err) {
+    console.error(`Error in startGame ${gameId}:`, err.message, err.stack);
+    game.message = 'Error starting game. Refunding bets...';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    await refundBetsForGame(gameId);
+  }
+};
+
+const drawCard = () => {
+  const cardNumber = Math.floor(Math.random() * 13) + 1;
+  const suits = ['spades', 'hearts', 'diamonds', 'clubs'];
+  const suitChars = ['S', 'H', 'D', 'C'];
+  const suitIndex = Math.floor(Math.random() * 4);
+  const suit = suits[suitIndex];
+  const suitChar = suitChars[suitIndex];
+  let cardName;
+  if (cardNumber === 1) cardName = 'A';
+  else if (cardNumber === 10) cardName = '0';
+  else if (cardNumber === 11) cardName = 'J';
+  else if (cardNumber === 12) cardName = 'Q';
+  else if (cardNumber === 13) cardName = 'K';
+  else cardName = cardNumber.toString();
+  
+  const value = cardNumber === 1 ? 14 : cardNumber;
+  const image = `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`;
+  
+  console.log(`Drawn card: ${cardName}${suitChar} (Value: ${value}, Suit: ${suit})`);
+  return { value, suit, image };
+};
+
+const advanceGamePhase = async (gameId) => {
+  const game = games[gameId];
+  if (!game) {
+    console.error(`Game ${gameId} not found in advanceGamePhase`);
+    await refundBetsForGame(gameId);
+    return;
+  }
+
+  if (game.status !== 'playing') {
+    console.log(`Game ${gameId} is not in playing state, aborting phase advance`);
+    return;
+  }
+
+  // Cancella qualsiasi timer attivo
+  if (game.turnTimer) {
+    clearTimeout(game.turnTimer);
+    game.turnTimer = null;
+    console.log(`Cleared timer for game ${gameId} before advancing phase`);
+  }
+
+  const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
+  const nextPlayer = game.players.find(p => p.id === game.currentTurn);
+
+  if (!lastPlayer || !nextPlayer) {
+    console.error(`Players not found in game ${gameId}`);
+    await refundBetsForGame(gameId);
+    return;
+  }
+
+  game.actionsCompleted = 0;
+  game.bettingRoundComplete = false;
+
+  if (game.gamePhase === 'pre-flop') {
+    game.message = 'The dealer is dealing the Flop...';
+    game.dealerMessage = 'The dealer is dealing the Flop cards.';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    setTimeout(() => {
+      try {
+        const newCards = Array(3).fill().map(() => drawCard());
+        if (!newCards.every(card => card && card.value && card.suit && card.image)) {
+          throw new Error('Invalid flop cards drawn');
+        }
+        game.tableCards = newCards;
+        game.gamePhase = 'flop';
+        game.message = 'Flop: Place your bets.';
+        game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to Flop, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to flop in game ${gameId}:`, err);
+        game.message = 'Error dealing flop. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        refundBetsForGame(gameId);
+      }
+    }, 1000);
+  } else if (game.gamePhase === 'flop') {
+    game.message = 'The dealer is dealing the Turn...';
+    game.dealerMessage = 'The dealer is dealing the Turn card.';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    setTimeout(() => {
+      try {
+        const newCard = drawCard();
+        if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
+          throw new Error('Invalid turn card drawn');
+        }
+        game.tableCards.push(newCard);
+        game.gamePhase = 'turn';
+        game.message = 'Turn: Place your bets.';
+        game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to turn in game ${gameId}:`, err);
+        game.message = 'Error dealing turn. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        refundBetsForGame(gameId);
+      }
+    }, 1000);
+  } else if (game.gamePhase === 'turn') {
+    game.message = 'The dealer is dealing the River...';
+    game.dealerMessage = 'The dealer is dealing the River card.';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    setTimeout(() => {
+      try {
+        const newCard = drawCard();
+        if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
+          throw new Error('Invalid river card drawn');
+        }
+        game.tableCards.push(newCard);
+        game.gamePhase = 'river';
+        game.message = 'River: Place your bets.';
+        game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+        game.currentTurn = lastPlayer.id;
+        game.currentBet = 0;
+        game.playerBets[lastPlayer.address] = 0;
+        game.playerBets[nextPlayer.address] = 0;
+        console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
+        startTurnTimer(gameId, lastPlayer.id);
+        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      } catch (err) {
+        console.error(`Error advancing to river in game ${gameId}:`, err);
+        game.message = 'Error dealing river. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        refundBetsForGame(gameId);
+      }
+    }, 1000);
+  } else if (game.gamePhase === 'river') {
+    game.gamePhase = 'showdown';
+    game.message = 'Showdown: Evaluating hands...';
+    game.dealerMessage = 'The dealer is evaluating the hands...';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    setTimeout(() => {
+      try {
+        endGame(gameId);
+      } catch (err) {
+        console.error(`Error advancing to showdown in game ${gameId}:`, err);
+        game.message = 'Error evaluating hands. Refunding bets...';
+        io.to(gameId).emit('gameState', removeCircularReferences(game));
+        refundBetsForGame(gameId);
+      }
+    }, 1000);
+  }
+};
+
+const getCombinations = (array, k) => {
+  const result = [];
+  const combine = (start, combo) => {
+    if (combo.length === k) {
+      result.push([...combo]);
       return;
     }
-  
-    if (game.turnTimer) {
-      clearInterval(game.turnTimer);
+    for (let i = start; i < array.length; i++) {
+      combine(i + 1, [...combo, array[i]]);
     }
-  
-    const player1 = game.players[0];
-    const player2 = game.players[1];
-    const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
-    const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
-    const player1Evaluation = evaluatePokerHand(player1Hand);
-    const player2Evaluation = evaluatePokerHand(player2Hand);
-  
-    console.log(`Player 1 (${player1.address}) hand:`, player1Hand);
-    console.log(`Player 1 evaluation:`, player1Evaluation);
-    console.log(`Player 2 (${player2.address}) hand:`, player2Hand);
-    console.log(`Player 2 evaluation:`, player2Evaluation);
-  
-    let winner;
-    let isTie = false;
-    if (player1Evaluation.rank > player2Evaluation.rank) {
-      winner = player1;
-      game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
-      game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
-    } else if (player2Evaluation.rank > player1Evaluation.rank) {
-      winner = player2;
-      game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
-      game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+  };
+  combine(0, []);
+  return result;
+};
+
+const evaluatePokerHand = (hand) => {
+  const combinations = getCombinations(hand, 5);
+  let bestRank = -1;
+  let bestDescription = '';
+  let bestHighCards = [];
+  let bestHand = null;
+
+  for (const combo of combinations) {
+    const values = combo.map(card => card.value).sort((a, b) => b - a);
+    const suits = combo.map(card => card.suit);
+    const isFlush = suits.every(suit => suit === suits[0]);
+    const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
+    const isLowStraight = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
+    const valueCounts = {};
+    values.forEach(val => {
+      valueCounts[val] = (valueCounts[val] || 0) + 1;
+    });
+    const counts = Object.values(valueCounts).sort((a, b) => b - a);
+
+    let rank = -1;
+    let description = '';
+    let highCards = [];
+
+    if (isFlush && (isStraight || isLowStraight)) {
+      rank = 8;
+      description = 'Straight Flush';
+      highCards = isLowStraight ? [5] : [values[0]];
+    } else if (counts[0] === 4) {
+      rank = 7;
+      description = 'Four of a Kind';
+      highCards = [parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 4))];
+    } else if (counts[0] === 3 && counts[1] === 2) {
+      rank = 6;
+      description = 'Full House';
+      highCards = [
+        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
+        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2)),
+      ];
+    } else if (isFlush) {
+      rank = 5;
+      description = 'Flush';
+      highCards = values;
+    } else if (isStraight || isLowStraight) {
+      rank = 4;
+      description = 'Straight';
+      highCards = isLowStraight ? [5] : [values[0]];
+    } else if (counts[0] === 3) {
+      rank = 3;
+      description = 'Three of a Kind';
+      highCards = [
+        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
+        ...values.filter(val => val !== parseInt(Object.keys(valueCounts).find(v => valueCounts[v] === 3))),
+      ];
+    } else if (counts[0] === 2 && counts[1] === 2) {
+      rank = 2;
+      description = 'Two Pair';
+      const pairs = Object.keys(valueCounts).filter(val => valueCounts[val] === 2).map(Number).sort((a, b) => b - a);
+      const kicker = values.find(val => !pairs.includes(val));
+      highCards = [...pairs, kicker];
+    } else if (counts[0] === 2) {
+      rank = 1;
+      description = 'One Pair';
+      const pairValue = parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2));
+      highCards = [
+        pairValue,
+        ...values.filter(val => val !== pairValue),
+      ];
     } else {
-      // Logica per il tie-breaker
-      let tieBreaker = false;
-      for (let i = 0; i < player1Evaluation.highCards.length; i++) {
-        if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
-          winner = player1;
-          game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
-          game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
-          tieBreaker = true;
+      rank = 0;
+      description = 'High Card';
+      highCards = values;
+    }
+
+    if (rank > bestRank) {
+      bestRank = rank;
+      bestDescription = description;
+      bestHighCards = highCards;
+      bestHand = combo;
+    } else if (rank === bestRank) {
+      for (let i = 0; i < bestHighCards.length; i++) {
+        if (bestHighCards[i] < highCards[i]) {
+          bestRank = rank;
+          bestDescription = description;
+          bestHighCards = highCards;
+          bestHand = combo;
           break;
-        } else if (player2Evaluation.highCards[i] > player1Evaluation.highCards[i]) {
-          winner = player2;
-          game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
-          game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
-          tieBreaker = true;
+        } else if (bestHighCards[i] > highCards[i]) {
           break;
         }
       }
-      if (!tieBreaker) {
-        isTie = true;
-        game.message = "It's a tie! The pot is split.";
-        game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
+    }
+  }
+
+  console.log('Best hand:', bestHand);
+  console.log('Best evaluation:', { rank: bestRank, description: bestDescription, highCards: bestHighCards });
+  return { rank: bestRank, description: bestDescription, highCards: bestHighCards };
+};
+
+const endGame = async (gameId) => {
+  const game = games[gameId];
+  if (!game) {
+    console.error(`Game ${gameId} not found in endGame`);
+    await refundBetsForGame(gameId);
+    return;
+  }
+
+  if (game.turnTimer) {
+    clearInterval(game.turnTimer);
+  }
+
+  const player1 = game.players[0];
+  const player2 = game.players[1];
+  const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
+  const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
+  const player1Evaluation = evaluatePokerHand(player1Hand);
+  const player2Evaluation = evaluatePokerHand(player2Hand);
+
+  console.log(`Player 1 (${player1.address}) hand:`, player1Hand);
+  console.log(`Player 1 evaluation:`, player1Evaluation);
+  console.log(`Player 2 (${player2.address}) hand:`, player2Hand);
+  console.log(`Player 2 evaluation:`, player2Evaluation);
+
+  let winner;
+  let isTie = false;
+  if (player1Evaluation.rank > player2Evaluation.rank) {
+    winner = player1;
+    game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+    game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+  } else if (player2Evaluation.rank > player1Evaluation.rank) {
+    winner = player2;
+    game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+    game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+  } else {
+    // Logica per il tie-breaker
+    let tieBreaker = false;
+    for (let i = 0; i < player1Evaluation.highCards.length; i++) {
+      if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
+        winner = player1;
+        game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+        game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+        tieBreaker = true;
+        break;
+      } else if (player2Evaluation.highCards[i] > player1Evaluation.highCards[i]) {
+        winner = player2;
+        game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+        game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+        tieBreaker = true;
+        break;
       }
     }
-  
-    game.status = 'finished';
-    game.opponentCardsVisible = true;
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-  
-    console.log(`Distributing winnings for game ${gameId}:`, { pot: game.pot, isTie });
-  
-    if (isTie) {
-      const splitAmount = game.pot / 2;
-      console.log(`Splitting pot: ${game.pot} COM into ${splitAmount} COM for each player`);
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount, isRefund: false });
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount, isRefund: false });
-      await updateLeaderboard(player1.address, splitAmount);
-      await updateLeaderboard(player2.address, splitAmount);
+    if (!tieBreaker) {
+      isTie = true;
+      game.message = "It's a tie! The pot is split.";
+      game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
+    }
+  }
+
+  game.status = 'finished';
+  game.opponentCardsVisible = true;
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
+
+  console.log(`Distributing winnings for game ${gameId}:`, { pot: game.pot, isTie });
+
+  if (isTie) {
+    const splitAmount = game.pot / 2;
+    console.log(`Splitting pot: ${game.pot} COM into ${splitAmount} COM for each player`);
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount, isRefund: false });
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount, isRefund: false });
+    await updateLeaderboard(player1.address, splitAmount);
+    await updateLeaderboard(player2.address, splitAmount);
+  } else {
+    console.log(`Distributing full pot: ${game.pot} COM to winner ${winner.address}`);
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot, isRefund: false });
+    await updateLeaderboard(winner.address, game.pot);
+  }
+
+  try {
+    await Game.updateOne({ gameId }, { status: 'finished' });
+    await Game.deleteOne({ gameId });
+    console.log(`Deleted game ${gameId} from database`);
+  } catch (err) {
+    console.error(`Error updating/deleting game ${gameId}:`, err);
+  }
+
+  delete games[gameId];
+};
+
+const updateLeaderboard = async (playerAddress, winnings) => {
+  try {
+    console.log(`Updating leaderboard for ${playerAddress} with ${winnings.toFixed(2)} COM`);
+    let player = await Player.findOne({ address: playerAddress });
+    if (!player) {
+      player = new Player({ address: playerAddress, totalWinnings: winnings });
     } else {
-      console.log(`Distributing full pot: ${game.pot} COM to winner ${winner.address}`);
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot, isRefund: false });
-      await updateLeaderboard(winner.address, game.pot);
+      player.totalWinnings += winnings;
     }
-  
-    try {
-      await Game.updateOne({ gameId }, { status: 'finished' });
-      await Game.deleteOne({ gameId });
-      console.log(`Deleted game ${gameId} from database`);
-    } catch (err) {
-      console.error(`Error updating/deleting game ${gameId}:`, err);
-    }
-  
-    delete games[gameId];
-  };
-  
-  const updateLeaderboard = async (playerAddress, winnings) => {
-    try {
-      console.log(`Updating leaderboard for ${playerAddress} with ${winnings.toFixed(2)} COM`);
-      let player = await Player.findOne({ address: playerAddress });
-      if (!player) {
-        player = new Player({ address: playerAddress, totalWinnings: winnings });
-      } else {
-        player.totalWinnings += winnings;
-      }
-      await player.save();
-      console.log(`Leaderboard updated for ${playerAddress}: ${player.totalWinnings.toFixed(2)} COM`);
-    } catch (err) {
-      console.error(`Error updating leaderboard for ${playerAddress}:`, err.message);
-    }
-  };
-  
-  // Gestione dei crash non gestiti
-  process.on('uncaughtException', async (err) => {
-    console.error('Uncaught Exception:', err);
-    await refundAllActiveGames();
-    process.exit(1);
-  });
-  
-  // Gestione delle promesse non gestite
-  process.on('unhandledRejection', async (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    await refundAllActiveGames();
-    process.exit(1);
-  });
-  
-  // Gestione della terminazione del server
-  process.on('SIGTERM', async () => {
-    console.log('Server shutting down...');
-    await refundAllActiveGames();
-    server.close(() => {
-      mongoose.connection.close(() => {
-        console.log('MongoDB connection closed');
-        process.exit(0);
-      });
+    await player.save();
+    console.log(`Leaderboard updated for ${playerAddress}: ${player.totalWinnings.toFixed(2)} COM`);
+  } catch (err) {
+    console.error(`Error updating leaderboard for ${playerAddress}:`, err.message);
+  }
+};
+
+// Gestione dei crash non gestiti
+process.on('uncaughtException', async (err) => {
+  console.error('Uncaught Exception:', err);
+  await refundAllActiveGames();
+  process.exit(1);
+});
+
+// Gestione delle promesse non gestite
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  await refundAllActiveGames();
+  process.exit(1);
+});
+
+// Gestione della terminazione del server
+process.on('SIGTERM', async () => {
+  console.log('Server shutting down...');
+  await refundAllActiveGames();
+  server.close(() => {
+    mongoose.connection.close(() => {
+      console.log('MongoDB connection closed');
+      process.exit(0);
     });
   });
-  
-  const PORT = process.env.PORT || 3001;
-  console.log(`PORT environment variable: ${process.env.PORT}`);
-  server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+});
+
+const PORT = process.env.PORT || 3001;
+console.log(`PORT environment variable: ${process.env.PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
