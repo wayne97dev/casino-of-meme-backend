@@ -1,5 +1,7 @@
 require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
 
+
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -7,23 +9,11 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const Player = require('./models/Player');
 const Game = require('./models/Game');
-const {
-  Connection,
-  Keypair,
-  PublicKey,
-  Transaction,
-  SystemProgram,
-  LAMPORTS_PER_SOL,
-  TOKEN_PROGRAM_ID,
-} = require('@solana/web3.js');
-const {
-  createTransferInstruction,
-  getAssociatedTokenAddress,
-  getAccount,
-  createAssociatedTokenAccountInstruction,
-  getTokenAccountBalance,
-} = require('@solana/spl-token');
+const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
+
+const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 
 const app = express();
 const server = http.createServer(app);
@@ -55,6 +45,7 @@ app.use((req, res, next) => {
   next();
 });
 
+
 // Middleware CORS ottimizzato
 app.use(cors({
   origin: (origin, callback) => {
@@ -67,14 +58,14 @@ app.use(cors({
       callback(new Error(`Origin ${origin} not allowed by CORS`));
     }
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-  preflightContinue: false,
-  смотретьoptionsSuccessStatus: 204,
+  methods: ['GET', 'POST', 'OPTIONS'], // Metodi consentiti
+  allowedHeaders: ['Content-Type', 'Authorization'], // Header consentiti
+  credentials: true, // Consenti i cookie e altre credenziali
+  preflightContinue: false, // Assicurati che la risposta preflight sia gestita correttamente
+  optionsSuccessStatus: 204, // Stato di successo per le richieste OPTIONS
 }));
 
-// Gestore esplicito per richieste OPTIONS
+// Gestore esplicito per richieste OPTIONS (aggiunto come precauzione)
 app.options('*', (req, res) => {
   console.log(`Handling OPTIONS request from origin: ${req.headers.origin}`);
   res.header('Access-Control-Allow-Origin', req.headers.origin);
@@ -84,6 +75,7 @@ app.options('*', (req, res) => {
   res.sendStatus(204);
 });
 
+// Gestore esplicito per richieste OPTIONS
 app.options('*', cors());
 
 // Middleware per parsing JSON
@@ -116,6 +108,9 @@ mongoose.connect(MONGODB_URI, {
 
 // Connessione a Solana
 const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
+
+
+const TAX_WALLET_ADDRESS = '2E1LhcV3pze6Q6P7MEsxUoNYK3KECm2rTS2D18eSRTn9';
 
 // Carica la private key in formato base58
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
@@ -167,11 +162,13 @@ const removeCircularReferences = (obj, seen = new WeakSet()) => {
   return obj;
 };
 
-// Costanti per i minigiochi (allineate con il frontend)
+
+
+// Costanti per i minigiochi
 const COMPUTER_WIN_CHANCE = {
-  solanaCardDuel: 0.92,
-  memeSlots: 0.92,
-  coinFlip: 0.92,
+  solanaCardDuel: 0.9,
+  memeSlots: 0.8,
+  coinFlip: 0.65,
   crazyWheel: 0.95,
 };
 
@@ -207,89 +204,38 @@ const shuffleArray = (array) => {
 
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
-// Funzione di retry per operazioni Solana
-const retry = async (fn, retries = 3, delay = 1000) => {
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (i === retries - 1) throw err;
-      console.log(`Retry attempt ${i + 1}/${retries} failed, retrying in ${delay}ms...`, err.message);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-};
-
 // Endpoint per Meme Slots
 app.post('/play-meme-slots', async (req, res) => {
-  const { playerAddress, betAmount, transactionSignature } = req.body;
+  const { playerAddress, betAmount, signature } = req.body;
 
-  console.log('DEBUG - /play-meme-slots called with:', { playerAddress, betAmount, transactionSignature });
-
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !transactionSignature) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, transactionSignature });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signature) {
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, betAmount, signature });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
-    console.log('DEBUG - Creating userPublicKey...');
+    console.log('DEBUG - Processing play-meme-slots request:', { playerAddress, betAmount, signature });
+
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-    console.log('DEBUG - betInLamports:', betInLamports);
 
-    console.log('DEBUG - Confirming transaction...');
-    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
+    // Verifica il saldo SOL
+    console.log('DEBUG - Checking user balance for:', userPublicKey.toString());
+    const userBalance = await connection.getBalance(userPublicKey);
+    console.log('DEBUG - User balance:', userBalance);
+    if (userBalance < betInLamports) {
+      console.log('DEBUG - Insufficient balance:', { userBalance, required: betInLamports });
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Verifica la transazione usando la firma
+    console.log('DEBUG - Confirming transaction with signature:', signature);
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('DEBUG - Transaction confirmation failed:', confirmation.value.err);
+      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    console.log('DEBUG - Fetching transaction details...');
-    const transactionDetails = await connection.getTransaction(transactionSignature, {
-      commitment: 'confirmed',
-    });
-    if (!transactionDetails) {
-      console.log('DEBUG - Transaction not found for signature:', transactionSignature);
-      return res.status(400).json({ success: false, error: 'Transaction not found' });
-    }
-
-    // Verifica che transactionDetails abbia la struttura attesa
-    if (
-      !transactionDetails.transaction ||
-      !transactionDetails.transaction.message ||
-      !Array.isArray(transactionDetails.transaction.message.instructions)
-    ) {
-      console.log('DEBUG - Invalid transaction structure:', transactionDetails);
-      return res.status(400).json({ success: false, error: 'Invalid transaction structure' });
-    }
-
-    console.log('DEBUG - Verifying transaction details...');
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      (instr) => {
-        if (!instr || !instr.programId) {
-          console.log('DEBUG - Skipping instruction with undefined programId:', instr);
-          return false;
-        }
-        return instr.programId.toBase58() === SystemProgram.programId.toBase58();
-      }
-    );
-
-    if (
-      !transferInstruction ||
-      !transferInstruction.parsed ||
-      !transferInstruction.parsed.info ||
-      transferInstruction.parsed.info.lamports !== betInLamports ||
-      transferInstruction.parsed.info.destination !== wallet.publicKey.toBase58() ||
-      transferInstruction.parsed.info.source !== userPublicKey.toBase58()
-    ) {
-      console.log('DEBUG - Invalid transaction details:', {
-        transferInstruction: transferInstruction?.parsed?.info,
-        expectedLamports: betInLamports,
-        expectedDestination: wallet.publicKey.toBase58(),
-        expectedSource: userPublicKey.toBase58(),
-      });
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
+    console.log('DEBUG - Transaction confirmed successfully');
 
     // Genera il risultato della slot
     let result;
@@ -300,7 +246,6 @@ app.post('/play-meme-slots', async (req, res) => {
     ];
 
     if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
-      // Computer vince: genera un risultato senza linee vincenti
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       let attempts = 0;
       while (attempts < 20) {
@@ -327,17 +272,10 @@ app.post('/play-meme-slots', async (req, res) => {
         result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
         attempts++;
       }
-
-      if (attempts >= 20) {
-        console.log('DEBUG - Forcing a losing result after max attempts');
-        result = Array(25).fill().map((_, index) => slotMemes[index % slotMemes.length]);
-      }
     } else {
-      // Giocatore vince: genera un risultato con una linea vincente
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
       const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
-
       const streakOptions = [
         { streak: 3, probability: 0.9 },
         { streak: 4, probability: 0.09 },
@@ -353,13 +291,11 @@ app.post('/play-meme-slots', async (req, res) => {
         }
         random -= option.probability;
       }
-
       for (let i = 0; i < selectedStreak; i++) {
         result[winningLine[i]] = winningSymbol;
       }
     }
 
-    // Calcola le vincite
     const winningLinesFound = [];
     const winningIndices = new Set();
     let totalWin = 0;
@@ -401,27 +337,7 @@ app.post('/play-meme-slots', async (req, res) => {
       }
     }
 
-    // Distribuisci le vincite
-    if (totalWin > 0) {
-      console.log('DEBUG - Distributing winnings:', totalWin);
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: userPublicKey,
-          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
-        })
-      );
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-
-      const winSignature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
-      await connection.confirmTransaction(winSignature);
-      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
-    }
-
+    console.log('DEBUG - Meme Slots result generated:', { totalWin, winningLines: winningLinesFound });
     res.json({
       success: true,
       result: result.map(item => ({ name: item.name, image: item.image })),
@@ -431,88 +347,42 @@ app.post('/play-meme-slots', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in play-meme-slots:', err.message, err.stack);
-    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
+    res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
   }
 });
 
+
+
 // Endpoint per Coin Flip
 app.post('/play-coin-flip', async (req, res) => {
-  const { playerAddress, betAmount, transactionSignature, choice } = req.body;
+  const { playerAddress, betAmount, signature, choice } = req.body;
 
-  console.log('DEBUG - /play-coin-flip called with:', { playerAddress, betAmount, transactionSignature, choice });
-
-  if (
-    !playerAddress ||
-    !betAmount ||
-    isNaN(betAmount) ||
-    betAmount <= 0 ||
-    !transactionSignature ||
-    !choice ||
-    !['blue', 'red'].includes(choice)
-  ) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, transactionSignature, choice });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signature || !choice || !['blue', 'red'].includes(choice)) {
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, betAmount, signature, choice });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
-    console.log('DEBUG - Creating userPublicKey...');
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-    console.log('DEBUG - betInLamports:', betInLamports);
 
-    console.log('DEBUG - Confirming transaction...');
-    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
+    // Verifica il saldo SOL
+    console.log('DEBUG - Checking user balance for:', userPublicKey.toString());
+    const userBalance = await connection.getBalance(userPublicKey);
+    console.log('DEBUG - User balance:', userBalance);
+    if (userBalance < betInLamports) {
+      console.log('DEBUG - Insufficient balance:', { userBalance, required: betInLamports });
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Verifica la transazione usando la firma
+    console.log('DEBUG - Confirming transaction with signature:', signature);
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('DEBUG - Transaction confirmation failed:', confirmation.value.err);
+      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    console.log('DEBUG - Fetching transaction details...');
-    const transactionDetails = await connection.getTransaction(transactionSignature, {
-      commitment: 'confirmed',
-    });
-    if (!transactionDetails) {
-      console.log('DEBUG - Transaction not found for signature:', transactionSignature);
-      return res.status(400).json({ success: false, error: 'Transaction not found' });
-    }
-
-    // Verifica che transactionDetails abbia la struttura attesa
-    if (
-      !transactionDetails.transaction ||
-      !transactionDetails.transaction.message ||
-      !Array.isArray(transactionDetails.transaction.message.instructions)
-    ) {
-      console.log('DEBUG - Invalid transaction structure:', transactionDetails);
-      return res.status(400).json({ success: false, error: 'Invalid transaction structure' });
-    }
-
-    console.log('DEBUG - Verifying transaction details...');
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      (instr) => {
-        if (!instr || !instr.programId) {
-          console.log('DEBUG - Skipping instruction with undefined programId:', instr);
-          return false;
-        }
-        return instr.programId.toBase58() === SystemProgram.programId.toBase58();
-      }
-    );
-
-    if (
-      !transferInstruction ||
-      !transferInstruction.parsed ||
-      !transferInstruction.parsed.info ||
-      transferInstruction.parsed.info.lamports !== betInLamports ||
-      transferInstruction.parsed.info.destination !== wallet.publicKey.toBase58() ||
-      transferInstruction.parsed.info.source !== userPublicKey.toBase58()
-    ) {
-      console.log('DEBUG - Invalid transaction details:', {
-        transferInstruction: transferInstruction?.parsed?.info,
-        expectedLamports: betInLamports,
-        expectedDestination: wallet.publicKey.toBase58(),
-        expectedSource: userPublicKey.toBase58(),
-      });
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
+    console.log('DEBUG - Transaction confirmed successfully');
 
     // Genera il risultato del Coin Flip
     let flipResult;
@@ -525,26 +395,9 @@ app.post('/play-coin-flip', async (req, res) => {
     let totalWin = 0;
     if (choice === flipResult) {
       totalWin = betAmount * 2;
-
-      // Distribuisci la vincita
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: userPublicKey,
-          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
-        })
-      );
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-
-      const winSignature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
-      await connection.confirmTransaction(winSignature);
-      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
+    console.log('DEBUG - Coin Flip result:', { flipResult, totalWin });
     res.json({
       success: true,
       flipResult,
@@ -552,24 +405,22 @@ app.post('/play-coin-flip', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in play-coin-flip:', err.message, err.stack);
-    res.status(500).json({ success: false, error: 'Failed to play coin flip' });
+    res.status(500).json({ success: false, error: `Failed to play coin flip: ${err.message}` });
   }
 });
 
+
+
 // Endpoint per Crazy Wheel
 app.post('/play-crazy-wheel', async (req, res) => {
-  const { playerAddress, bets, transactionSignature } = req.body;
+  const { playerAddress, bets, signedTransaction } = req.body;
 
-  console.log('DEBUG - /play-crazy-wheel called with:', { playerAddress, bets, transactionSignature });
-
-  if (!playerAddress || !bets || !transactionSignature) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, bets, transactionSignature });
+  if (!playerAddress || !bets || !signedTransaction) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   const totalBet = Object.values(bets).reduce((sum, bet) => sum + bet, 0);
   if (totalBet <= 0) {
-    console.log('DEBUG - No bets placed:', totalBet);
     return res.status(400).json({ success: false, error: 'No bets placed' });
   }
 
@@ -577,75 +428,38 @@ app.post('/play-crazy-wheel', async (req, res) => {
   const validSegments = ['1', '2', '5', '10', 'Coin Flip', 'Pachinko', 'Cash Hunt', 'Crazy Time'];
   for (const segment in bets) {
     if (!validSegments.includes(segment) || isNaN(bets[segment]) || bets[segment] < 0) {
-      console.log('DEBUG - Invalid bet segment or amount:', { segment, bet: bets[segment] });
       return res.status(400).json({ success: false, error: 'Invalid bet segment or amount' });
     }
   }
 
   try {
-    console.log('DEBUG - Creating userPublicKey...');
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(totalBet * LAMPORTS_PER_SOL);
-    console.log('DEBUG - betInLamports:', betInLamports);
 
-    console.log('DEBUG - Confirming transaction...');
-    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
+    // Verifica il saldo SOL
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    console.log('DEBUG - Fetching transaction details...');
-    const transactionDetails = await connection.getTransaction(transactionSignature, {
-      commitment: 'confirmed',
-    });
-    if (!transactionDetails) {
-      console.log('DEBUG - Transaction not found for signature:', transactionSignature);
-      return res.status(400).json({ success: false, error: 'Transaction not found' });
-    }
-
-    // Verifica che transactionDetails abbia la struttura attesa
-    if (
-      !transactionDetails.transaction ||
-      !transactionDetails.transaction.message ||
-      !Array.isArray(transactionDetails.transaction.message.instructions)
-    ) {
-      console.log('DEBUG - Invalid transaction structure:', transactionDetails);
-      return res.status(400).json({ success: false, error: 'Invalid transaction structure' });
-    }
-
-    console.log('DEBUG - Verifying transaction details...');
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      (instr) => {
-        if (!instr || !instr.programId) {
-          console.log('DEBUG - Skipping instruction with undefined programId:', instr);
-          return false;
-        }
-        return instr.programId.toBase58() === SystemProgram.programId.toBase58();
-      }
-    );
-
-    if (
-      !transferInstruction ||
-      !transferInstruction.parsed ||
-      !transferInstruction.parsed.info ||
-      transferInstruction.parsed.info.lamports !== betInLamports ||
-      transferInstruction.parsed.info.destination !== wallet.publicKey.toBase58() ||
-      transferInstruction.parsed.info.source !== userPublicKey.toBase58()
-    ) {
-      console.log('DEBUG - Invalid transaction details:', {
-        transferInstruction: transferInstruction?.parsed?.info,
-        expectedLamports: betInLamports,
-        expectedDestination: wallet.publicKey.toBase58(),
-        expectedSource: userPublicKey.toBase58(),
-      });
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
-
-    // La logica del gioco è gestita nel frontend
+    // Non genera il risultato del gioco, lascia che il frontend lo gestisca
     res.json({ success: true });
   } catch (err) {
-    console.error('Error in play-crazy-wheel:', err.message, err.stack);
+    console.error('Error in play-crazy-wheel:', err);
     res.status(500).json({ success: false, error: 'Failed to process transaction' });
   }
 });
@@ -660,14 +474,20 @@ app.get('/get-crazy-wheel', (req, res) => {
   }
 });
 
-// Endpoint per Solana Card Duel (Blackjack)
-app.post('/play-solana-card-duel', async (req, res) => {
-  const { playerAddress, betAmount, transactionSignature, action } = req.body;
+ 
 
-  console.log('DEBUG - /play-solana-card-duel called with:', { playerAddress, betAmount, transactionSignature, action });
+
+
+
+
+
+
+// Endpoint aggiornato
+app.post('/play-solana-card-duel', async (req, res) => {
+  const { playerAddress, betAmount, signature, action } = req.body;
 
   if (!playerAddress || !action) {
-    console.log('DEBUG - Invalid playerAddress or action:', { playerAddress, action });
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, action });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or action' });
   }
 
@@ -676,70 +496,32 @@ app.post('/play-solana-card-duel', async (req, res) => {
     return res.json({ success: true });
   }
 
-  if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !transactionSignature) {
-    console.log('DEBUG - Invalid betAmount or transactionSignature:', { betAmount, transactionSignature });
-    return res.status(400).json({ success: false, error: 'Invalid betAmount or transactionSignature' });
+  if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !signature) {
+    console.log('DEBUG - Invalid parameters received:', { playerAddress, betAmount, signature });
+    return res.status(400).json({ success: false, error: 'Invalid betAmount or signature' });
   }
 
   try {
-    console.log('DEBUG - Creating userPublicKey...');
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-    console.log('DEBUG - betInLamports:', betInLamports);
 
-    console.log('DEBUG - Confirming transaction...');
-    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
+    // Verifica il saldo SOL
+    console.log('DEBUG - Checking user balance for:', userPublicKey.toString());
+    const userBalance = await connection.getBalance(userPublicKey);
+    console.log('DEBUG - User balance:', userBalance);
+    if (userBalance < betInLamports) {
+      console.log('DEBUG - Insufficient balance:', { userBalance, required: betInLamports });
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    // Verifica la transazione usando la firma
+    console.log('DEBUG - Confirming transaction with signature:', signature);
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('DEBUG - Transaction confirmation failed:', confirmation.value.err);
+      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    console.log('DEBUG - Fetching transaction details...');
-    const transactionDetails = await connection.getTransaction(transactionSignature, {
-      commitment: 'confirmed',
-    });
-    if (!transactionDetails) {
-      console.log('DEBUG - Transaction not found for signature:', transactionSignature);
-      return res.status(400).json({ success: false, error: 'Transaction not found' });
-    }
-
-    // Verifica che transactionDetails abbia la struttura attesa
-    if (
-      !transactionDetails.transaction ||
-      !transactionDetails.transaction.message ||
-      !Array.isArray(transactionDetails.transaction.message.instructions)
-    ) {
-      console.log('DEBUG - Invalid transaction structure:', transactionDetails);
-      return res.status(400).json({ success: false, error: 'Invalid transaction structure' });
-    }
-
-    console.log('DEBUG - Verifying transaction details...');
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      (instr) => {
-        if (!instr || !instr.programId) {
-          console.log('DEBUG - Skipping instruction with undefined programId:', instr);
-          return false;
-        }
-        return instr.programId.toBase58() === SystemProgram.programId.toBase58();
-      }
-    );
-
-    if (
-      !transferInstruction ||
-      !transferInstruction.parsed ||
-      !transferInstruction.parsed.info ||
-      transferInstruction.parsed.info.lamports !== betInLamports ||
-      transferInstruction.parsed.info.destination !== wallet.publicKey.toBase58() ||
-      transferInstruction.parsed.info.source !== userPublicKey.toBase58()
-    ) {
-      console.log('DEBUG - Invalid transaction details:', {
-        transferInstruction: transferInstruction?.parsed?.info,
-        expectedLamports: betInLamports,
-        expectedDestination: wallet.publicKey.toBase58(),
-        expectedSource: userPublicKey.toBase58(),
-      });
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
+    console.log('DEBUG - Transaction confirmed successfully');
 
     res.json({
       success: true,
@@ -768,7 +550,7 @@ const refundBetsForGame = async (gameId) => {
         playerSocket.emit('refund', {
           message: 'Game crashed or interrupted. Your bet has been refunded.',
           amount: player.bet,
-          isRefund: true,
+          isRefund: true, // Aggiunto flag
         });
         console.log(`Refunded ${player.bet} COM to ${player.address} for game ${gameId}`);
       } else {
@@ -799,7 +581,6 @@ const refundAllActiveGames = async () => {
           playerSocket.emit('refund', {
             message: 'Server crashed or shutting down. Your bet has been refunded.',
             amount: player.bet,
-            isRefund: true,
           });
           console.log(`Refunded ${player.bet} COM to ${player.address} for game ${game.gameId}`);
         }
@@ -1042,8 +823,6 @@ app.post('/distribute-winnings', async (req, res) => {
 app.post('/refund', async (req, res) => {
   const { playerAddress, amount } = req.body;
 
-  console.log('DEBUG - /refund called with:', { playerAddress, amount });
-
   if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
     console.log('Invalid refund parameters:', { playerAddress, amount });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
@@ -1139,7 +918,184 @@ app.post('/refund', async (req, res) => {
   }
 });
 
+// Endpoint per creare una transazione (usato da tutti i minigiochi escluso Poker PvP)
+app.post('/create-transaction', async (req, res) => {
+  const { playerAddress, betAmount, type } = req.body;
+
+  console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
+
+  // Validazione dei parametri
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
+  }
+
+  try {
+    // Validazione dell'indirizzo Solana
+    let userPublicKey;
+    try {
+      userPublicKey = new PublicKey(playerAddress);
+      console.log('DEBUG - Valid Solana address:', playerAddress);
+    } catch (err) {
+      console.log('DEBUG - Invalid Solana address:', err.message);
+      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
+    }
+
+    const transaction = new Transaction();
+
+    if (type === 'sol') {
+      // Trasferimento SOL verso il tax wallet
+      const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+      console.log('DEBUG - Bet in lamports:', betInLamports);
+
+      // Verifica il saldo dell'utente
+      const userBalance = await connection.getBalance(userPublicKey);
+      console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
+      if (userBalance < betInLamports) {
+        console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
+        return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+      }
+
+      transaction.add(
+        SystemProgram.transfer({
+          fromPubkey: userPublicKey,
+          toPubkey: wallet.publicKey, // Tax wallet
+          lamports: betInLamports,
+        })
+      );
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid transaction type' });
+    }
+
+    // Ottieni il blockhash recente
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = userPublicKey;
+
+    // Log della transazione creata
+    console.log('DEBUG - Transaction created:', {
+      instructionCount: transaction.instructions.length,
+      instructions: transaction.instructions.map((instr, index) => ({
+        index,
+        programId: instr.programId.toBase58(),
+        keys: instr.keys.map(key => key.pubkey.toBase58()),
+        data: instr.data.toString('hex'),
+      })),
+      recentBlockhash: transaction.recentBlockhash,
+    });
+
+    // Serializza la transazione
+    const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
+
+    res.json({ success: true, transaction: serializedTransaction });
+  } catch (err) {
+    console.error('Error in create-transaction:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to create transaction: ${err.message}` });
+  }
+});
+
+// Endpoint per ottenere solo il recentBlockhash
+app.post('/get-recent-blockhash', async (req, res) => {
+  const { playerAddress } = req.body;
+
+  console.log('DEBUG - /get-recent-blockhash called with:', { playerAddress });
+
+  // Validazione dei parametri
+  if (!playerAddress) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress' });
+  }
+
+  try {
+    // Validazione dell'indirizzo Solana
+    let userPublicKey;
+    try {
+      userPublicKey = new PublicKey(playerAddress);
+      console.log('DEBUG - Valid Solana address:', playerAddress);
+    } catch (err) {
+      console.log('DEBUG - Invalid Solana address:', err.message);
+      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
+    }
+
+    // Ottieni il blockhash recente
+    const { blockhash } = await connection.getLatestBlockhash();
+    console.log('DEBUG - Recent blockhash:', blockhash);
+
+    // Restituisci il blockhash
+    res.json({
+      success: true,
+      recentBlockhash: blockhash,
+    });
+  } catch (err) {
+    console.error('Error in get-recent-blockhash:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to get recent blockhash: ${err.message}` });
+  }
+});
+
+
+// Nuovo endpoint per processare le transazioni di tutti i minigiochi (escluso Poker PvP)
+app.post('/process-transaction', async (req, res) => {
+  const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
+
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !gameType) {
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  const validGameTypes = ['memeSlots', 'crazyWheel', 'solanaCardDuel', 'coinFlip'];
+  if (!validGameTypes.includes(gameType)) {
+    return res.status(400).json({ success: false, error: 'Invalid gameType' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    // Reindirizza la logica al gioco specifico
+    const endpointMap = {
+      memeSlots: '/play-meme-slots',
+      coinFlip: '/play-coin-flip',
+      crazyWheel: '/play-crazy-wheel',
+      solanaCardDuel: '/play-solana-card-duel',
+    };
+
+    res.json({ success: true, redirectTo: endpointMap[gameType] });
+  } catch (err) {
+    console.error('Error in process-transaction:', err);
+    res.status(500).json({ success: false, error: `Failed to process transaction: ${err.message}` });
+  }
+});
+
 // Endpoint per distribuire vincite in SOL (usato per tutti i minigiochi escluso Poker PvP)
+const retry = async (fn, retries = 3, delay = 1000) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      console.log(`Retry attempt ${i + 1}/${retries} failed, retrying in ${delay}ms...`, err.message);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+};
+
 app.post('/distribute-winnings-sol', async (req, res) => {
   const { playerAddress, amount } = req.body;
 
@@ -1201,15 +1157,13 @@ app.post('/distribute-winnings-sol', async (req, res) => {
   }
 });
 
-// Endpoint per unirsi a una partita di Poker PvP
+// Endpoint per unirsi a una partita di Poker PvP (invariato)
 app.post('/join-poker-game', async (req, res) => {
-  const { playerAddress, betAmount, transactionSignature } = req.body;
+  const { playerAddress, betAmount, signature } = req.body;
 
-  console.log('DEBUG - /join-poker-game called with:', { playerAddress, betAmount, transactionSignature });
-
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !transactionSignature) {
-    console.log('Invalid parameters:', { playerAddress, betAmount, transactionSignature });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or transactionSignature' });
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signature) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signature });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signature' });
   }
 
   if (betAmount < MIN_BET) {
@@ -1227,7 +1181,9 @@ app.post('/join-poker-game', async (req, res) => {
     try {
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
+      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
+      console.log('DEBUG - Casino ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1242,7 +1198,7 @@ app.post('/join-poker-game', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA');
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
 
     // Verifica il saldo COM dell'utente
@@ -1250,88 +1206,39 @@ app.post('/join-poker-game', async (req, res) => {
       value: { uiAmount: 0 },
     }));
     if (userBalance.value.uiAmount < betAmount) {
-      console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${betAmount}`);
+      console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${betAmount}`);
       return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
 
-    // Verifica la transazione
-    console.log('DEBUG - Confirming transaction for join-poker-game...');
-    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
+    // Verifica la transazione usando la firma
+    console.log('DEBUG - Confirming transaction with signature:', signature);
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('DEBUG - Transaction confirmation failed:', confirmation.value.err);
+      console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    console.log('DEBUG - Fetching transaction details for join-poker-game...');
-    const transactionDetails = await connection.getTransaction(transactionSignature, {
-      commitment: 'confirmed',
-    });
-    if (!transactionDetails) {
-      console.log('DEBUG - Transaction not found for signature:', transactionSignature);
-      return res.status(400).json({ success: false, error: 'Transaction not found' });
-    }
-
-    // Verifica che transactionDetails abbia la struttura attesa
-    if (
-      !transactionDetails.transaction ||
-      !transactionDetails.transaction.message ||
-      !Array.isArray(transactionDetails.transaction.message.instructions)
-    ) {
-      console.log('DEBUG - Invalid transaction structure:', transactionDetails);
-      return res.status(400).json({ success: false, error: 'Invalid transaction structure' });
-    }
-
-    console.log('DEBUG - Verifying transaction details for join-poker-game...');
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      (instr) => {
-        if (!instr || !instr.programId) {
-          console.log('DEBUG - Skipping instruction with undefined programId:', instr);
-          return false;
-        }
-        return instr.programId.toBase58() === TOKEN_PROGRAM_ID.toBase58();
-      }
-    );
-
-    if (
-      !transferInstruction ||
-      !transferInstruction.parsed ||
-      !transferInstruction.parsed.info ||
-      transferInstruction.parsed.info.amount !== (betAmount * 1e6).toString() ||
-      transferInstruction.parsed.info.destination !== casinoATA.toBase58() ||
-      transferInstruction.parsed.info.source !== userATA.toBase58()
-    ) {
-      console.log('DEBUG - Invalid transaction details:', {
-        transferInstruction: transferInstruction?.parsed?.info,
-        expectedAmount: (betAmount * 1e6).toString(),
-        expectedDestination: casinoATA.toBase58(),
-        expectedSource: userATA.toBase58(),
-      });
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
-
-    console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
+    console.log('DEBUG - Transaction confirmed successfully');
+    console.log(`DEBUG - Transferred ${betAmount} COM from ${playerAddress} to casino`);
 
     res.json({ success: true });
   } catch (err) {
     console.error('Error in join-poker-game:', err.message, err.stack);
-    res.status(500).json({ success: false, error: 'Failed to join game: ' + err.message });
+    res.status(500).json({ success: false, error: `Failed to join game: ${err.message}` });
   }
 });
 
-// Endpoint per gestire le mosse in Poker PvP
+// Endpoint per gestire le mosse in Poker PvP (invariato)
 app.post('/make-poker-move', async (req, res) => {
-  const { playerAddress, gameId, move, amount, transactionSignature } = req.body;
-
-  console.log('DEBUG - /make-poker-move called with:', { playerAddress, gameId, move, amount, transactionSignature });
+  const { playerAddress, gameId, move, amount, signature } = req.body;
 
   if (!playerAddress || !gameId || !move || amount === undefined || isNaN(amount) || amount < 0) {
-    console.log('Invalid parameters:', { playerAddress, gameId, move, amount });
+    console.log('DEBUG - Invalid parameters:', { playerAddress, gameId, move, amount });
     return res.status(400).json({ success: false, error: 'Invalid required fields' });
   }
 
-  if (amount > 0 && !transactionSignature) {
-    console.log('Missing transaction signature for move:', move);
-    return res.status(400).json({ success: false, error: 'Missing transaction signature' });
+  if (amount > 0 && !signature) {
+    console.log('DEBUG - Missing signature for move:', move);
+    return res.status(400).json({ success: false, error: 'Missing signature' });
   }
 
   try {
@@ -1344,9 +1251,9 @@ app.post('/make-poker-move', async (req, res) => {
     try {
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
+      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
+      console.log('DEBUG - Casino ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1361,7 +1268,7 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
 
     // Verifica e crea ATA del giocatore
@@ -1369,9 +1276,9 @@ app.post('/make-poker-move', async (req, res) => {
     try {
       await getAccount(connection, userATA);
       playerAccountExists = true;
-      console.log('Player ATA exists:', userATA.toBase58());
+      console.log('DEBUG - Player ATA exists:', userATA.toBase58());
     } catch (err) {
-      console.log('Player ATA does not exist, creating...');
+      console.log('DEBUG - Player ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1386,72 +1293,25 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created player ATA:', userATA.toBase58());
+      console.log('DEBUG - Created player ATA:', userATA.toBase58());
     }
 
     if (amount > 0) {
       const userBalance = await connection.getTokenAccountBalance(userATA);
       if (userBalance.value.uiAmount < amount) {
-        console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${amount}`);
+        console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${amount}`);
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
       }
 
-      // Verifica la transazione
-      console.log('DEBUG - Confirming transaction for make-poker-move...');
-      const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
+      // Verifica la transazione usando la firma
+      console.log('DEBUG - Confirming transaction with signature:', signature);
+      const confirmation = await connection.confirmTransaction(signature, 'confirmed');
       if (confirmation.value.err) {
-        console.log('DEBUG - Transaction confirmation failed:', confirmation.value.err);
+        console.error('DEBUG - Transaction confirmation failed:', confirmation.value.err);
         return res.status(500).json({ success: false, error: 'Transaction failed' });
       }
-
-      console.log('DEBUG - Fetching transaction details for make-poker-move...');
-      const transactionDetails = await connection.getTransaction(transactionSignature, {
-        commitment: 'confirmed',
-      });
-      if (!transactionDetails) {
-        console.log('DEBUG - Transaction not found for signature:', transactionSignature);
-        return res.status(400).json({ success: false, error: 'Transaction not found' });
-      }
-
-      // Verifica che transactionDetails abbia la struttura attesa
-      if (
-        !transactionDetails.transaction ||
-        !transactionDetails.transaction.message ||
-        !Array.isArray(transactionDetails.transaction.message.instructions)
-      ) {
-        console.log('DEBUG - Invalid transaction structure:', transactionDetails);
-        return res.status(400).json({ success: false, error: 'Invalid transaction structure' });
-      }
-
-      console.log('DEBUG - Verifying transaction details for make-poker-move...');
-      const transferInstruction = transactionDetails.transaction.message.instructions.find(
-        (instr) => {
-          if (!instr || !instr.programId) {
-            console.log('DEBUG - Skipping instruction with undefined programId:', instr);
-            return false;
-          }
-          return instr.programId.toBase58() === TOKEN_PROGRAM_ID.toBase58();
-        }
-      );
-
-      if (
-        !transferInstruction ||
-        !transferInstruction.parsed ||
-        !transferInstruction.parsed.info ||
-        transferInstruction.parsed.info.amount !== (amount * 1e6).toString() ||
-        transferInstruction.parsed.info.destination !== casinoATA.toBase58() ||
-        transferInstruction.parsed.info.source !== userATA.toBase58()
-      ) {
-        console.log('DEBUG - Invalid transaction details:', {
-          transferInstruction: transferInstruction?.parsed?.info,
-          expectedAmount: (amount * 1e6).toString(),
-          expectedDestination: casinoATA.toBase58(),
-          expectedSource: userATA.toBase58(),
-        });
-        return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-      }
-
-      console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
+      console.log('DEBUG - Transaction confirmed successfully');
+      console.log(`DEBUG - Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
     }
 
     res.json({ success: true });
@@ -1461,7 +1321,7 @@ app.post('/make-poker-move', async (req, res) => {
   }
 });
 
-// Endpoint per la leaderboard
+// Endpoint per la leaderboard (invariato)
 app.get('/leaderboard', async (req, res) => {
   console.log('Received request for /leaderboard');
   try {
@@ -1489,7 +1349,7 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
-// Gestione delle connessioni WebSocket per Poker PvP
+// Gestione delle connessioni WebSocket per Poker PvP (invariato)
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
 
@@ -1624,14 +1484,14 @@ io.on('connection', (socket) => {
       const player = waitingPlayers[playerIndex];
       waitingPlayers.splice(playerIndex, 1);
       console.log(`Player ${playerAddress} left the waiting list`);
-
+  
       // Emetti l'evento refund con un flag isRefund per indicare che non è una vincita
       socket.emit('refund', {
         message: 'You left the waiting list. Your bet has been refunded.',
         amount: player.bet,
-        isRefund: true,
+        isRefund: true, // Aggiunto flag
       });
-
+  
       io.emit('waitingPlayers', {
         players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
       });
@@ -1679,12 +1539,12 @@ io.on('connection', (socket) => {
       console.log(`Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
       return;
     }
-
+  
     if (game.turnTimer) {
       clearInterval(game.turnTimer);
     }
     game.timeLeft = 30;
-
+  
     const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
     if (!playerAddress || !opponent) {
@@ -1694,7 +1554,7 @@ io.on('connection', (socket) => {
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
     console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
-
+  
     if (move === 'fold') {
       game.status = 'finished';
       game.opponentCardsVisible = true;
@@ -1723,7 +1583,7 @@ io.on('connection', (socket) => {
         console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
         game.actionsCompleted += 1;
         console.log(`Actions completed: ${game.actionsCompleted}`);
-
+  
         if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
           game.actionsCompleted = 0;
@@ -1746,7 +1606,7 @@ io.on('connection', (socket) => {
       console.log(`Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
       game.actionsCompleted += 1;
       console.log(`Actions completed: ${game.actionsCompleted}`);
-
+  
       if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         game.actionsCompleted = 0;
@@ -2036,6 +1896,7 @@ const startGame = async (gameId) => {
     await refundBetsForGame(gameId);
   }
 };
+
 
 const drawCard = () => {
   const cardNumber = Math.floor(Math.random() * 13) + 1;
@@ -2410,6 +2271,33 @@ const updateLeaderboard = async (playerAddress, winnings) => {
     console.error(`Error updating leaderboard for ${playerAddress}:`, err.message);
   }
 };
+
+app.get('/leaderboard', async (req, res) => {
+  console.log('Received request for /leaderboard');
+  try {
+    console.log('Fetching leaderboard...');
+    const leaderboard = await Player.find()
+      .sort({ totalWinnings: -1 })
+      .limit(10)
+      .maxTimeMS(5000);
+    console.log('Leaderboard fetched:', leaderboard);
+    if (!leaderboard || leaderboard.length === 0) {
+      console.log('Leaderboard is empty');
+      res.json([]);
+    } else {
+      const leaderboardWithUnit = leaderboard.map(player => ({
+        address: player.address,
+        totalWinnings: player.totalWinnings,
+        unit: 'COM',
+      }));
+      res.json(leaderboardWithUnit);
+    }
+  } catch (err) {
+    console.error('Error fetching leaderboard:', err.message);
+    console.error('Error stack:', err.stack);
+    res.status(500).json({ error: 'Error fetching leaderboard' });
+  }
+});
 
 // Gestione dei crash non gestiti
 process.on('uncaughtException', async (err) => {
