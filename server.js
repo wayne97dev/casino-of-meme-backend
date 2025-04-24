@@ -204,9 +204,9 @@ const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 // Endpoint per Meme Slots
 app.post('/play-meme-slots', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction } = req.body;
+  const { playerAddress, betAmount, transactionSignature } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !transactionSignature) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
@@ -214,27 +214,26 @@ app.post('/play-meme-slots', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo SOL
-    const userBalance = await connection.getBalance(userPublicKey);
-    if (userBalance < betInLamports) {
-      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-    }
-
-    // Valida e processa la transazione firmata
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-
-    if (!transaction.verifySignatures()) {
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    // Verifica la transazione
+    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
     if (confirmation.value.err) {
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    // Genera il risultato della slot
+    // Verifica che la transazione sia stata effettivamente eseguita (opzionale)
+    const transactionDetails = await connection.getTransaction(transactionSignature);
+    const transferInstruction = transactionDetails.transaction.message.instructions.find(
+      instr => instr.programId.toBase58() === SystemProgram.programId.toBase58()
+    );
+    if (
+      !transferInstruction ||
+      transferInstruction.parsed.info.destination !== wallet.publicKey.toBase58() ||
+      transferInstruction.parsed.info.lamports !== betInLamports
+    ) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
+    }
+
+    // Genera il risultato della slot (come prima)
     let result;
     const winLines = [
       [0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24],
@@ -243,7 +242,6 @@ app.post('/play-meme-slots', async (req, res) => {
     ];
 
     if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
-      // Computer vince: genera un risultato senza linee vincenti
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       let attempts = 0;
       while (attempts < 20) {
@@ -271,7 +269,6 @@ app.post('/play-meme-slots', async (req, res) => {
         attempts++;
       }
     } else {
-      // Giocatore vince: genera una linea vincente
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
       const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
@@ -295,7 +292,6 @@ app.post('/play-meme-slots', async (req, res) => {
       }
     }
 
-    // Calcola le vincite
     const winningLinesFound = [];
     const winningIndices = new Set();
     let totalWin = 0;
@@ -335,26 +331,6 @@ app.post('/play-meme-slots', async (req, res) => {
         if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
         totalWin += winAmount;
       }
-    }
-
-    // Distribuisci le vincite
-    if (totalWin > 0) {
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: userPublicKey,
-          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
-        })
-      );
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-
-      const winSignature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(winSignature);
-      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
     res.json({
@@ -958,14 +934,12 @@ app.post('/create-transaction', async (req, res) => {
 
   console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
 
-  // Validazione dei parametri
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
   }
 
   try {
-    // Validazione dell'indirizzo Solana
     let userPublicKey;
     try {
       userPublicKey = new PublicKey(playerAddress);
@@ -978,11 +952,9 @@ app.post('/create-transaction', async (req, res) => {
     const transaction = new Transaction();
 
     if (type === 'sol') {
-      // Trasferimento SOL verso il tax wallet
       const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
       console.log('DEBUG - Bet in lamports:', betInLamports);
 
-      // Verifica il saldo dell'utente
       const userBalance = await connection.getBalance(userPublicKey);
       console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
       if (userBalance < betInLamports) {
@@ -1001,12 +973,10 @@ app.post('/create-transaction', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction type' });
     }
 
-    // Ottieni il blockhash recente
     const { blockhash } = await connection.getLatestBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = userPublicKey;
 
-    // Log della transazione creata
     console.log('DEBUG - Transaction created:', {
       instructionCount: transaction.instructions.length,
       instructions: transaction.instructions.map((instr, index) => ({
@@ -1018,7 +988,6 @@ app.post('/create-transaction', async (req, res) => {
       recentBlockhash: transaction.recentBlockhash,
     });
 
-    // Serializza la transazione
     const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
 
     res.json({ success: true, transaction: serializedTransaction });
