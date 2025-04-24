@@ -265,14 +265,19 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
   }
 
   try {
-    const userPublicKey = new PublicKey(playerAddress);
-    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+    const user = await User.findOne({ address: playerAddress });
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
 
-    // Verifica il saldo SOL (opzionale, puoi gestire il saldo internamente)
-    const userBalance = await connection.getBalance(userPublicKey);
-    if (userBalance < betInLamports) {
+    // Verifica il saldo interno (user.solBalance)
+    if (user.solBalance < betAmount) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
+
+    // Detrai il betAmount dal saldo interno
+    user.solBalance -= betAmount;
+    await user.save();
 
     // Genera il risultato della slot
     let result;
@@ -374,12 +379,20 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
       }
     }
 
+    // Aggiungi eventuali vincite al saldo interno
+    if (totalWin > 0) {
+      user.solBalance += totalWin;
+      await user.save();
+    }
+
+    // Invia il nuovo saldo nella risposta
     res.json({
       success: true,
       result: result.map(item => ({ name: item.name, image: item.image })),
       winningLines: winningLinesFound,
       winningIndices: Array.from(winningIndices),
       totalWin,
+      newBalance: user.solBalance,
     });
   } catch (err) {
     console.error('Error in play-meme-slots:', err.message, err.stack);
