@@ -19,6 +19,7 @@ const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 const app = express();
 const server = http.createServer(app);
 
+
 // Definizione degli origin consentiti
 const allowedOrigins = [
   'https://casino-of-meme.com',
