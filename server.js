@@ -203,7 +203,8 @@ const shuffleArray = (array) => {
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 
-const { verify } = require('@solana/web3.js');
+const nacl = require('tweetnacl');
+const { PublicKey } = require('@solana/web3.js');
 
 app.post('/authenticate', async (req, res) => {
   const { playerAddress, message, signature } = req.body;
@@ -217,7 +218,12 @@ app.post('/authenticate', async (req, res) => {
     const messageBytes = new TextEncoder().encode(message);
     const signatureBytes = Buffer.from(signature, 'base64');
 
-    const isValid = await verify(messageBytes, signatureBytes, userPublicKey);
+    const isValid = nacl.sign.detached.verify(
+      messageBytes,
+      signatureBytes,
+      userPublicKey.toBuffer()
+    );
+
     if (!isValid) {
       return res.status(400).json({ success: false, error: 'Invalid signature' });
     }
@@ -230,7 +236,6 @@ app.post('/authenticate', async (req, res) => {
     res.status(500).json({ success: false, error: `Authentication failed: ${err.message}` });
   }
 });
-
 
 // Endpoint per Meme Slots
 const verifyToken = (req, res, next) => {
