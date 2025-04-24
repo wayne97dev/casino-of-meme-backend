@@ -24,7 +24,6 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
   'https://casino-of-meme-dapp.vercel.app',
-  'https://casino-of-meme-santes-projects-c6c8cd0c.vercel.app',
 ];
 
 // Inizializzazione di socket.io
