@@ -23,7 +23,7 @@ const allowedOrigins = [
   'https://casino-of-meme.com',
   'http://localhost:5173',
   'http://localhost:3000',
-  'https://casino-of-meme-dapp.vercel.app',
+  'https://testdashb.vercel.app',
 ];
 
 // Inizializzazione di socket.io
