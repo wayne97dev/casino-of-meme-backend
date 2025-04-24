@@ -214,26 +214,16 @@ app.post('/play-meme-slots', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica la transazione
-    const confirmation = await connection.confirmTransaction(transactionSignature, 'confirmed');
-    if (confirmation.value.err) {
-      return res.status(500).json({ success: false, error: 'Transaction failed' });
-    }
+    // Verifica la transazione con un timeout
+    const confirmationPromise = connection.confirmTransaction(transactionSignature, 'confirmed');
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Transaction confirmation timed out')), 30000); // 30 secondi
+    });
+    await Promise.race([confirmationPromise, timeoutPromise]).catch(err => {
+      throw new Error(`Failed to confirm transaction: ${err.message}`);
+    });
 
-    // Verifica che la transazione sia stata effettivamente eseguita (opzionale)
-    const transactionDetails = await connection.getTransaction(transactionSignature);
-    const transferInstruction = transactionDetails.transaction.message.instructions.find(
-      instr => instr.programId.toBase58() === SystemProgram.programId.toBase58()
-    );
-    if (
-      !transferInstruction ||
-      transferInstruction.parsed.info.destination !== wallet.publicKey.toBase58() ||
-      transferInstruction.parsed.info.lamports !== betInLamports
-    ) {
-      return res.status(400).json({ success: false, error: 'Invalid transaction details' });
-    }
-
-    // Genera il risultato della slot (come prima)
+    // Genera il risultato della slot
     let result;
     const winLines = [
       [0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24],
@@ -341,8 +331,8 @@ app.post('/play-meme-slots', async (req, res) => {
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-meme-slots:', err);
-    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
+    console.error('Error in play-meme-slots:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
   }
 });
 
@@ -1037,54 +1027,7 @@ app.post('/get-recent-blockhash', async (req, res) => {
 
 
 // Nuovo endpoint per processare le transazioni di tutti i minigiochi (escluso Poker PvP)
-app.post('/process-transaction', async (req, res) => {
-  const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !gameType) {
-    return res.status(400).json({ success: false, error: 'Invalid parameters' });
-  }
-
-  const validGameTypes = ['memeSlots', 'crazyWheel', 'solanaCardDuel', 'coinFlip'];
-  if (!validGameTypes.includes(gameType)) {
-    return res.status(400).json({ success: false, error: 'Invalid gameType' });
-  }
-
-  try {
-    const userPublicKey = new PublicKey(playerAddress);
-    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-
-    const userBalance = await connection.getBalance(userPublicKey);
-    if (userBalance < betInLamports) {
-      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
-    }
-
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const transaction = Transaction.from(transactionBuffer);
-
-    if (!transaction.verifySignatures()) {
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-    }
-
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-    if (confirmation.value.err) {
-      return res.status(500).json({ success: false, error: 'Transaction failed' });
-    }
-
-    // Reindirizza la logica al gioco specifico
-    const endpointMap = {
-      memeSlots: '/play-meme-slots',
-      coinFlip: '/play-coin-flip',
-      crazyWheel: '/play-crazy-wheel',
-      solanaCardDuel: '/play-solana-card-duel',
-    };
-
-    res.json({ success: true, redirectTo: endpointMap[gameType] });
-  } catch (err) {
-    console.error('Error in process-transaction:', err);
-    res.status(500).json({ success: false, error: `Failed to process transaction: ${err.message}` });
-  }
-});
 
 // Endpoint per distribuire vincite in SOL (usato per tutti i minigiochi escluso Poker PvP)
 const retry = async (fn, retries = 3, delay = 1000) => {
