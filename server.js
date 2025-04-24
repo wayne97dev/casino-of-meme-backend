@@ -202,26 +202,87 @@ const shuffleArray = (array) => {
 
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
-// Endpoint per Meme Slots
-app.post('/play-meme-slots', async (req, res) => {
-  const { playerAddress, betAmount, transactionSignature } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !transactionSignature) {
+
+const jwt = require('jsonwebtoken');
+
+app.post('/authenticate', async (req, res) => {
+  const { playerAddress, signedTransaction } = req.body;
+
+  if (!playerAddress || !signedTransaction) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+
+    // Crea una transazione dummy
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: userPublicKey,
+        toPubkey: userPublicKey, // Transazione che non fa nulla
+        lamports: 0,
+      })
+    );
+
+    const { blockhash } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = userPublicKey;
+
+    // Verifica la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const receivedTransaction = Transaction.from(transactionBuffer);
+
+    if (!receivedTransaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    // Genera un token JWT
+    const token = jwt.sign({ playerAddress }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: '1h' });
+
+    res.json({ success: true, token });
+  } catch (err) {
+    console.error('Error in authenticate:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Authentication failed: ${err.message}` });
+  }
+});
+
+// Endpoint per Meme Slots
+const verifyToken = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ success: false, error: 'No token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret');
+    req.playerAddress = decoded.playerAddress;
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, error: 'Invalid token' });
+  }
+};
+
+app.post('/play-meme-slots', verifyToken, async (req, res) => {
+  const { playerAddress, betAmount } = req.body;
+
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  if (playerAddress !== req.playerAddress) {
+    return res.status(403).json({ success: false, error: 'Unauthorized player address' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica la transazione con un timeout
-    const confirmationPromise = connection.confirmTransaction(transactionSignature, 'confirmed');
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Transaction confirmation timed out')), 30000); // 30 secondi
-    });
-    await Promise.race([confirmationPromise, timeoutPromise]).catch(err => {
-      throw new Error(`Failed to confirm transaction: ${err.message}`);
-    });
+    // Verifica il saldo SOL (opzionale, puoi gestire il saldo internamente)
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
 
     // Genera il risultato della slot
     let result;
