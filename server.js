@@ -12,6 +12,7 @@ const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
+const User = require('./models/User');
 
 const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 
