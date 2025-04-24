@@ -245,7 +245,7 @@ const verifyToken = (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'cd2adnz00v7fwout6hnvi9nte6yj33fc');
     req.playerAddress = decoded.playerAddress;
     next();
   } catch (err) {
