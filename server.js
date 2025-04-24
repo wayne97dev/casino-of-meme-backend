@@ -12,7 +12,7 @@ const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
-const User = require('./models/User');
+
 
 const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 
@@ -216,13 +216,6 @@ app.post('/authenticate', async (req, res) => {
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
-
-    let user = await User.findOne({ address: playerAddress });
-    if (!user) {
-      user = new User({ address: playerAddress });
-      await user.save();
-    }
-
     const token = jwt.sign({ playerAddress }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
     res.json({ success: true, token });
@@ -249,9 +242,9 @@ const verifyToken = (req, res, next) => {
 };
 
 app.post('/play-meme-slots', verifyToken, async (req, res) => {
-  const { playerAddress, betAmount } = req.body;
+  const { playerAddress, betAmount, signedTransaction } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0) {
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
@@ -260,19 +253,28 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ address: playerAddress });
-    if (!user) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo interno (user.solBalance)
-    if (user.solBalance < betAmount) {
+    // Verifica il saldo SOL on-chain
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Detrai il betAmount dal saldo interno
-    user.solBalance -= betAmount;
-    await user.save();
+    // Valida e processa la transazione firmata
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
 
     // Genera il risultato della slot
     let result;
@@ -374,20 +376,32 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
       }
     }
 
-    // Aggiungi eventuali vincite al saldo interno
+    // Se l'utente vince, distribuisci le vincite
     if (totalWin > 0) {
-      user.solBalance += totalWin;
-      await user.save();
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
+        })
+      );
+
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature, 'confirmed');
+      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
-    // Invia il nuovo saldo nella risposta
     res.json({
       success: true,
       result: result.map(item => ({ name: item.name, image: item.image })),
       winningLines: winningLinesFound,
       winningIndices: Array.from(winningIndices),
       totalWin,
-      newBalance: user.solBalance,
     });
   } catch (err) {
     console.error('Error in play-meme-slots:', err.message, err.stack);
