@@ -203,42 +203,26 @@ const shuffleArray = (array) => {
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 
-
-const jwt = require('jsonwebtoken');
+const { verify } = require('@solana/web3.js');
 
 app.post('/authenticate', async (req, res) => {
-  const { playerAddress, signedTransaction } = req.body;
+  const { playerAddress, message, signature } = req.body;
 
-  if (!playerAddress || !signedTransaction) {
+  if (!playerAddress || !message || !signature) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
+    const messageBytes = new TextEncoder().encode(message);
+    const signatureBytes = Buffer.from(signature, 'base64');
 
-    // Crea una transazione dummy
-    const transaction = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: userPublicKey,
-        toPubkey: userPublicKey, // Transazione che non fa nulla
-        lamports: 0,
-      })
-    );
-
-    const { blockhash } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = userPublicKey;
-
-    // Verifica la transazione firmata
-    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-    const receivedTransaction = Transaction.from(transactionBuffer);
-
-    if (!receivedTransaction.verifySignatures()) {
-      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    const isValid = await verify(messageBytes, signatureBytes, userPublicKey);
+    if (!isValid) {
+      return res.status(400).json({ success: false, error: 'Invalid signature' });
     }
 
-    // Genera un token JWT
-    const token = jwt.sign({ playerAddress }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: '1h' });
+    const token = jwt.sign({ playerAddress }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
     res.json({ success: true, token });
   } catch (err) {
@@ -246,6 +230,7 @@ app.post('/authenticate', async (req, res) => {
     res.status(500).json({ success: false, error: `Authentication failed: ${err.message}` });
   }
 });
+
 
 // Endpoint per Meme Slots
 const verifyToken = (req, res, next) => {
