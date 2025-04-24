@@ -1,7 +1,7 @@
 require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
 
 
-const jwt = require('jsonwebtoken');
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -13,12 +13,10 @@ const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
 
-
 const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 
 const app = express();
 const server = http.createServer(app);
-
 
 // Definizione degli origin consentiti
 const allowedOrigins = [
@@ -204,60 +202,19 @@ const shuffleArray = (array) => {
 
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
-
-const nacl = require('tweetnacl');
-
-
-app.post('/authenticate', async (req, res) => {
-  const { playerAddress } = req.body;
-
-  if (!playerAddress) {
-    return res.status(400).json({ success: false, error: 'Invalid parameters' });
-  }
-
-  try {
-    const userPublicKey = new PublicKey(playerAddress);
-    const token = jwt.sign({ playerAddress }, process.env.JWT_SECRET, { expiresIn: '1h' });
-
-    res.json({ success: true, token });
-  } catch (err) {
-    console.error('Error in authenticate:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Authentication failed: ${err.message}` });
-  }
-});
-
 // Endpoint per Meme Slots
-const verifyToken = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) {
-    return res.status(401).json({ success: false, error: 'No token provided' });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'cd2adnz00v7fwout6hnvi9nte6yj33fc');
-    req.playerAddress = decoded.playerAddress;
-    next();
-  } catch (err) {
-    return res.status(401).json({ success: false, error: 'Invalid token' });
-  }
-};
-
-app.post('/play-meme-slots', verifyToken, async (req, res) => {
+app.post('/play-meme-slots', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
-  if (playerAddress !== req.playerAddress) {
-    return res.status(403).json({ success: false, error: 'Unauthorized player address' });
-  }
-
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo SOL on-chain
+    // Verifica il saldo SOL
     const userBalance = await connection.getBalance(userPublicKey);
     if (userBalance < betInLamports) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
@@ -286,6 +243,7 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
     ];
 
     if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
+      // Computer vince: genera un risultato senza linee vincenti
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       let attempts = 0;
       while (attempts < 20) {
@@ -313,6 +271,7 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
         attempts++;
       }
     } else {
+      // Giocatore vince: genera una linea vincente
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
       const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
@@ -336,6 +295,7 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
       }
     }
 
+    // Calcola le vincite
     const winningLinesFound = [];
     const winningIndices = new Set();
     let totalWin = 0;
@@ -377,7 +337,7 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
       }
     }
 
-    // Se l'utente vince, distribuisci le vincite
+    // Distribuisci le vincite
     if (totalWin > 0) {
       const transaction = new Transaction().add(
         SystemProgram.transfer({
@@ -393,7 +353,7 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
       transaction.partialSign(wallet);
 
       const winSignature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(winSignature, 'confirmed');
+      await connection.confirmTransaction(winSignature);
       console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
@@ -405,8 +365,8 @@ app.post('/play-meme-slots', verifyToken, async (req, res) => {
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-meme-slots:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
+    console.error('Error in play-meme-slots:', err);
+    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
   }
 });
 
@@ -998,12 +958,14 @@ app.post('/create-transaction', async (req, res) => {
 
   console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
 
+  // Validazione dei parametri
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
   }
 
   try {
+    // Validazione dell'indirizzo Solana
     let userPublicKey;
     try {
       userPublicKey = new PublicKey(playerAddress);
@@ -1016,9 +978,11 @@ app.post('/create-transaction', async (req, res) => {
     const transaction = new Transaction();
 
     if (type === 'sol') {
+      // Trasferimento SOL verso il tax wallet
       const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
       console.log('DEBUG - Bet in lamports:', betInLamports);
 
+      // Verifica il saldo dell'utente
       const userBalance = await connection.getBalance(userPublicKey);
       console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
       if (userBalance < betInLamports) {
@@ -1037,10 +1001,12 @@ app.post('/create-transaction', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction type' });
     }
 
+    // Ottieni il blockhash recente
     const { blockhash } = await connection.getLatestBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = userPublicKey;
 
+    // Log della transazione creata
     console.log('DEBUG - Transaction created:', {
       instructionCount: transaction.instructions.length,
       instructions: transaction.instructions.map((instr, index) => ({
@@ -1052,6 +1018,7 @@ app.post('/create-transaction', async (req, res) => {
       recentBlockhash: transaction.recentBlockhash,
     });
 
+    // Serializza la transazione
     const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
 
     res.json({ success: true, transaction: serializedTransaction });
@@ -1101,7 +1068,54 @@ app.post('/get-recent-blockhash', async (req, res) => {
 
 
 // Nuovo endpoint per processare le transazioni di tutti i minigiochi (escluso Poker PvP)
+app.post('/process-transaction', async (req, res) => {
+  const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
 
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !gameType) {
+    return res.status(400).json({ success: false, error: 'Invalid parameters' });
+  }
+
+  const validGameTypes = ['memeSlots', 'crazyWheel', 'solanaCardDuel', 'coinFlip'];
+  if (!validGameTypes.includes(gameType)) {
+    return res.status(400).json({ success: false, error: 'Invalid gameType' });
+  }
+
+  try {
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+
+    const userBalance = await connection.getBalance(userPublicKey);
+    if (userBalance < betInLamports) {
+      return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
+    }
+
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = Transaction.from(transactionBuffer);
+
+    if (!transaction.verifySignatures()) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
+    }
+
+    // Reindirizza la logica al gioco specifico
+    const endpointMap = {
+      memeSlots: '/play-meme-slots',
+      coinFlip: '/play-coin-flip',
+      crazyWheel: '/play-crazy-wheel',
+      solanaCardDuel: '/play-solana-card-duel',
+    };
+
+    res.json({ success: true, redirectTo: endpointMap[gameType] });
+  } catch (err) {
+    console.error('Error in process-transaction:', err);
+    res.status(500).json({ success: false, error: `Failed to process transaction: ${err.message}` });
+  }
+});
 
 // Endpoint per distribuire vincite in SOL (usato per tutti i minigiochi escluso Poker PvP)
 const retry = async (fn, retries = 3, delay = 1000) => {
