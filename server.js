@@ -208,25 +208,19 @@ const nacl = require('tweetnacl');
 
 
 app.post('/authenticate', async (req, res) => {
-  const { playerAddress, message, signature } = req.body;
+  const { playerAddress } = req.body;
 
-  if (!playerAddress || !message || !signature) {
+  if (!playerAddress) {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
-    const messageBytes = new TextEncoder().encode(message);
-    const signatureBytes = Buffer.from(signature, 'base64');
 
-    const isValid = nacl.sign.detached.verify(
-      messageBytes,
-      signatureBytes,
-      userPublicKey.toBuffer()
-    );
-
-    if (!isValid) {
-      return res.status(400).json({ success: false, error: 'Invalid signature' });
+    let user = await User.findOne({ address: playerAddress });
+    if (!user) {
+      user = new User({ address: playerAddress });
+      await user.save();
     }
 
     const token = jwt.sign({ playerAddress }, process.env.JWT_SECRET, { expiresIn: '1h' });
