@@ -204,7 +204,7 @@ const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 
 const nacl = require('tweetnacl');
-const { PublicKey } = require('@solana/web3.js');
+
 
 app.post('/authenticate', async (req, res) => {
   const { playerAddress, message, signature } = req.body;
