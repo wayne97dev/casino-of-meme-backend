@@ -207,7 +207,6 @@ const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 const validateTransaction = (transaction, userPublicKey, casinoATA, expectedAmount) => {
   try {
-    // Cerca l'istruzione di trasferimento dei token
     const transferInstruction = transaction.instructions.find(
       instr => instr.programId.equals(TOKEN_PROGRAM_ID)
     );
@@ -217,43 +216,46 @@ const validateTransaction = (transaction, userPublicKey, casinoATA, expectedAmou
       return false;
     }
 
-    // Estrai i dati dell'istruzione (assumiamo che sia un'istruzione di trasferimento)
     const data = transferInstruction.data;
     if (data.length < 9) {
       console.log('DEBUG - Invalid instruction data length:', data.length);
       return false;
     }
 
-    // Decodifica manualmente i dati dell'istruzione di trasferimento
-    // Formato: [instruction discriminator (1 byte), amount (8 bytes)]
     const instructionDiscriminator = data[0];
-    if (instructionDiscriminator !== 3) { // 3 è il discriminatore per Transfer
+    if (instructionDiscriminator !== 3) {
       console.log('DEBUG - Invalid instruction discriminator:', instructionDiscriminator);
       return false;
     }
 
-    // Estrai l'importo (8 bytes, little-endian)
     const amountBuffer = data.slice(1, 9);
     const amount = amountBuffer.readBigUInt64LE(0);
-    const expectedAmountInTokens = BigInt(Math.round(expectedAmount * 1e6)); // Converti in unità base (6 decimali)
+    const expectedAmountInTokens = BigInt(Math.round(expectedAmount * 1e6));
 
-    // Verifica l'importo
     if (amount !== expectedAmountInTokens) {
-      console.log('DEBUG - Amount mismatch:', { actual: Number(amount), expected: Number(expectedAmountInTokens) });
+      console.log('DEBUG - Amount mismatch:', {
+        actual: Number(amount),
+        expected: Number(expectedAmountInTokens),
+      });
       return false;
     }
 
-    // Verifica mittente e destinatario
     const fromPubkey = transferInstruction.keys[0].pubkey;
     const toPubkey = transferInstruction.keys[1].pubkey;
 
     if (!fromPubkey.equals(userPublicKey)) {
-      console.log('DEBUG - Sender mismatch:', { actual: fromPubkey.toBase58(), expected: userPublicKey.toBase58() });
+      console.log('DEBUG - Sender mismatch:', {
+        actual: fromPubkey.toBase58(),
+        expected: userPublicKey.toBase58(),
+      });
       return false;
     }
 
     if (!toPubkey.equals(casinoATA)) {
-      console.log('DEBUG - Recipient mismatch:', { actual: toPubkey.toBase58(), expected: casinoATA.toBase58() });
+      console.log('DEBUG - Recipient mismatch:', {
+        actual: toPubkey.toBase58(),
+        expected: casinoATA.toBase58(),
+      });
       return false;
     }
 
@@ -268,6 +270,8 @@ const validateTransaction = (transaction, userPublicKey, casinoATA, expectedAmou
     return false;
   }
 };
+
+    
 
 // Endpoint per Meme Slots
 app.post('/play-meme-slots', async (req, res) => {
