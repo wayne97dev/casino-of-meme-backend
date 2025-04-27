@@ -12,7 +12,7 @@ const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
-
+const { TOKEN_PROGRAM_ID } = require('@solana/spl-token');
 const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 
 const app = express();
@@ -201,6 +201,73 @@ const shuffleArray = (array) => {
 };
 
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
+
+
+
+
+const validateTransaction = (transaction, userPublicKey, casinoATA, expectedAmount) => {
+  try {
+    // Cerca l'istruzione di trasferimento dei token
+    const transferInstruction = transaction.instructions.find(
+      instr => instr.programId.equals(TOKEN_PROGRAM_ID)
+    );
+
+    if (!transferInstruction) {
+      console.log('DEBUG - No token transfer instruction found in transaction');
+      return false;
+    }
+
+    // Estrai i dati dell'istruzione (assumiamo che sia un'istruzione di trasferimento)
+    const data = transferInstruction.data;
+    if (data.length < 9) {
+      console.log('DEBUG - Invalid instruction data length:', data.length);
+      return false;
+    }
+
+    // Decodifica manualmente i dati dell'istruzione di trasferimento
+    // Formato: [instruction discriminator (1 byte), amount (8 bytes)]
+    const instructionDiscriminator = data[0];
+    if (instructionDiscriminator !== 3) { // 3 è il discriminatore per Transfer
+      console.log('DEBUG - Invalid instruction discriminator:', instructionDiscriminator);
+      return false;
+    }
+
+    // Estrai l'importo (8 bytes, little-endian)
+    const amountBuffer = data.slice(1, 9);
+    const amount = amountBuffer.readBigUInt64LE(0);
+    const expectedAmountInTokens = BigInt(Math.round(expectedAmount * 1e6)); // Converti in unità base (6 decimali)
+
+    // Verifica l'importo
+    if (amount !== expectedAmountInTokens) {
+      console.log('DEBUG - Amount mismatch:', { actual: Number(amount), expected: Number(expectedAmountInTokens) });
+      return false;
+    }
+
+    // Verifica mittente e destinatario
+    const fromPubkey = transferInstruction.keys[0].pubkey;
+    const toPubkey = transferInstruction.keys[1].pubkey;
+
+    if (!fromPubkey.equals(userPublicKey)) {
+      console.log('DEBUG - Sender mismatch:', { actual: fromPubkey.toBase58(), expected: userPublicKey.toBase58() });
+      return false;
+    }
+
+    if (!toPubkey.equals(casinoATA)) {
+      console.log('DEBUG - Recipient mismatch:', { actual: toPubkey.toBase58(), expected: casinoATA.toBase58() });
+      return false;
+    }
+
+    console.log('DEBUG - Transaction validated successfully:', {
+      amount: Number(amount),
+      from: fromPubkey.toBase58(),
+      to: toPubkey.toBase58(),
+    });
+    return true;
+  } catch (err) {
+    console.error('DEBUG - Error validating transaction:', err.message);
+    return false;
+  }
+};
 
 // Endpoint per Meme Slots
 app.post('/play-meme-slots', async (req, res) => {
@@ -1195,13 +1262,15 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 app.post('/join-poker-game', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
+  console.log('DEBUG - /join-poker-game called:', { playerAddress, betAmount });
+
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
-    console.log('Invalid parameters:', { playerAddress, betAmount, signedTransaction });
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
   }
 
   if (betAmount < MIN_BET) {
-    console.log(`Bet ${betAmount} COM is below minimum ${MIN_BET} COM`);
+    console.log(`DEBUG - Bet ${betAmount} COM is below minimum ${MIN_BET} COM`);
     return res.status(400).json({ success: false, error: `Bet must be at least ${MIN_BET} COM` });
   }
 
@@ -1210,58 +1279,42 @@ app.post('/join-poker-game', async (req, res) => {
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
-    let casinoAccountExists = false;
-    try {
-      await getAccount(connection, casinoATA);
-      casinoAccountExists = true;
-    } catch (err) {
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log('Created casino ATA');
-    }
-
     // Verifica il saldo COM dell'utente
     const userBalance = await connection.getTokenAccountBalance(userATA).catch(() => ({
       value: { uiAmount: 0 },
     }));
     if (userBalance.value.uiAmount < betAmount) {
-      console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${betAmount}`);
+      console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${betAmount}`);
       return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
 
-    // Valida e processa la transazione firmata
+    // Valida la transazione
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
+    if (!validateTransaction(transaction, userPublicKey, casinoATA, betAmount)) {
+      console.log('DEBUG - Transaction validation failed');
+      return res.status(400).json({ success: false, error: 'Invalid transaction: incorrect amount or recipient' });
+    }
+
+    // Verifica le firme
     if (!transaction.verifySignatures()) {
-      console.log('Invalid transaction signatures for:', playerAddress);
+      console.log('DEBUG - Invalid transaction signatures for:', playerAddress);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    // Esegui la transazione
     const signature = await connection.sendRawTransaction(transaction.serialize());
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('Transaction failed:', confirmation.value.err);
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-    console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
 
-    res.json({ success: true });
+    console.log(`DEBUG - Transferred ${betAmount} COM from ${playerAddress} to casino, signature: ${signature}`);
+    res.json({ success: true, transactionSignature: signature });
   } catch (err) {
-    console.error('Error in join-poker-game:', err.message, err.stack);
+    console.error('DEBUG - Error in join-poker-game:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to join game: ' + err.message });
   }
 });
@@ -1270,13 +1323,15 @@ app.post('/join-poker-game', async (req, res) => {
 app.post('/make-poker-move', async (req, res) => {
   const { playerAddress, gameId, move, amount, signedTransaction } = req.body;
 
+  console.log('DEBUG - /make-poker-move called:', { playerAddress, gameId, move, amount });
+
   if (!playerAddress || !gameId || !move || amount === undefined || isNaN(amount) || amount < 0) {
-    console.log('Invalid parameters:', { playerAddress, gameId, move, amount });
+    console.log('DEBUG - Invalid parameters:', { playerAddress, gameId, move, amount });
     return res.status(400).json({ success: false, error: 'Invalid required fields' });
   }
 
   if (amount > 0 && !signedTransaction) {
-    console.log('Missing signed transaction for move:', move);
+    console.log('DEBUG - Missing signed transaction for move:', move);
     return res.status(400).json({ success: false, error: 'Missing signed transaction' });
   }
 
@@ -1290,9 +1345,9 @@ app.post('/make-poker-move', async (req, res) => {
     try {
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
+      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
+      console.log('DEBUG - Casino ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1307,7 +1362,7 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
 
     // Verifica e crea ATA del giocatore
@@ -1315,9 +1370,9 @@ app.post('/make-poker-move', async (req, res) => {
     try {
       await getAccount(connection, userATA);
       playerAccountExists = true;
-      console.log('Player ATA exists:', userATA.toBase58());
+      console.log('DEBUG - Player ATA exists:', userATA.toBase58());
     } catch (err) {
-      console.log('Player ATA does not exist, creating...');
+      console.log('DEBUG - Player ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1332,37 +1387,46 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created player ATA:', userATA.toBase58());
+      console.log('DEBUG - Created player ATA:', userATA.toBase58());
     }
 
     if (amount > 0) {
+      // Verifica il saldo COM
       const userBalance = await connection.getTokenAccountBalance(userATA);
       if (userBalance.value.uiAmount < amount) {
-        console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${amount}`);
+        console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${amount}`);
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
       }
 
-      // Valida e processa la transazione firmata
+      // Valida la transazione
       const transactionBuffer = Buffer.from(signedTransaction, 'base64');
       const transaction = Transaction.from(transactionBuffer);
 
+      if (!validateTransaction(transaction, userPublicKey, casinoATA, amount)) {
+        console.log('DEBUG - Transaction validation failed');
+        return res.status(400).json({ success: false, error: 'Invalid transaction: incorrect amount or recipient' });
+      }
+
+      // Verifica le firme
       if (!transaction.verifySignatures()) {
-        console.log('Invalid transaction signatures for:', playerAddress);
+        console.log('DEBUG - Invalid transaction signatures for:', playerAddress);
         return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
       }
 
+      // Esegui la transazione
       const signature = await connection.sendRawTransaction(transaction.serialize());
       const confirmation = await connection.confirmTransaction(signature, 'confirmed');
       if (confirmation.value.err) {
-        console.log('Transaction failed:', confirmation.value.err);
+        console.log('DEBUG - Transaction failed:', confirmation.value.err);
         return res.status(500).json({ success: false, error: 'Transaction failed' });
       }
-      console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
+
+      console.log(`DEBUG - Transferred ${amount} COM from ${playerAddress} to casino for move ${move}, signature: ${signature}`);
     }
 
-    res.json({ success: true });
+    res.json({ success: true, transactionSignature: amount > 0 ? signature : undefined });
   } catch (err) {
-    console.error('Error in make-poker-move:', err.message, err.stack);
+    console.error('DEBUG - Error in make-poker-move:', err.message, err.stack);
     res.status(500).json({ success: false, error: `Failed to process move: ${err.message}` });
   }
 });
