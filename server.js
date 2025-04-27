@@ -1300,6 +1300,11 @@ app.post('/join-poker-game', async (req, res) => {
 
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    console.log('DEBUG - ATA details:', {
+      userATA: userATA.toBase58(),
+      casinoATA: casinoATA.toBase58(),
+      casinoPublicKey: wallet.publicKey.toBase58(),
+    });
 
     // Verifica il saldo COM
     const userBalance = await connection.getTokenAccountBalance(userATA).catch(() => ({
@@ -1318,7 +1323,15 @@ app.post('/join-poker-game', async (req, res) => {
     try {
       const transactionBuffer = Buffer.from(signedTransaction, 'base64');
       transaction = Transaction.from(transactionBuffer);
-      console.log('DEBUG - Transaction decoded successfully');
+      console.log('DEBUG - Transaction decoded successfully', {
+        instructionCount: transaction.instructions.length,
+        instructions: transaction.instructions.map((instr, i) => ({
+          index: i,
+          programId: instr.programId.toBase58(),
+          keys: instr.keys.map(key => key.pubkey.toBase58()),
+          data: instr.data.toString('hex'),
+        })),
+      });
     } catch (err) {
       console.log('DEBUG - Failed to decode transaction:', err.message);
       return res.status(400).json({ success: false, error: 'Invalid signedTransaction format' });
