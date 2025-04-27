@@ -710,6 +710,15 @@ app.get('/com-balance/:playerAddress', async (req, res) => {
   const { playerAddress } = req.params;
   const cacheKey = `com_balance:${playerAddress}`;
 
+  // Valida l'indirizzo Solana
+  let userPublicKey;
+  try {
+    userPublicKey = new PublicKey(playerAddress);
+  } catch (err) {
+    console.log('Invalid Solana address:', playerAddress);
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress' });
+  }
+
   try {
     const cachedBalance = await redis.get(cacheKey);
     if (cachedBalance) {
@@ -717,7 +726,6 @@ app.get('/com-balance/:playerAddress', async (req, res) => {
       return res.json({ success: true, balance: parseFloat(cachedBalance) });
     }
 
-    const userPublicKey = new PublicKey(playerAddress);
     const userATA = await getAssociatedTokenAddress(new PublicKey(MINT_ADDRESS), userPublicKey);
     const balance = await getTokenAccountBalance(connection, userATA).catch(() => ({
       value: { uiAmount: 0 },
@@ -747,6 +755,18 @@ app.post('/distribute-winnings', async (req, res) => {
     const winnerPublicKey = new PublicKey(winnerAddress);
     const casinoATA = await getAssociatedTokenAddress(new PublicKey(MINT_ADDRESS), wallet.publicKey);
     const winnerATA = await getAssociatedTokenAddress(new PublicKey(MINT_ADDRESS), winnerPublicKey);
+
+    // Controlla il saldo COM del casinò
+    const casinoBalance = await getTokenAccountBalance(connection, casinoATA).catch(() => ({
+      value: { uiAmount: 0 },
+    }));
+    if (casinoBalance.value.uiAmount < amount) {
+      console.log(`Insufficient COM balance in casino wallet: ${casinoBalance.value.uiAmount} COM available, ${amount} COM required`);
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient COM balance in casino wallet: ${casinoBalance.value.uiAmount} COM available, ${amount} COM required`,
+      });
+    }
 
     const transaction = new Transaction().add(
       createTransferInstruction(
@@ -779,7 +799,6 @@ app.post('/distribute-winnings', async (req, res) => {
   }
 });
 
-// Endpoint per gestire i rimborsi in COM (usato per Poker PvP)
 // Endpoint: Rimborso
 app.post('/refund', async (req, res) => {
   const { playerAddress, amount } = req.body;
@@ -793,6 +812,18 @@ app.post('/refund', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const casinoATA = await getAssociatedTokenAddress(new PublicKey(MINT_ADDRESS), wallet.publicKey);
     const playerATA = await getAssociatedTokenAddress(new PublicKey(MINT_ADDRESS), userPublicKey);
+
+    // Controlla il saldo COM del casinò
+    const casinoBalance = await getTokenAccountBalance(connection, casinoATA).catch(() => ({
+      value: { uiAmount: 0 },
+    }));
+    if (casinoBalance.value.uiAmount < amount) {
+      console.log(`Insufficient COM balance in casino wallet: ${casinoBalance.value.uiAmount} COM available, ${amount} COM required`);
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient COM balance in casino wallet: ${casinoBalance.value.uiAmount} COM available, ${amount} COM required`,
+      });
+    }
 
     const transaction = new Transaction().add(
       createTransferInstruction(
@@ -1016,6 +1047,18 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
+
+    // Controlla il saldo del tax wallet
+    const casinoBalance = await connection.getBalance(wallet.publicKey);
+    const requiredLamports = Math.round(amount * LAMPORTS_PER_SOL) + 5000; // Aggiungi fee minime
+    if (casinoBalance < requiredLamports) {
+      console.log(`Insufficient SOL balance in tax wallet: ${casinoBalance / LAMPORTS_PER_SOL} SOL available, ${(requiredLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL required`);
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient SOL balance in tax wallet: ${casinoBalance / LAMPORTS_PER_SOL} SOL available, ${(requiredLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL required`,
+      });
+    }
+
     const transaction = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: wallet.publicKey,
