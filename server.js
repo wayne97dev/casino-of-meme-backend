@@ -633,22 +633,27 @@ const refundAllActiveGames = async () => {
 app.get('/tax-wallet-balance', async (req, res) => {
   const cacheKey = 'tax_wallet_balance';
   try {
+    console.log('DEBUG - Attempting to fetch cached balance from Redis...');
     const cachedBalance = await redis.get(cacheKey);
     if (cachedBalance) {
       console.log('Cache hit for tax_wallet_balance:', cachedBalance);
       return res.json({ success: true, balance: parseFloat(cachedBalance) });
     }
 
+    console.log('DEBUG - Cache miss, querying Solana for tax wallet balance...');
+    console.log('DEBUG - wallet.publicKey:', wallet.publicKey ? wallet.publicKey.toBase58() : 'undefined');
     const balance = await connection.getBalance(wallet.publicKey);
+    console.log('DEBUG - Balance fetched from Solana:', balance, 'lamports');
     const taxWalletBalance = balance / LAMPORTS_PER_SOL;
 
+    console.log('DEBUG - Caching balance in Redis...');
     await redis.setEx(cacheKey, 60, taxWalletBalance.toString());
     console.log('Cache miss for tax_wallet_balance, fetched from Solana:', taxWalletBalance);
 
     res.json({ success: true, balance: taxWalletBalance });
   } catch (err) {
-    console.error('Error fetching tax wallet balance:', err);
-    res.status(500).json({ success: false, error: 'Failed to fetch tax wallet balance' });
+    console.error('Error fetching tax wallet balance:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to fetch tax wallet balance: ${err.message}` });
   }
 });
 
