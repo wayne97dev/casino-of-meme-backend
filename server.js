@@ -203,10 +203,15 @@ const shuffleArray = (array) => {
 const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 
-
-
 const validateTransaction = (transaction, userPublicKey, casinoATA, expectedAmount) => {
   try {
+    console.log('DEBUG - Validating transaction:', {
+      userPublicKey: userPublicKey.toBase58(),
+      casinoATA: casinoATA.toBase58(),
+      expectedAmount,
+      expectedAmountInTokens: Math.round(expectedAmount * 1e6),
+    });
+
     const transferInstruction = transaction.instructions.find(
       instr => instr.programId.equals(TOKEN_PROGRAM_ID)
     );
@@ -266,10 +271,12 @@ const validateTransaction = (transaction, userPublicKey, casinoATA, expectedAmou
     });
     return true;
   } catch (err) {
-    console.error('DEBUG - Error validating transaction:', err.message);
+    console.error('DEBUG - Error validating transaction:', err.message, err.stack);
     return false;
   }
 };
+
+
 
     
 
