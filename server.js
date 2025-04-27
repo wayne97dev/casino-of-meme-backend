@@ -629,25 +629,43 @@ const refundAllActiveGames = async () => {
 };
 
 
-// Endpoint: Saldo del Tax Wallet
 app.get('/tax-wallet-balance', async (req, res) => {
   const cacheKey = 'tax_wallet_balance';
   try {
+    // Validate wallet
+    if (!wallet || !wallet.publicKey) {
+      throw new Error('Tax wallet is not initialized');
+    }
+
+    // Fetch cached balance
     console.log('DEBUG - Attempting to fetch cached balance from Redis...');
-    const cachedBalance = await redis.get(cacheKey);
+    let cachedBalance;
+    try {
+      cachedBalance = await redis.get(cacheKey);
+    } catch (redisErr) {
+      console.error('Redis error during get:', redisErr.message);
+      throw new Error(`Redis error: ${redisErr.message}`);
+    }
     if (cachedBalance) {
       console.log('Cache hit for tax_wallet_balance:', cachedBalance);
       return res.json({ success: true, balance: parseFloat(cachedBalance) });
     }
 
+    // Query Solana
     console.log('DEBUG - Cache miss, querying Solana for tax wallet balance...');
-    console.log('DEBUG - wallet.publicKey:', wallet.publicKey ? wallet.publicKey.toBase58() : 'undefined');
+    console.log('DEBUG - wallet.publicKey:', wallet.publicKey.toBase58());
     const balance = await connection.getBalance(wallet.publicKey);
     console.log('DEBUG - Balance fetched from Solana:', balance, 'lamports');
     const taxWalletBalance = balance / LAMPORTS_PER_SOL;
 
+    // Cache the result
     console.log('DEBUG - Caching balance in Redis...');
-    await redis.setEx(cacheKey, 60, taxWalletBalance.toString());
+    try {
+      await redis.setEx(cacheKey, 60, taxWalletBalance.toString());
+    } catch (redisErr) {
+      console.error('Redis error during setEx:', redisErr.message);
+      throw new Error(`Redis error: ${redisErr.message}`);
+    }
     console.log('Cache miss for tax_wallet_balance, fetched from Solana:', taxWalletBalance);
 
     res.json({ success: true, balance: taxWalletBalance });
