@@ -629,49 +629,17 @@ const refundAllActiveGames = async () => {
 };
 
 
+// Endpoint per il saldo del tax wallet
 app.get('/tax-wallet-balance', async (req, res) => {
-  const cacheKey = 'tax_wallet_balance';
   try {
-    // Validate wallet
-    if (!wallet || !wallet.publicKey) {
-      throw new Error('Tax wallet is not initialized');
-    }
-
-    // Fetch cached balance
-    console.log('DEBUG - Attempting to fetch cached balance from Redis...');
-    let cachedBalance;
-    try {
-      cachedBalance = await redis.get(cacheKey);
-    } catch (redisErr) {
-      console.error('Redis error during get:', redisErr.message);
-      throw new Error(`Redis error: ${redisErr.message}`);
-    }
-    if (cachedBalance) {
-      console.log('Cache hit for tax_wallet_balance:', cachedBalance);
-      return res.json({ success: true, balance: parseFloat(cachedBalance) });
-    }
-
-    // Query Solana
-    console.log('DEBUG - Cache miss, querying Solana for tax wallet balance...');
-    console.log('DEBUG - wallet.publicKey:', wallet.publicKey.toBase58());
+    console.log('Fetching tax wallet balance for:', wallet.publicKey.toBase58());
     const balance = await connection.getBalance(wallet.publicKey);
-    console.log('DEBUG - Balance fetched from Solana:', balance, 'lamports');
+    console.log('Balance fetched:', balance);
     const taxWalletBalance = balance / LAMPORTS_PER_SOL;
-
-    // Cache the result
-    console.log('DEBUG - Caching balance in Redis...');
-    try {
-      await redis.setEx(cacheKey, 60, taxWalletBalance.toString());
-    } catch (redisErr) {
-      console.error('Redis error during setEx:', redisErr.message);
-      throw new Error(`Redis error: ${redisErr.message}`);
-    }
-    console.log('Cache miss for tax_wallet_balance, fetched from Solana:', taxWalletBalance);
-
     res.json({ success: true, balance: taxWalletBalance });
   } catch (err) {
-    console.error('Error fetching tax wallet balance:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to fetch tax wallet balance: ${err.message}` });
+    console.error('Error fetching tax wallet balance:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch tax wallet balance' });
   }
 });
 
@@ -2297,3 +2265,42 @@ console.log(`PORT environment variable: ${process.env.PORT}`);
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
