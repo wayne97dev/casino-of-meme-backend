@@ -556,6 +556,16 @@ app.post('/play-coin-flip', async (req, res) => {
   }
 });
 
+app.get('/get-crazy-wheel', (req, res) => {
+  try {
+    console.log('DEBUG - Fetching crazyTimeWheel for frontend');
+    res.json({ success: true, wheel: crazyTimeWheel });
+  } catch (err) {
+    console.error('Error fetching crazyTimeWheel:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch wheel data' });
+  }
+});
+
 // Endpoint per Crazy Wheel
 app.post('/play-crazy-wheel', async (req, res) => {
   const { playerAddress, bets, signedTransaction } = req.body;
