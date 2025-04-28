@@ -1214,6 +1214,7 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 
   console.log('DEBUG - /distribute-winnings-sol called:', { playerAddress, amount });
 
+  // Validazione degli input
   if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, amount });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
@@ -1221,12 +1222,22 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 
   try {
     console.log('DEBUG - Validating player address...');
-    const userPublicKey = new PublicKey(playerAddress);
+    let userPublicKey;
+    try {
+      userPublicKey = new PublicKey(playerAddress);
+    } catch (err) {
+      console.log('DEBUG - Invalid player address:', err.message);
+      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
+    }
 
-    // Verifica il saldo SOL del casinò con caching
     console.log('DEBUG - Checking casino SOL balance...');
-    const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol');
+    const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true); // Forza refresh
     const requiredBalance = amount + 0.01; // Importo + fee minime
+    console.log('DEBUG - Casino balance check:', {
+      casinoSolBalance,
+      requiredBalance,
+      sufficient: casinoSolBalance >= requiredBalance,
+    });
     if (casinoSolBalance < requiredBalance) {
       console.log('DEBUG - Insufficient SOL balance in casino wallet:', {
         balance: casinoSolBalance,
@@ -1234,11 +1245,10 @@ app.post('/distribute-winnings-sol', async (req, res) => {
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient SOL balance in casino wallet: ${casinoSolBalance} SOL available, ${requiredBalance} SOL required`,
+        error: `Insufficient SOL balance in casino wallet: ${casinoSolBalance} SOL available, ${requiredBalance.toFixed(4)} SOL required`,
       });
     }
 
-    // Crea la transazione di trasferimento
     console.log('DEBUG - Creating SOL transfer transaction for', amount, 'SOL...');
     const transaction = new Transaction().add(
       SystemProgram.transfer({
@@ -1250,12 +1260,22 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 
     console.log('DEBUG - Getting latest blockhash...');
     const { blockhash } = await getCachedBlockhash(connection);
+    console.log('DEBUG - Blockhash:', blockhash);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
-    transaction.partialSign(wallet);
+
+    console.log('DEBUG - Signing transaction...');
+    try {
+      transaction.partialSign(wallet);
+    } catch (err) {
+      console.error('DEBUG - Error signing transaction:', err);
+      throw new Error('Failed to sign transaction');
+    }
 
     console.log('DEBUG - Sending transaction...');
     const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()), 3, 1000);
+    console.log('DEBUG - Transaction sent, signature:', signature);
+
     console.log('DEBUG - Confirming transaction...');
     await connection.confirmTransaction(signature, 'confirmed');
     console.log(`DEBUG - Distributed ${amount} SOL to ${playerAddress}, signature: ${signature}`);
