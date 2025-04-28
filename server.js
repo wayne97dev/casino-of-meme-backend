@@ -166,31 +166,50 @@ async function getCachedBlockhash(connection) {
   }
 }
 
-async function getCachedBalance(connection, publicKey, type = 'sol') {
+async function getCachedBalance(connection, publicKey, type = 'sol', forceRefresh = false) {
   const cacheKey = `balance:${publicKey.toBase58()}:${type}`;
-  try {
-    const cachedBalance = await redisClient.get(cacheKey);
-    if (cachedBalance) {
-      console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}`);
-      return parseFloat(cachedBalance);
+  if (!forceRefresh) {
+    try {
+      const cachedBalance = await redisClient.get(cacheKey);
+      if (cachedBalance) {
+        const balance = parseFloat(cachedBalance);
+        console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
+        // Controlla se il saldo è valido
+        if (balance < 0 || isNaN(balance)) {
+          console.log('DEBUG - Invalid cached balance, forcing refresh');
+          forceRefresh = true;
+        } else {
+          return balance;
+        }
+      }
+    } catch (err) {
+      console.error('DEBUG - Redis error fetching balance:', err);
     }
-  } catch (err) {
-    console.error('DEBUG - Redis error fetching balance:', err);
   }
 
   try {
     let balance;
     if (type === 'sol') {
-      balance = await connection.getBalance(publicKey);
-      balance = balance / LAMPORTS_PER_SOL;
+      try {
+        balance = await connection.getBalance(publicKey);
+        balance = balance / LAMPORTS_PER_SOL;
+        console.log(`DEBUG - Successfully fetched SOL balance from primary RPC for ${publicKey.toBase58()}: ${balance}`);
+      } catch (err) {
+        console.error('DEBUG - Primary RPC failed, trying fallback:', err);
+        const fallbackConnection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+        balance = await fallbackConnection.getBalance(publicKey);
+        balance = balance / LAMPORTS_PER_SOL;
+        console.log(`DEBUG - Successfully fetched SOL balance from fallback RPC for ${publicKey.toBase58()}: ${balance}`);
+      }
     } else if (type === 'com') {
       const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
       const account = await connection.getTokenAccountBalance(userATA).catch(() => ({
         value: { uiAmount: 0 },
       }));
       balance = account.value.uiAmount || 0;
+      console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
     }
-    await redisClient.setEx(cacheKey, 60, balance.toString());
+    await redisClient.setEx(cacheKey, 30, balance.toString());
     console.log(`DEBUG - Fetched and cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
     return balance;
   } catch (err) {
@@ -462,16 +481,20 @@ app.post('/play-coin-flip', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction, choice } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !choice || !['blue', 'red'].includes(choice)) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction, choice });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+    console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
     // Verifica il saldo SOL con caching
-    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
-    if (userBalance < betInLamports) {
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol', req.body.forceRefresh || false);
+    console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
+    if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
+      console.log('DEBUG - Insufficient SOL balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
@@ -480,12 +503,14 @@ app.post('/play-coin-flip', async (req, res) => {
     const transaction = Transaction.from(transactionBuffer);
 
     if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures:', transaction.signatures);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
     const signature = await connection.sendRawTransaction(transaction.serialize());
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
@@ -536,11 +561,13 @@ app.post('/play-crazy-wheel', async (req, res) => {
   const { playerAddress, bets, signedTransaction } = req.body;
 
   if (!playerAddress || !bets || !signedTransaction) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, bets, signedTransaction });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   const totalBet = Object.values(bets).reduce((sum, bet) => sum + bet, 0);
   if (totalBet <= 0) {
+    console.log('DEBUG - No bets placed:', { bets });
     return res.status(400).json({ success: false, error: 'No bets placed' });
   }
 
@@ -548,6 +575,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
   const validSegments = ['1', '2', '5', '10', 'Coin Flip', 'Pachinko', 'Cash Hunt', 'Crazy Time'];
   for (const segment in bets) {
     if (!validSegments.includes(segment) || isNaN(bets[segment]) || bets[segment] < 0) {
+      console.log('DEBUG - Invalid bet segment or amount:', { segment, amount: bets[segment] });
       return res.status(400).json({ success: false, error: 'Invalid bet segment or amount' });
     }
   }
@@ -555,10 +583,13 @@ app.post('/play-crazy-wheel', async (req, res) => {
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(totalBet * LAMPORTS_PER_SOL);
+    console.log('DEBUG - Bet details:', { totalBet, betInLamports });
 
     // Verifica il saldo SOL con caching
-    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
-    if (userBalance < betInLamports) {
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol', req.body.forceRefresh || false);
+    console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
+    if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
+      console.log('DEBUG - Insufficient SOL balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
@@ -567,12 +598,14 @@ app.post('/play-crazy-wheel', async (req, res) => {
     const transaction = Transaction.from(transactionBuffer);
 
     if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures:', transaction.signatures);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
     const signature = await connection.sendRawTransaction(transaction.serialize());
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
@@ -583,21 +616,12 @@ app.post('/play-crazy-wheel', async (req, res) => {
   }
 });
 
-app.get('/get-crazy-wheel', (req, res) => {
-  try {
-    console.log('DEBUG - Fetching crazyTimeWheel for frontend');
-    res.json({ success: true, wheel: crazyTimeWheel });
-  } catch (err) {
-    console.error('Error fetching crazyTimeWheel:', err);
-    res.status(500).json({ success: false, error: 'Failed to fetch wheel data' });
-  }
-});
-
 // Endpoint aggiornato per Solana Card Duel
 app.post('/play-solana-card-duel', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction, action } = req.body;
 
   if (!playerAddress || !action) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, action });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or action' });
   }
 
@@ -606,16 +630,20 @@ app.post('/play-solana-card-duel', async (req, res) => {
   }
 
   if (!betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    console.log('DEBUG - Invalid bet parameters:', { betAmount, signedTransaction });
     return res.status(400).json({ success: false, error: 'Invalid betAmount or signedTransaction' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+    console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
     // Verifica il saldo SOL con caching
-    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
-    if (userBalance < betInLamports) {
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol', req.body.forceRefresh || false);
+    console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
+    if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
+      console.log('DEBUG - Insufficient SOL balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
@@ -623,12 +651,14 @@ app.post('/play-solana-card-duel', async (req, res) => {
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
     if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures:', transaction.signatures);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
     const signature = await connection.sendRawTransaction(transaction.serialize());
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
