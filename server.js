@@ -292,16 +292,20 @@ app.post('/play-meme-slots', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   try {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+    console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
     // Verifica il saldo SOL con caching
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
-    if (userBalance < betInLamports) {
+    console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
+    if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
+      console.log('DEBUG - Insufficient SOL balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
