@@ -1,7 +1,5 @@
 require('dotenv').config(); // Carica le variabili d'ambiente dal file .env
 
-
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -12,6 +10,7 @@ const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
+const { client: redisClient, connectRedis } = require('./config/redis'); // Importa il modulo Redis
 
 const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 
@@ -46,7 +45,6 @@ app.use((req, res, next) => {
   next();
 });
 
-
 // Middleware CORS ottimizzato
 app.use(cors({
   origin: (origin, callback) => {
@@ -59,14 +57,14 @@ app.use(cors({
       callback(new Error(`Origin ${origin} not allowed by CORS`));
     }
   },
-  methods: ['GET', 'POST', 'OPTIONS'], // Metodi consentiti
-  allowedHeaders: ['Content-Type', 'Authorization'], // Header consentiti
-  credentials: true, // Consenti i cookie e altre credenziali
-  preflightContinue: false, // Assicurati che la risposta preflight sia gestita correttamente
-  optionsSuccessStatus: 204, // Stato di successo per le richieste OPTIONS
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
 }));
 
-// Gestore esplicito per richieste OPTIONS (aggiunto come precauzione)
+// Gestore esplicito per richieste OPTIONS
 app.options('*', (req, res) => {
   console.log(`Handling OPTIONS request from origin: ${req.headers.origin}`);
   res.header('Access-Control-Allow-Origin', req.headers.origin);
@@ -76,7 +74,6 @@ app.options('*', (req, res) => {
   res.sendStatus(204);
 });
 
-// Gestore esplicito per richieste OPTIONS
 app.options('*', cors());
 
 // Middleware per parsing JSON
@@ -106,6 +103,12 @@ mongoose.connect(MONGODB_URI, {
     console.error('MongoDB connection error:', err);
     process.exit(1);
   });
+
+// Connessione a Redis
+connectRedis().catch(err => {
+  console.error('ERROR - Could not connect to Redis:', err);
+  // Non terminare il processo, continua senza caching
+});
 
 // Connessione a Solana
 const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
@@ -139,6 +142,90 @@ const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
 // Scommessa minima in COM per Poker PvP
 const MIN_BET = 1000; // 1000 COM
 
+// Funzioni di caching per Solana
+async function getCachedBlockhash(connection) {
+  const cacheKey = 'latestBlockhash';
+  try {
+    const cachedBlockhash = await redisClient.get(cacheKey);
+    if (cachedBlockhash) {
+      console.log('DEBUG - Using cached blockhash');
+      return JSON.parse(cachedBlockhash);
+    }
+  } catch (err) {
+    console.error('DEBUG - Redis error fetching blockhash:', err);
+  }
+
+  try {
+    const { blockhash } = await connection.getLatestBlockhash();
+    await redisClient.setEx(cacheKey, 30, JSON.stringify({ blockhash }));
+    console.log('DEBUG - Fetched and cached new blockhash:', blockhash);
+    return { blockhash };
+  } catch (err) {
+    console.error('DEBUG - Error fetching blockhash from Solana:', err);
+    throw err;
+  }
+}
+
+async function getCachedBalance(connection, publicKey, type = 'sol') {
+  const cacheKey = `balance:${publicKey.toBase58()}:${type}`;
+  try {
+    const cachedBalance = await redisClient.get(cacheKey);
+    if (cachedBalance) {
+      console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}`);
+      return parseFloat(cachedBalance);
+    }
+  } catch (err) {
+    console.error('DEBUG - Redis error fetching balance:', err);
+  }
+
+  try {
+    let balance;
+    if (type === 'sol') {
+      balance = await connection.getBalance(publicKey);
+      balance = balance / LAMPORTS_PER_SOL;
+    } else if (type === 'com') {
+      const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
+      const account = await connection.getTokenAccountBalance(userATA).catch(() => ({
+        value: { uiAmount: 0 },
+      }));
+      balance = account.value.uiAmount || 0;
+    }
+    await redisClient.setEx(cacheKey, 60, balance.toString());
+    console.log(`DEBUG - Fetched and cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
+    return balance;
+  } catch (err) {
+    console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err);
+    throw err;
+  }
+}
+
+async function getCachedMintInfo(connection, mintAddress) {
+  const cacheKey = `mint:${mintAddress.toBase58()}`;
+  try {
+    const cachedMintInfo = await redisClient.get(cacheKey);
+    if (cachedMintInfo) {
+      console.log('DEBUG - Using cached mint info');
+      return JSON.parse(cachedMintInfo);
+    }
+  } catch (err) {
+    console.error('DEBUG - Redis error fetching mint info:', err);
+  }
+
+  try {
+    const mintInfo = await connection.getParsedAccountInfo(mintAddress);
+    if (!mintInfo.value) {
+      throw new Error('Failed to fetch mint info');
+    }
+    const mintData = mintInfo.value.data.parsed.info;
+    await redisClient.setEx(cacheKey, 24 * 60 * 60, JSON.stringify(mintData)); // Cache per 24 ore
+    console.log('DEBUG - Fetched and cached mint info:', mintData);
+    return mintData;
+  } catch (err) {
+    console.error('DEBUG - Error fetching mint info from Solana:', err);
+    throw err;
+  }
+}
+
 // Funzione per rimuovere riferimenti circolari
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
   if (obj && typeof obj === 'object') {
@@ -159,8 +246,6 @@ const removeCircularReferences = (obj, seen = new WeakSet()) => {
   }
   return obj;
 };
-
-
 
 // Costanti per i minigiochi
 const COMPUTER_WIN_CHANCE = {
@@ -214,8 +299,8 @@ app.post('/play-meme-slots', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo SOL
-    const userBalance = await connection.getBalance(userPublicKey);
+    // Verifica il saldo SOL con caching
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
     if (userBalance < betInLamports) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
@@ -243,7 +328,6 @@ app.post('/play-meme-slots', async (req, res) => {
     ];
 
     if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
-      // Computer vince: genera un risultato senza linee vincenti
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       let attempts = 0;
       while (attempts < 20) {
@@ -271,7 +355,6 @@ app.post('/play-meme-slots', async (req, res) => {
         attempts++;
       }
     } else {
-      // Giocatore vince: genera una linea vincente
       result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
       const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
       const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
@@ -347,7 +430,7 @@ app.post('/play-meme-slots', async (req, res) => {
         })
       );
 
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -382,8 +465,8 @@ app.post('/play-coin-flip', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo SOL
-    const userBalance = await connection.getBalance(userPublicKey);
+    // Verifica il saldo SOL con caching
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
     if (userBalance < betInLamports) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
@@ -423,7 +506,7 @@ app.post('/play-coin-flip', async (req, res) => {
         })
       );
 
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -443,8 +526,6 @@ app.post('/play-coin-flip', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to play coin flip' });
   }
 });
-
-
 
 // Endpoint per Crazy Wheel
 app.post('/play-crazy-wheel', async (req, res) => {
@@ -471,8 +552,8 @@ app.post('/play-crazy-wheel', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(totalBet * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo SOL
-    const userBalance = await connection.getBalance(userPublicKey);
+    // Verifica il saldo SOL con caching
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
     if (userBalance < betInLamports) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
@@ -491,7 +572,6 @@ app.post('/play-crazy-wheel', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    // Non genera il risultato del gioco, lascia che il frontend lo gestisca
     res.json({ success: true });
   } catch (err) {
     console.error('Error in play-crazy-wheel:', err);
@@ -509,15 +589,7 @@ app.get('/get-crazy-wheel', (req, res) => {
   }
 });
 
- 
-
-
-
-
-
-
-
-// Endpoint aggiornato
+// Endpoint aggiornato per Solana Card Duel
 app.post('/play-solana-card-duel', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction, action } = req.body;
 
@@ -526,7 +598,6 @@ app.post('/play-solana-card-duel', async (req, res) => {
   }
 
   if (action !== 'start') {
-    // Ignora azioni diverse da 'start', poiché la logica di gioco è gestita nel frontend
     return res.json({ success: true });
   }
 
@@ -538,8 +609,8 @@ app.post('/play-solana-card-duel', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    // Verifica il saldo SOL
-    const userBalance = await connection.getBalance(userPublicKey);
+    // Verifica il saldo SOL con caching
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
     if (userBalance < betInLamports) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
@@ -584,7 +655,7 @@ const refundBetsForGame = async (gameId) => {
         playerSocket.emit('refund', {
           message: 'Game crashed or interrupted. Your bet has been refunded.',
           amount: player.bet,
-          isRefund: true, // Aggiunto flag
+          isRefund: true,
         });
         console.log(`Refunded ${player.bet} COM to ${player.address} for game ${gameId}`);
       } else {
@@ -631,10 +702,9 @@ const refundAllActiveGames = async () => {
 app.get('/tax-wallet-balance', async (req, res) => {
   try {
     console.log('Fetching tax wallet balance for:', wallet.publicKey.toBase58());
-    const balance = await connection.getBalance(wallet.publicKey);
+    const balance = await getCachedBalance(connection, wallet.publicKey, 'sol');
     console.log('Balance fetched:', balance);
-    const taxWalletBalance = balance / LAMPORTS_PER_SOL;
-    res.json({ success: true, balance: taxWalletBalance });
+    res.json({ success: true, balance });
   } catch (err) {
     console.error('Error fetching tax wallet balance:', err);
     res.status(500).json({ success: false, error: 'Failed to fetch tax wallet balance' });
@@ -644,7 +714,7 @@ app.get('/tax-wallet-balance', async (req, res) => {
 // Endpoint per le ricompense
 app.get('/rewards', async (req, res) => {
   try {
-    const balance = await connection.getBalance(wallet.publicKey);
+    const balance = await getCachedBalance(connection, wallet.publicKey, 'sol');
     const usableBalance = balance * 0.5;
     const solPerToken = Math.floor(usableBalance * 0.95);
     const solPerPortion = Math.floor(solPerToken / 3);
@@ -688,12 +758,8 @@ app.get('/com-balance/:playerAddress', async (req, res) => {
   const { playerAddress } = req.params;
   try {
     const userPublicKey = new PublicKey(playerAddress);
-    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
-    const balance = await connection.getTokenAccountBalance(userATA).catch(() => ({
-      value: { uiAmount: 0 },
-    }));
-    const comBalance = balance.value.uiAmount || 0;
-    res.json({ success: true, balance: comBalance });
+    const balance = await getCachedBalance(connection, userPublicKey, 'com');
+    res.json({ success: true, balance });
   } catch (err) {
     console.error('Error fetching COM balance:', err);
     res.status(500).json({ success: false, error: 'Failed to fetch COM balance' });
@@ -720,16 +786,16 @@ app.post('/distribute-winnings', async (req, res) => {
     const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
 
     console.log('DEBUG - Checking casino SOL balance...');
-    const casinoSolBalance = await connection.getBalance(wallet.publicKey);
+    const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol');
     const minSolBalance = 0.01 * LAMPORTS_PER_SOL;
-    if (casinoSolBalance < minSolBalance) {
+    if (casinoSolBalance * LAMPORTS_PER_SOL < minSolBalance) {
       console.log('DEBUG - Insufficient SOL balance:', {
-        balance: casinoSolBalance / LAMPORTS_PER_SOL,
+        balance: casinoSolBalance,
         required: minSolBalance / LAMPORTS_PER_SOL,
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
+        error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
       });
     }
 
@@ -753,7 +819,7 @@ app.post('/distribute-winnings', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -763,17 +829,15 @@ app.post('/distribute-winnings', async (req, res) => {
     }
 
     console.log('DEBUG - Checking casino COM balance...');
-    const casinoBalance = await connection.getTokenAccountBalance(casinoATA).catch(() => ({
-      value: { uiAmount: 0 },
-    }));
-    if (casinoBalance.value.uiAmount < amount) {
+    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com');
+    if (casinoBalance < amount) {
       console.log('DEBUG - Insufficient COM balance:', {
-        balance: casinoBalance.value.uiAmount,
+        balance: casinoBalance,
         required: amount,
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient COM balance in casino wallet: ${casinoBalance.value.uiAmount} COM available, ${amount} COM required`,
+        error: `Insufficient COM balance in casino wallet: ${casinoBalance} COM available, ${amount} COM required`,
       });
     }
 
@@ -797,7 +861,7 @@ app.post('/distribute-winnings', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -807,12 +871,7 @@ app.post('/distribute-winnings', async (req, res) => {
     }
 
     console.log('DEBUG - Verifying mint COM...');
-    const mintInfo = await connection.getParsedAccountInfo(MINT_ADDRESS);
-    if (!mintInfo.value) {
-      console.log('DEBUG - Failed to fetch token mint info');
-      return res.status(500).json({ success: false, error: 'Failed to fetch token mint info' });
-    }
-    const mintData = mintInfo.value.data.parsed.info;
+    const mintData = await getCachedMintInfo(connection, MINT_ADDRESS);
     if (mintData.decimals !== 6) {
       console.log('DEBUG - Unexpected mint decimals:', mintData.decimals);
       return res.status(500).json({
@@ -832,7 +891,7 @@ app.post('/distribute-winnings', async (req, res) => {
     );
 
     console.log('DEBUG - Getting latest blockhash...');
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await getCachedBlockhash(connection);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
     transaction.partialSign(wallet);
@@ -883,7 +942,7 @@ app.post('/refund', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -892,12 +951,10 @@ app.post('/refund', async (req, res) => {
       console.log('Created casino ATA:', casinoATA.toBase58());
     }
 
-    // Verifica il saldo del casinò
-    const casinoBalance = await connection.getTokenAccountBalance(casinoATA).catch(() => ({
-      value: { uiAmount: 0 },
-    }));
-    if (casinoBalance.value.uiAmount < amount) {
-      console.log('Insufficient COM balance in casino ATA:', { balance: casinoBalance.value.uiAmount, required: amount });
+    // Verifica il saldo del casinò con caching
+    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com');
+    if (casinoBalance < amount) {
+      console.log('Insufficient COM balance in casino ATA:', { balance: casinoBalance, required: amount });
       return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
     }
 
@@ -917,7 +974,7 @@ app.post('/refund', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -936,7 +993,7 @@ app.post('/refund', async (req, res) => {
       )
     );
 
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await getCachedBlockhash(connection);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
     transaction.partialSign(wallet);
@@ -952,20 +1009,18 @@ app.post('/refund', async (req, res) => {
   }
 });
 
-// Endpoint per creare una transazione (usato da tutti i minigiochi escluso Poker PvP)
+// Endpoint per creare una transazione
 app.post('/create-transaction', async (req, res) => {
   const { playerAddress, betAmount, type } = req.body;
 
   console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
 
-  // Validazione dei parametri
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or type' });
   }
 
   try {
-    // Validazione dell'indirizzo Solana
     let userPublicKey;
     try {
       userPublicKey = new PublicKey(playerAddress);
@@ -978,22 +1033,21 @@ app.post('/create-transaction', async (req, res) => {
     const transaction = new Transaction();
 
     if (type === 'sol') {
-      // Trasferimento SOL verso il tax wallet
       const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
       console.log('DEBUG - Bet in lamports:', betInLamports);
 
-      // Verifica il saldo dell'utente
-      const userBalance = await connection.getBalance(userPublicKey);
-      console.log('DEBUG - User balance:', userBalance / LAMPORTS_PER_SOL, 'SOL');
-      if (userBalance < betInLamports) {
-        console.log('DEBUG - Insufficient SOL balance:', userBalance / LAMPORTS_PER_SOL);
+      // Verifica il saldo dell'utente con caching
+      const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
+      console.log('DEBUG - User balance:', userBalance, 'SOL');
+      if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
+        console.log('DEBUG - Insufficient SOL balance:', userBalance);
         return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
       }
 
       transaction.add(
         SystemProgram.transfer({
           fromPubkey: userPublicKey,
-          toPubkey: wallet.publicKey, // Tax wallet
+          toPubkey: wallet.publicKey,
           lamports: betInLamports,
         })
       );
@@ -1001,12 +1055,10 @@ app.post('/create-transaction', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction type' });
     }
 
-    // Ottieni il blockhash recente
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await getCachedBlockhash(connection);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = userPublicKey;
 
-    // Log della transazione creata
     console.log('DEBUG - Transaction created:', {
       instructionCount: transaction.instructions.length,
       instructions: transaction.instructions.map((instr, index) => ({
@@ -1018,7 +1070,6 @@ app.post('/create-transaction', async (req, res) => {
       recentBlockhash: transaction.recentBlockhash,
     });
 
-    // Serializza la transazione
     const serializedTransaction = transaction.serialize({ requireAllSignatures: false }).toString('base64');
 
     res.json({ success: true, transaction: serializedTransaction });
@@ -1034,14 +1085,12 @@ app.post('/get-recent-blockhash', async (req, res) => {
 
   console.log('DEBUG - /get-recent-blockhash called with:', { playerAddress });
 
-  // Validazione dei parametri
   if (!playerAddress) {
     console.log('DEBUG - Invalid parameters:', { playerAddress });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress' });
   }
 
   try {
-    // Validazione dell'indirizzo Solana
     let userPublicKey;
     try {
       userPublicKey = new PublicKey(playerAddress);
@@ -1051,11 +1100,9 @@ app.post('/get-recent-blockhash', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid Solana address' });
     }
 
-    // Ottieni il blockhash recente
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await getCachedBlockhash(connection);
     console.log('DEBUG - Recent blockhash:', blockhash);
 
-    // Restituisci il blockhash
     res.json({
       success: true,
       recentBlockhash: blockhash,
@@ -1066,8 +1113,7 @@ app.post('/get-recent-blockhash', async (req, res) => {
   }
 });
 
-
-// Nuovo endpoint per processare le transazioni di tutti i minigiochi (escluso Poker PvP)
+// Endpoint per processare le transazioni di tutti i minigiochi
 app.post('/process-transaction', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
 
@@ -1075,7 +1121,7 @@ app.post('/process-transaction', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
-  const validGameTypes = ['memeSlots', 'crazyWheel', 'solanaCardDuel', 'coinFlip'];
+  const validGameTypes = ['memeSlots', 'coinFlip', 'crazyWheel', 'solanaCardDuel'];
   if (!validGameTypes.includes(gameType)) {
     return res.status(400).json({ success: false, error: 'Invalid gameType' });
   }
@@ -1084,8 +1130,8 @@ app.post('/process-transaction', async (req, res) => {
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
-    const userBalance = await connection.getBalance(userPublicKey);
-    if (userBalance < betInLamports) {
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
+    if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
@@ -1102,7 +1148,6 @@ app.post('/process-transaction', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    // Reindirizza la logica al gioco specifico
     const endpointMap = {
       memeSlots: '/play-meme-slots',
       coinFlip: '/play-coin-flip',
@@ -1117,7 +1162,7 @@ app.post('/process-transaction', async (req, res) => {
   }
 });
 
-// Endpoint per distribuire vincite in SOL (usato per tutti i minigiochi escluso Poker PvP)
+// Endpoint per distribuire vincite in SOL
 const retry = async (fn, retries = 3, delay = 1000) => {
   for (let i = 0; i < retries; i++) {
     try {
@@ -1144,18 +1189,18 @@ app.post('/distribute-winnings-sol', async (req, res) => {
     console.log('DEBUG - Validating player address...');
     const userPublicKey = new PublicKey(playerAddress);
 
-    // Verifica il saldo SOL del casinò
+    // Verifica il saldo SOL del casinò con caching
     console.log('DEBUG - Checking casino SOL balance...');
-    const casinoSolBalance = await connection.getBalance(wallet.publicKey);
-    const requiredBalance = amount * LAMPORTS_PER_SOL + 0.01 * LAMPORTS_PER_SOL; // Importo + fee minime
+    const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol');
+    const requiredBalance = amount + 0.01; // Importo + fee minime
     if (casinoSolBalance < requiredBalance) {
       console.log('DEBUG - Insufficient SOL balance in casino wallet:', {
-        balance: casinoSolBalance / LAMPORTS_PER_SOL,
-        required: requiredBalance / LAMPORTS_PER_SOL,
+        balance: casinoSolBalance,
+        required: requiredBalance,
       });
       return res.status(400).json({
         success: false,
-        error: `Insufficient SOL balance in casino wallet: ${casinoSolBalance / LAMPORTS_PER_SOL} SOL available, ${(requiredBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL required`,
+        error: `Insufficient SOL balance in casino wallet: ${casinoSolBalance} SOL available, ${requiredBalance} SOL required`,
       });
     }
 
@@ -1170,7 +1215,7 @@ app.post('/distribute-winnings-sol', async (req, res) => {
     );
 
     console.log('DEBUG - Getting latest blockhash...');
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash } = await getCachedBlockhash(connection);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
     transaction.partialSign(wallet);
@@ -1191,7 +1236,7 @@ app.post('/distribute-winnings-sol', async (req, res) => {
   }
 });
 
-// Endpoint per unirsi a una partita di Poker PvP (invariato)
+// Endpoint per unirsi a una partita di Poker PvP
 app.post('/join-poker-game', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
@@ -1224,7 +1269,7 @@ app.post('/join-poker-game', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -1233,12 +1278,10 @@ app.post('/join-poker-game', async (req, res) => {
       console.log('Created casino ATA');
     }
 
-    // Verifica il saldo COM dell'utente
-    const userBalance = await connection.getTokenAccountBalance(userATA).catch(() => ({
-      value: { uiAmount: 0 },
-    }));
-    if (userBalance.value.uiAmount < betAmount) {
-      console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${betAmount}`);
+    // Verifica il saldo COM dell'utente con caching
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'com');
+    if (userBalance < betAmount) {
+      console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance} < ${betAmount}`);
       return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
 
@@ -1266,7 +1309,7 @@ app.post('/join-poker-game', async (req, res) => {
   }
 });
 
-// Endpoint per gestire le mosse in Poker PvP (invariato)
+// Endpoint per gestire le mosse in Poker PvP
 app.post('/make-poker-move', async (req, res) => {
   const { playerAddress, gameId, move, amount, signedTransaction } = req.body;
 
@@ -1301,7 +1344,7 @@ app.post('/make-poker-move', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -1326,7 +1369,7 @@ app.post('/make-poker-move', async (req, res) => {
           MINT_ADDRESS
         )
       );
-      const { blockhash } = await connection.getLatestBlockhash();
+      const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
@@ -1336,9 +1379,9 @@ app.post('/make-poker-move', async (req, res) => {
     }
 
     if (amount > 0) {
-      const userBalance = await connection.getTokenAccountBalance(userATA);
-      if (userBalance.value.uiAmount < amount) {
-        console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance.value.uiAmount} < ${amount}`);
+      const userBalance = await getCachedBalance(connection, userPublicKey, 'com');
+      if (userBalance < amount) {
+        console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
       }
 
@@ -1367,7 +1410,7 @@ app.post('/make-poker-move', async (req, res) => {
   }
 });
 
-// Endpoint per la leaderboard (invariato)
+// Endpoint per la leaderboard
 app.get('/leaderboard', async (req, res) => {
   console.log('Received request for /leaderboard');
   try {
@@ -1395,14 +1438,13 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
-// Gestione delle connessioni WebSocket per Poker PvP (invariato)
+// Gestione delle connessioni WebSocket per Poker PvP
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM, socket.id: ${socket.id}`);
 
-    // Validazione dei parametri
     if (!playerAddress || !betAmount || isNaN(betAmount)) {
       const errorMsg = 'Invalid playerAddress or betAmount';
       console.log(`Join rejected: ${errorMsg}`);
@@ -1427,7 +1469,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Verifica se il giocatore è già nella lista
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
@@ -1438,25 +1479,20 @@ io.on('connection', (socket) => {
       console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
     }
 
-    // Log dello stato attuale della waiting list
     console.log('Current waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet, socketId: p.id })));
 
-    // Emetti evento waiting al giocatore
-    socket.emit('waiting', { 
-      message: 'You have joined the game! Waiting for another player...', 
-      players: waitingPlayers 
+    socket.emit('waiting', {
+      message: 'You have joined the game! Waiting for another player...',
+      players: waitingPlayers
     });
-    // Emetti evento waitingPlayers a tutti i client
-    io.emit('waitingPlayers', { 
-      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+    io.emit('waitingPlayers', {
+      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
     });
 
-    // Rispondi al client con un acknowledgment
     if (callback) {
       callback({ success: true, message: 'Joined waiting list successfully' });
     }
 
-    // Avvia una partita se ci sono almeno 2 giocatori
     if (waitingPlayers.length >= 2) {
       console.log(`Enough players (${waitingPlayers.length}), starting game...`);
       const gameId = Date.now().toString();
@@ -1514,9 +1550,8 @@ io.on('connection', (socket) => {
         }
       });
 
-      // Aggiorna la lista d'attesa per tutti i client
-      io.emit('waitingPlayers', { 
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })) 
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
       });
       console.log(`Game ${gameId} started with players:`, players.map(p => p.address));
 
@@ -1530,14 +1565,13 @@ io.on('connection', (socket) => {
       const player = waitingPlayers[playerIndex];
       waitingPlayers.splice(playerIndex, 1);
       console.log(`Player ${playerAddress} left the waiting list`);
-  
-      // Emetti l'evento refund con un flag isRefund per indicare che non è una vincita
+
       socket.emit('refund', {
         message: 'You left the waiting list. Your bet has been refunded.',
         amount: player.bet,
-        isRefund: true, // Aggiunto flag
+        isRefund: true,
       });
-  
+
       io.emit('waitingPlayers', {
         players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
       });
@@ -1585,12 +1619,12 @@ io.on('connection', (socket) => {
       console.log(`Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
       return;
     }
-  
+
     if (game.turnTimer) {
       clearInterval(game.turnTimer);
     }
     game.timeLeft = 30;
-  
+
     const playerAddress = game.players.find(p => p.id === socket.id)?.address;
     const opponent = game.players.find(p => p.id !== socket.id);
     if (!playerAddress || !opponent) {
@@ -1600,7 +1634,7 @@ io.on('connection', (socket) => {
     }
     const currentPlayerBet = game.playerBets[playerAddress] || 0;
     console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
-  
+
     if (move === 'fold') {
       game.status = 'finished';
       game.opponentCardsVisible = true;
@@ -1629,7 +1663,7 @@ io.on('connection', (socket) => {
         console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
         game.actionsCompleted += 1;
         console.log(`Actions completed: ${game.actionsCompleted}`);
-  
+
         if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
           game.bettingRoundComplete = true;
           game.actionsCompleted = 0;
@@ -1652,7 +1686,7 @@ io.on('connection', (socket) => {
       console.log(`Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
       game.actionsCompleted += 1;
       console.log(`Actions completed: ${game.actionsCompleted}`);
-  
+
       if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         game.actionsCompleted = 0;
@@ -1684,14 +1718,13 @@ io.on('connection', (socket) => {
       const additionalBet = newBet - currentPlayerBet;
       game.pot += additionalBet;
       game.playerBets[playerAddress] = newBet;
-      game.currentBet = newBet;
+      game.currentBet = new       game.currentBet;
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       console.log(`${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
-      game.actionsCompleted += 1;
+      game.actionsCompleted = 1; // Resetta a 1, poiché l'avversario deve rispondere
       game.currentTurn = opponent.id;
       game.bettingRoundComplete = false;
-      game.actionsCompleted = 1; // Resetta a 1, poiché l'avversario deve rispondere
       try {
         await Game.updateOne({ gameId }, { pot: game.pot });
         console.log(`Updated pot for game ${gameId} to ${game.pot}`);
@@ -1908,7 +1941,7 @@ const startGame = async (gameId) => {
     console.log(`Player 1 cards:`, player1Cards);
     console.log(`Player 2 cards:`, player2Cards);
 
-    if (!player1Cards.every(card => card && card.value && card.suit && card.image) || 
+    if (!player1Cards.every(card => card && card.value && card.suit && card.image) ||
         !player2Cards.every(card => card && card.value && card.suit && card.image)) {
       throw new Error('Invalid cards drawn');
     }
@@ -1930,7 +1963,7 @@ const startGame = async (gameId) => {
     game.status = 'playing';
     game.message = 'Pre-Flop: Place your bets.';
     game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
-    game.actionsCompleted = 0; // Inizializza il contatore delle azioni
+    game.actionsCompleted = 0;
 
     console.log(`Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
     startTurnTimer(gameId, game.players[0].id);
@@ -1942,7 +1975,6 @@ const startGame = async (gameId) => {
     await refundBetsForGame(gameId);
   }
 };
-
 
 const drawCard = () => {
   const cardNumber = Math.floor(Math.random() * 13) + 1;
@@ -1958,10 +1990,10 @@ const drawCard = () => {
   else if (cardNumber === 12) cardName = 'Q';
   else if (cardNumber === 13) cardName = 'K';
   else cardName = cardNumber.toString();
-  
+
   const value = cardNumber === 1 ? 14 : cardNumber;
   const image = `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`;
-  
+
   console.log(`Drawn card: ${cardName}${suitChar} (Value: ${value}, Suit: ${suit})`);
   return { value, suit, image };
 };
@@ -1979,7 +2011,6 @@ const advanceGamePhase = async (gameId) => {
     return;
   }
 
-  // Cancella qualsiasi timer attivo
   if (game.turnTimer) {
     clearTimeout(game.turnTimer);
     game.turnTimer = null;
@@ -2248,7 +2279,6 @@ const endGame = async (gameId) => {
     game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
     game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
   } else {
-    // Logica per il tie-breaker
     let tieBreaker = false;
     for (let i = 0; i < player1Evaluation.highCards.length; i++) {
       if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
@@ -2318,33 +2348,6 @@ const updateLeaderboard = async (playerAddress, winnings) => {
   }
 };
 
-app.get('/leaderboard', async (req, res) => {
-  console.log('Received request for /leaderboard');
-  try {
-    console.log('Fetching leaderboard...');
-    const leaderboard = await Player.find()
-      .sort({ totalWinnings: -1 })
-      .limit(10)
-      .maxTimeMS(5000);
-    console.log('Leaderboard fetched:', leaderboard);
-    if (!leaderboard || leaderboard.length === 0) {
-      console.log('Leaderboard is empty');
-      res.json([]);
-    } else {
-      const leaderboardWithUnit = leaderboard.map(player => ({
-        address: player.address,
-        totalWinnings: player.totalWinnings,
-        unit: 'COM',
-      }));
-      res.json(leaderboardWithUnit);
-    }
-  } catch (err) {
-    console.error('Error fetching leaderboard:', err.message);
-    console.error('Error stack:', err.stack);
-    res.status(500).json({ error: 'Error fetching leaderboard' });
-  }
-});
-
 // Gestione dei crash non gestiti
 process.on('uncaughtException', async (err) => {
   console.error('Uncaught Exception:', err);
@@ -2366,7 +2369,10 @@ process.on('SIGTERM', async () => {
   server.close(() => {
     mongoose.connection.close(() => {
       console.log('MongoDB connection closed');
-      process.exit(0);
+      redisClient.quit(() => {
+        console.log('Redis connection closed');
+        process.exit(0);
+      });
     });
   });
 });
