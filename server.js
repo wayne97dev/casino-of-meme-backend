@@ -133,6 +133,7 @@ try {
 // Stato del gioco
 const games = {};
 const waitingPlayers = [];
+let visitorCount = 0; // Aggiungi variabile per il conteggio dei visitatori
 
 // Indirizzo del mint COM
 const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
@@ -1502,9 +1503,20 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
-// Gestione delle connessioni WebSocket per Poker PvP
+
+// Gestione delle connessioni WebSocket
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
+
+  // Incrementa il conteggio dei visitatori
+  visitorCount++;
+  console.log(`New visitor connected. Total visitors: ${visitorCount}`);
+
+  // Invia il conteggio iniziale al client appena connesso
+  socket.emit('visitorCount', visitorCount);
+
+  // Trasmetti il conteggio aggiornato a tutti i client
+  io.emit('visitorCount', visitorCount);
 
   socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM, socket.id: ${socket.id}`);
@@ -1800,8 +1812,19 @@ io.on('connection', (socket) => {
     }
   });
 
+
   socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
+
+    // Decrementa il conteggio dei visitatori
+    visitorCount = Math.max(0, visitorCount - 1); // Assicura che non scenda sotto 0
+    console.log(`Visitor disconnected. Total visitors: ${visitorCount}`);
+
+    // Trasmetti il conteggio aggiornato a tutti i client
+    io.emit('visitorCount', visitorCount);
+
+
+
     for (const gameId in games) {
       const game = games[gameId];
       const playerIndex = game.players.findIndex(p => p.id === socket.id);
