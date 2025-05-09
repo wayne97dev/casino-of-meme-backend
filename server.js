@@ -1502,9 +1502,17 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
-// Gestione delle connessioni WebSocket per Poker PvP
+// Variabile per tracciare il numero di utenti connessi
+let activeUsers = 0;
+
+// Gestione delle connessioni WebSocket per Poker PvP e counter utenti
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
+  // Incrementa il contatore degli utenti attivi
+  activeUsers++;
+  console.log(`Active users: ${activeUsers}`);
+  // Invia il numero di utenti attivi a tutti i client
+  io.emit('activeUsers', { count: activeUsers });
 
   socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM, socket.id: ${socket.id}`);
@@ -1782,7 +1790,7 @@ io.on('connection', (socket) => {
       const additionalBet = newBet - currentPlayerBet;
       game.pot += additionalBet;
       game.playerBets[playerAddress] = newBet;
-      game.currentBet = new       game.currentBet;
+      game.currentBet = newBet; // Corretto da `game.currentBet` a `newBet`
       game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
       console.log(`${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
@@ -1802,6 +1810,12 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
+    // Decrementa il contatore degli utenti attivi
+    activeUsers = Math.max(0, activeUsers - 1); // Evita valori negativi
+    console.log(`Active users: ${activeUsers}`);
+    // Invia il nuovo conteggio a tutti i client
+    io.emit('activeUsers', { count: activeUsers });
+
     for (const gameId in games) {
       const game = games[gameId];
       const playerIndex = game.players.findIndex(p => p.id === socket.id);
