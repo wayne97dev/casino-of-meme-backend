@@ -1502,13 +1502,15 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
+
+
+// Gestione delle connessioni WebSocket per Poker PvP e counter utenti
 // Variabile per tracciare il numero di utenti connessi
 let activeUsers = 0;
 
-// Gestione delle connessioni WebSocket per Poker PvP e counter utenti
+// Gestione delle connessioni WebSocket
 io.on('connection', (socket) => {
   console.log('A player connected:', socket.id, 'from origin:', socket.handshake.headers.origin);
-  // Incrementa il contatore degli utenti attivi
   activeUsers++;
   console.log(`Active users: ${activeUsers}`);
   // Invia il numero di utenti attivi a tutti i client
@@ -1810,12 +1812,11 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
-    // Decrementa il contatore degli utenti attivi
-    activeUsers = Math.max(0, activeUsers - 1); // Evita valori negativi
+    activeUsers = Math.max(0, activeUsers - 1);
     console.log(`Active users: ${activeUsers}`);
-    // Invia il nuovo conteggio a tutti i client
     io.emit('activeUsers', { count: activeUsers });
 
+    
     for (const gameId in games) {
       const game = games[gameId];
       const playerIndex = game.players.findIndex(p => p.id === socket.id);
