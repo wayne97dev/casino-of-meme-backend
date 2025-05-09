@@ -268,7 +268,7 @@ const removeCircularReferences = (obj, seen = new WeakSet()) => {
 
 // Costanti per i minigiochi
 const COMPUTER_WIN_CHANCE = {
-  solanaCardDuel: 0.92,
+  solanaCardDuel: 0.97,
   memeSlots: 0.92,
   coinFlip: 0.6,
   crazyWheel: 0.95,
@@ -1802,41 +1802,32 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', async () => {
     console.log('A player disconnected:', socket.id);
-
-    const waitingIndex = waitingPlayers.findIndex(p => p.id === socket.id);
-    if (waitingIndex !== -1) {
-      const player = waitingPlayers[waitingIndex];
-      waitingPlayers.splice(waitingIndex, 1);
-      console.log(`Player ${player.address} removed from waiting list due to disconnect`);
-      io.emit('waitingPlayers', {
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
-      });
-    }
-
     for (const gameId in games) {
       const game = games[gameId];
       const playerIndex = game.players.findIndex(p => p.id === socket.id);
       if (playerIndex !== -1) {
         const opponent = game.players.find(p => p.id !== socket.id);
         if (opponent) {
-          if (game.turnTimer) {
-            clearInterval(game.turnTimer);
-          }
-          game.status = 'finished';
-          game.opponentCardsVisible = true;
-          game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
-          game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
-          io.to(gameId).emit('gameState', removeCircularReferences(game));
-          io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-          await updateLeaderboard(opponent.address, game.pot);
-          try {
-            await Game.updateOne({ gameId }, { status: 'finished' });
-            await Game.deleteOne({ gameId });
-            console.log(`Deleted game ${gameId} from database`);
-          } catch (err) {
-            console.error(`Error updating/deleting game ${gameId}:`, err);
-          }
-          delete games[gameId];
+          console.log(`Player ${socket.id} disconnected, waiting 30s before ending game ${gameId}`);
+          setTimeout(async () => {
+            if (!games[gameId]) return; // Gioco già terminato
+            if (game.turnTimer) clearInterval(game.turnTimer);
+            game.status = 'finished';
+            game.opponentCardsVisible = true;
+            game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
+            game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
+            io.to(gameId).emit('gameState', removeCircularReferences(game));
+            io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+            await updateLeaderboard(opponent.address, game.pot);
+            try {
+              await Game.updateOne({ gameId }, { status: 'finished' });
+              await Game.deleteOne({ gameId });
+              console.log(`Deleted game ${gameId} from database`);
+            } catch (err) {
+              console.error(`Error updating/deleting game ${gameId}:`, err);
+            }
+            delete games[gameId];
+          }, 30000); // Attendi 30 secondi
         } else {
           await refundBetsForGame(gameId);
         }
