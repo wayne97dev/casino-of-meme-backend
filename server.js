@@ -584,10 +584,22 @@ app.post('/play-meme-slots', async (req, res) => {
         })
       );
 
+      console.log('DEBUG - Getting latest blockhash for winnings transaction...');
       const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
+
+      console.log('DEBUG - Signing winnings transaction...');
+      try {
+        transaction.partialSign(wallet);
+        console.log('DEBUG - Winnings transaction signed successfully');
+      } catch (err) {
+        console.error('DEBUG - Error signing winnings transaction:', err.message, err.stack);
+        return res.status(500).json({
+          success: false,
+          error: `Failed to sign winnings transaction: ${err.message}`,
+        });
+      }
 
       // Calcola la firma della transazione
       const serializedTransaction = transaction.serialize();
@@ -1734,9 +1746,16 @@ const retry = async (fn, retries = 3, delay = 1000, transaction = null) => {
         const { blockhash } = await getCachedBlockhash(connection);
         console.log('DEBUG - Updating recentBlockhash for retry:', blockhash);
         transaction.recentBlockhash = blockhash;
+
+        // Non rimuovere le firme esistenti, mantieni quelle già presenti
         // Rifirma la transazione con il nuovo blockhash
-        transaction.signatures = []; // Rimuovi le firme esistenti
-        transaction.partialSign(wallet);
+        try {
+          transaction.partialSign(wallet);
+          console.log('DEBUG - Transaction re-signed with new blockhash');
+        } catch (err) {
+          console.error('DEBUG - Error re-signing transaction in retry:', err.message, err.stack);
+          throw err;
+        }
       }
 
       const result = await fn();
@@ -1748,7 +1767,7 @@ const retry = async (fn, retries = 3, delay = 1000, transaction = null) => {
       }
 
       if (i === retries - 1) {
-        console.error('DEBUG - Retry attempts exhausted:', err.message);
+        console.error('DEBUG - Retry attempts exhausted:', err.message, err.stack);
         throw err;
       }
 
