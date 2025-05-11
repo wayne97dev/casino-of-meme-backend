@@ -46,14 +46,27 @@ app.use((req, res, next) => {
 });
 
 // Middleware CORS ottimizzato
+app.use((req, res, next) => {
+  console.log('DEBUG - Setting CORS headers for:', req.url, 'Origin:', req.headers.origin);
+  res.header('Access-Control-Allow-Origin', req.headers.origin || 'https://casino-of-meme.com');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') {
+    console.log(`DEBUG - Handling OPTIONS request for ${req.url}`);
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 app.use(cors({
   origin: (origin, callback) => {
-    console.log(`CORS check - Origin received: ${origin}`);
+    console.log(`DEBUG - CORS check - Origin received: ${origin}`);
     if (!origin || allowedOrigins.includes(origin)) {
-      console.log(`CORS allowed - Origin: ${origin}`);
+      console.log(`DEBUG - CORS allowed - Origin: ${origin}`);
       callback(null, true);
     } else {
-      console.log(`CORS blocked - Origin: ${origin} not in allowedOrigins: ${allowedOrigins}`);
+      console.log(`DEBUG - CORS blocked - Origin: ${origin} not in allowedOrigins: ${allowedOrigins}`);
       callback(new Error(`Origin ${origin} not allowed by CORS`));
     }
   },
@@ -66,7 +79,7 @@ app.use(cors({
 
 // Gestore esplicito per richieste OPTIONS
 app.options('*', (req, res) => {
-  console.log(`Handling OPTIONS request from origin: ${req.headers.origin}`);
+  console.log(`DEBUG - Handling OPTIONS request from origin: ${req.headers.origin}`);
   res.header('Access-Control-Allow-Origin', req.headers.origin);
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -74,10 +87,14 @@ app.options('*', (req, res) => {
   res.sendStatus(204);
 });
 
-app.options('*', cors());
-
 // Middleware per parsing JSON
 app.use(express.json());
+
+// Gestore errori globale
+app.use((err, req, res, next) => {
+  console.error('DEBUG - Global error handler:', err.message, err.stack);
+  res.status(500).json({ success: false, error: 'Internal server error' });
+});
 
 // Endpoint health check
 app.get('/health', (req, res) => {
@@ -92,26 +109,36 @@ if (!MONGODB_URI) {
 }
 console.log('DEBUG - MONGODB_URI:', MONGODB_URI ? 'Present' : 'Missing');
 mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 50000,
-  connectTimeoutMS: 50000,
+  serverSelectionTimeoutMS: 100000,
+  connectTimeoutMS: 60000,
   socketTimeoutMS: 60000,
-  maxPoolSize: 10,
+  maxPoolSize: 20,
   retryWrites: true,
 })
-  .then(() => console.log('Connected to MongoDB'))
+  .then(() => console.log('DEBUG - Connected to MongoDB'))
   .catch(err => {
-    console.error('MongoDB connection error:', err);
+    console.error('DEBUG - MongoDB connection error:', err.message, err.stack);
     process.exit(1);
   });
 
 // Connessione a Redis
 connectRedis().catch(err => {
-  console.error('ERROR - Could not connect to Redis:', err);
-  // Non terminare il processo, continua senza caching
+  console.error('DEBUG - Could not connect to Redis:', err.message);
 });
 
 // Connessione a Solana
-const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
+const primaryConnection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
+const fallbackConnection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+
+async function getConnection() {
+  try {
+    await primaryConnection.getSlot();
+    return primaryConnection;
+  } catch (err) {
+    console.warn('DEBUG - Primary RPC failed, using fallback:', err.message);
+    return fallbackConnection;
+  }
+}
 
 // Carica la private key in formato base58
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
@@ -133,7 +160,7 @@ try {
 // Stato del gioco
 const games = {};
 const waitingPlayers = [];
-let visitorCount = 0; // Aggiungi variabile per il conteggio dei visitatori
+let visitorCount = 0;
 
 // Indirizzo del mint COM
 const COM_MINT_ADDRESS = '5HV956n7UQT1XdJzv43fHPocest5YAmi9ipsuiJx7zt7';
@@ -141,7 +168,7 @@ console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
 const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
 
 // Scommessa minima in COM per Poker PvP
-const MIN_BET = 1000; // 1000 COM
+const MIN_BET = 1000;
 
 // Funzioni di caching per Solana
 async function getCachedBlockhash(connection) {
@@ -153,7 +180,7 @@ async function getCachedBlockhash(connection) {
       return JSON.parse(cachedBlockhash);
     }
   } catch (err) {
-    console.error('DEBUG - Redis error fetching blockhash:', err);
+    console.warn('DEBUG - Redis error fetching blockhash:', err.message);
   }
 
   try {
@@ -162,7 +189,7 @@ async function getCachedBlockhash(connection) {
     console.log('DEBUG - Fetched and cached new blockhash:', blockhash);
     return { blockhash };
   } catch (err) {
-    console.error('DEBUG - Error fetching blockhash from Solana:', err);
+    console.error('DEBUG - Error fetching blockhash from Solana:', err.message);
     throw err;
   }
 }
@@ -174,17 +201,14 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
       const cachedBalance = await redisClient.get(cacheKey);
       if (cachedBalance) {
         const balance = parseFloat(cachedBalance);
-        console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
-        // Controlla se il saldo è valido
-        if (balance < 0 || isNaN(balance)) {
-          console.log('DEBUG - Invalid cached balance, forcing refresh');
-          forceRefresh = true;
-        } else {
+        if (balance >= 0 && !isNaN(balance)) {
+          console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
           return balance;
         }
+        console.log('DEBUG - Invalid cached balance, forcing refresh');
       }
     } catch (err) {
-      console.error('DEBUG - Redis error fetching balance:', err);
+      console.warn('DEBUG - Redis error fetching balance:', err.message);
     }
   }
 
@@ -194,13 +218,13 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
       try {
         balance = await connection.getBalance(publicKey);
         balance = balance / LAMPORTS_PER_SOL;
-        console.log(`DEBUG - Successfully fetched SOL balance from primary RPC for ${publicKey.toBase58()}: ${balance}`);
+        console.log(`DEBUG - Successfully fetched SOL balance for ${publicKey.toBase58()}: ${balance}`);
       } catch (err) {
-        console.error('DEBUG - Primary RPC failed, trying fallback:', err);
-        const fallbackConnection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
-        balance = await fallbackConnection.getBalance(publicKey);
+        console.error('DEBUG - Primary RPC failed, trying fallback:', err.message);
+        const fallbackConn = await getConnection();
+        balance = await fallbackConn.getBalance(publicKey);
         balance = balance / LAMPORTS_PER_SOL;
-        console.log(`DEBUG - Successfully fetched SOL balance from fallback RPC for ${publicKey.toBase58()}: ${balance}`);
+        console.log(`DEBUG - Successfully fetched SOL balance from fallback for ${publicKey.toBase58()}: ${balance}`);
       }
     } else if (type === 'com') {
       const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
@@ -210,11 +234,15 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
       balance = account.value.uiAmount || 0;
       console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
     }
-    await redisClient.setEx(cacheKey, 30, balance.toString());
-    console.log(`DEBUG - Fetched and cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
+    try {
+      await redisClient.setEx(cacheKey, 30, balance.toString());
+      console.log(`DEBUG - Cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
+    } catch (err) {
+      console.warn('DEBUG - Failed to cache balance:', err.message);
+    }
     return balance;
   } catch (err) {
-    console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err);
+    console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err.message);
     throw err;
   }
 }
@@ -228,7 +256,7 @@ async function getCachedMintInfo(connection, mintAddress) {
       return JSON.parse(cachedMintInfo);
     }
   } catch (err) {
-    console.error('DEBUG - Redis error fetching mint info:', err);
+    console.warn('DEBUG - Redis error fetching mint info:', err.message);
   }
 
   try {
@@ -237,11 +265,11 @@ async function getCachedMintInfo(connection, mintAddress) {
       throw new Error('Failed to fetch mint info');
     }
     const mintData = mintInfo.value.data.parsed.info;
-    await redisClient.setEx(cacheKey, 24 * 60 * 60, JSON.stringify(mintData)); // Cache per 24 ore
+    await redisClient.setEx(cacheKey, 24 * 60 * 60, JSON.stringify(mintData));
     console.log('DEBUG - Fetched and cached mint info:', mintData);
     return mintData;
   } catch (err) {
-    console.error('DEBUG - Error fetching mint info from Solana:', err);
+    console.error('DEBUG - Error fetching mint info from Solana:', err.message);
     throw err;
   }
 }
@@ -309,6 +337,7 @@ const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 
 // Endpoint per Meme Slots
 app.post('/play-meme-slots', async (req, res) => {
+  console.log('DEBUG - /play-meme-slots called:', req.body);
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
@@ -317,11 +346,13 @@ app.post('/play-meme-slots', async (req, res) => {
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
     console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
-    // Verifica il saldo SOL con caching
+    const connection = await getConnection();
+    console.log('DEBUG - Checking user SOL balance...');
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
     console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
@@ -329,21 +360,24 @@ app.post('/play-meme-slots', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Valida e processa la transazione firmata
+    console.log('DEBUG - Processing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
     if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures');
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    console.log('DEBUG - Sending transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Confirming transaction:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    // Genera il risultato della slot
     let result;
     const winLines = [
       [0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24],
@@ -402,7 +436,6 @@ app.post('/play-meme-slots', async (req, res) => {
       }
     }
 
-    // Calcola le vincite
     const winningLinesFound = [];
     const winningIndices = new Set();
     let totalWin = 0;
@@ -444,7 +477,6 @@ app.post('/play-meme-slots', async (req, res) => {
       }
     }
 
-    // Distribuisci le vincite
     if (totalWin > 0) {
       const transaction = new Transaction().add(
         SystemProgram.transfer({
@@ -461,7 +493,7 @@ app.post('/play-meme-slots', async (req, res) => {
 
       const winSignature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(winSignature);
-      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
+      console.log(`DEBUG - Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
     res.json({
@@ -472,13 +504,14 @@ app.post('/play-meme-slots', async (req, res) => {
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-meme-slots:', err);
+    console.error('DEBUG - Error in play-meme-slots:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to play meme slots' });
   }
 });
 
 // Endpoint per Coin Flip
 app.post('/play-coin-flip', async (req, res) => {
+  console.log('DEBUG - /play-coin-flip called:', req.body);
   const { playerAddress, betAmount, signedTransaction, choice } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !choice || !['blue', 'red'].includes(choice)) {
@@ -487,11 +520,13 @@ app.post('/play-coin-flip', async (req, res) => {
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
     console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
-    // Verifica il saldo SOL con caching
+    const connection = await getConnection();
+    console.log('DEBUG - Checking user SOL balance...');
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol', req.body.forceRefresh || false);
     console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
@@ -499,7 +534,7 @@ app.post('/play-coin-flip', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Valida e processa la transazione firmata
+    console.log('DEBUG - Processing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
@@ -508,14 +543,15 @@ app.post('/play-coin-flip', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    console.log('DEBUG - Sending transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Confirming transaction:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
       console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    // Genera il risultato del Coin Flip
     let flipResult;
     if (Math.random() < COMPUTER_WIN_CHANCE.coinFlip) {
       flipResult = choice === 'blue' ? 'red' : 'blue';
@@ -527,7 +563,6 @@ app.post('/play-coin-flip', async (req, res) => {
     if (choice === flipResult) {
       totalWin = betAmount * 2;
 
-      // Distribuisci la vincita
       const transaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: wallet.publicKey,
@@ -543,7 +578,7 @@ app.post('/play-coin-flip', async (req, res) => {
 
       const winSignature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(winSignature);
-      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
+      console.log(`DEBUG - Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
     res.json({
@@ -552,23 +587,25 @@ app.post('/play-coin-flip', async (req, res) => {
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-coin-flip:', err);
+    console.error('DEBUG - Error in play-coin-flip:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to play coin flip' });
   }
 });
 
 app.get('/get-crazy-wheel', (req, res) => {
+  console.log('DEBUG - /get-crazy-wheel called');
   try {
     console.log('DEBUG - Fetching crazyTimeWheel for frontend');
     res.json({ success: true, wheel: crazyTimeWheel });
   } catch (err) {
-    console.error('Error fetching crazyTimeWheel:', err);
+    console.error('DEBUG - Error fetching crazyTimeWheel:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to fetch wheel data' });
   }
 });
 
 // Endpoint per Crazy Wheel
 app.post('/play-crazy-wheel', async (req, res) => {
+  console.log('DEBUG - /play-crazy-wheel called:', req.body);
   const { playerAddress, bets, signedTransaction } = req.body;
 
   if (!playerAddress || !bets || !signedTransaction) {
@@ -582,7 +619,6 @@ app.post('/play-crazy-wheel', async (req, res) => {
     return res.status(400).json({ success: false, error: 'No bets placed' });
   }
 
-  // Valida le scommesse
   const validSegments = ['1', '2', '5', '10', 'Coin Flip', 'Pachinko', 'Cash Hunt', 'Crazy Time'];
   for (const segment in bets) {
     if (!validSegments.includes(segment) || isNaN(bets[segment]) || bets[segment] < 0) {
@@ -592,11 +628,13 @@ app.post('/play-crazy-wheel', async (req, res) => {
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(totalBet * LAMPORTS_PER_SOL);
     console.log('DEBUG - Bet details:', { totalBet, betInLamports });
 
-    // Verifica il saldo SOL con caching
+    const connection = await getConnection();
+    console.log('DEBUG - Checking user SOL balance...');
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol', req.body.forceRefresh || false);
     console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
@@ -604,7 +642,7 @@ app.post('/play-crazy-wheel', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Valida e processa la transazione firmata
+    console.log('DEBUG - Processing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
@@ -613,7 +651,9 @@ app.post('/play-crazy-wheel', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    console.log('DEBUG - Sending transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Confirming transaction:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
       console.log('DEBUG - Transaction failed:', confirmation.value.err);
@@ -622,13 +662,14 @@ app.post('/play-crazy-wheel', async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error in play-crazy-wheel:', err);
+    console.error('DEBUG - Error in play-crazy-wheel:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to process transaction' });
   }
 });
 
 // Endpoint aggiornato per Solana Card Duel
 app.post('/play-solana-card-duel', async (req, res) => {
+  console.log('DEBUG - /play-solana-card-duel called:', req.body);
   const { playerAddress, betAmount, signedTransaction, action } = req.body;
 
   if (!playerAddress || !action) {
@@ -646,11 +687,13 @@ app.post('/play-solana-card-duel', async (req, res) => {
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
     console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
-    // Verifica il saldo SOL con caching
+    const connection = await getConnection();
+    console.log('DEBUG - Checking user SOL balance...');
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol', req.body.forceRefresh || false);
     console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
@@ -658,7 +701,7 @@ app.post('/play-solana-card-duel', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
-    // Valida e processa la transazione
+    console.log('DEBUG - Processing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
     if (!transaction.verifySignatures()) {
@@ -666,7 +709,9 @@ app.post('/play-solana-card-duel', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    console.log('DEBUG - Sending transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Confirming transaction:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
       console.log('DEBUG - Transaction failed:', confirmation.value.err);
@@ -678,50 +723,52 @@ app.post('/play-solana-card-duel', async (req, res) => {
       message: 'Bet placed successfully',
     });
   } catch (err) {
-    console.error('Error in play-solana-card-duel:', err);
+    console.error('DEBUG - Error in play-solana-card-duel:', err.message, err.stack);
     res.status(500).json({ success: false, error: `Failed to play solana card duel: ${err.message}` });
   }
 });
 
 // Funzione di rimborso per una partita
 const refundBetsForGame = async (gameId) => {
+  console.log('DEBUG - Refunding bets for game:', gameId);
   try {
     const game = await Game.findOne({ gameId });
     if (!game || game.status === 'finished') {
-      console.log(`No active game ${gameId} to refund or already finished`);
+      console.log(`DEBUG - No active game ${gameId} to refund or already finished`);
       return;
     }
 
-    console.log(`Refunding bets for game ${gameId}, players:`, game.players);
+    console.log(`DEBUG - Refunding bets for game ${gameId}, players:`, game.players);
     for (const player of game.players) {
       const playerSocket = io.sockets.sockets.get(player.id);
       if (playerSocket) {
-        console.log(`Emitting refund event to player ${player.address}, amount: ${player.bet}`);
+        console.log(`DEBUG - Emitting refund event to player ${player.address}, amount: ${player.bet}`);
         playerSocket.emit('refund', {
           message: 'Game crashed or interrupted. Your bet has been refunded.',
           amount: player.bet,
           isRefund: true,
         });
-        console.log(`Refunded ${player.bet} COM to ${player.address} for game ${gameId}`);
+        console.log(`DEBUG - Refunded ${player.bet} COM to ${player.address} for game ${gameId}`);
       } else {
-        console.log(`Player ${player.address} socket not found, skipping refund emission`);
+        console.log(`DEBUG - Player ${player.address} socket not found, skipping refund emission`);
       }
     }
 
     await Game.deleteOne({ gameId });
-    console.log(`Deleted game ${gameId} after refund`);
+    console.log(`DEBUG - Deleted game ${gameId} from database`);
 
     if (games[gameId]) {
       delete games[gameId];
-      console.log(`Removed game ${gameId} from games object`);
+      console.log(`DEBUG - Removed game ${gameId} from games object`);
     }
   } catch (err) {
-    console.error(`Error refunding bets for game ${gameId}:`, err.message, err.stack);
+    console.error(`DEBUG - Error refunding bets for game ${gameId}:`, err.message, err.stack);
   }
 };
 
 // Funzione per rimborsare tutte le partite attive
 const refundAllActiveGames = async () => {
+  console.log('DEBUG - Refunding all active games');
   try {
     const activeGames = await Game.find({ status: { $in: ['waiting', 'playing'] } });
     for (const game of activeGames) {
@@ -732,33 +779,37 @@ const refundAllActiveGames = async () => {
             message: 'Server crashed or shutting down. Your bet has been refunded.',
             amount: player.bet,
           });
-          console.log(`Refunded ${player.bet} COM to ${player.address} for game ${game.gameId}`);
+          console.log(`DEBUG - Refunded ${player.bet} COM to ${player.address} for game ${game.gameId}`);
         }
       }
       await Game.deleteOne({ gameId: game.gameId });
-      console.log(`Deleted game ${game.gameId} after refund`);
+      console.log(`DEBUG - Deleted game ${game.gameId} after refund`);
     }
   } catch (err) {
-    console.error('Error refunding active games:', err);
+    console.error('DEBUG - Error refunding active games:', err.message, err.stack);
   }
 };
 
 // Endpoint per il saldo del tax wallet
 app.get('/tax-wallet-balance', async (req, res) => {
+  console.log('DEBUG - /tax-wallet-balance called');
   try {
-    console.log('Fetching tax wallet balance for:', wallet.publicKey.toBase58());
+    console.log('DEBUG - Fetching tax wallet balance for:', wallet.publicKey.toBase58());
+    const connection = await getConnection();
     const balance = await getCachedBalance(connection, wallet.publicKey, 'sol');
-    console.log('Balance fetched:', balance);
+    console.log('DEBUG - Balance fetched:', balance);
     res.json({ success: true, balance });
   } catch (err) {
-    console.error('Error fetching tax wallet balance:', err);
+    console.error('DEBUG - Error fetching tax wallet balance:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to fetch tax wallet balance' });
   }
 });
 
 // Endpoint per le ricompense
 app.get('/rewards', async (req, res) => {
+  console.log('DEBUG - /rewards called');
   try {
+    const connection = await getConnection();
     const balance = await getCachedBalance(connection, wallet.publicKey, 'sol');
     const usableBalance = balance * 0.5;
     const solPerToken = Math.floor(usableBalance * 0.95);
@@ -793,29 +844,32 @@ app.get('/rewards', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('Error fetching rewards:', err);
+    console.error('DEBUG - Error fetching rewards:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to fetch rewards' });
   }
 });
 
 // Endpoint per il saldo COM
 app.get('/com-balance/:playerAddress', async (req, res) => {
+  console.log('DEBUG - /com-balance called:', req.params);
   const { playerAddress } = req.params;
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
+    const connection = await getConnection();
     const balance = await getCachedBalance(connection, userPublicKey, 'com');
+    console.log('DEBUG - COM balance fetched:', balance);
     res.json({ success: true, balance });
   } catch (err) {
-    console.error('Error fetching COM balance:', err);
+    console.error('DEBUG - Error fetching COM balance:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to fetch COM balance' });
   }
 });
 
 // Endpoint per distribuire vincite in COM (usato per Poker PvP)
 app.post('/distribute-winnings', async (req, res) => {
+  console.log('DEBUG - /distribute-winnings called:', req.body);
   const { winnerAddress, amount } = req.body;
-
-  console.log('DEBUG - /distribute-winnings called:', { winnerAddress, amount });
 
   if (!winnerAddress || !amount || isNaN(amount) || amount <= 0) {
     console.log('DEBUG - Invalid parameters:', { winnerAddress, amount });
@@ -823,13 +877,14 @@ app.post('/distribute-winnings', async (req, res) => {
   }
 
   try {
-    console.log('DEBUG - Validating winner address...');
+    console.log('DEBUG - Validating winner address:', winnerAddress);
     const winnerPublicKey = new PublicKey(winnerAddress);
     console.log('DEBUG - Getting casino ATA...');
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
     console.log('DEBUG - Getting winner ATA...');
     const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
 
+    const connection = await getConnection();
     console.log('DEBUG - Checking casino SOL balance...');
     const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol');
     const minSolBalance = 0.01 * LAMPORTS_PER_SOL;
@@ -959,26 +1014,33 @@ app.post('/distribute-winnings', async (req, res) => {
 
 // Endpoint per gestire i rimborsi in COM (usato per Poker PvP)
 app.post('/refund', async (req, res) => {
+  console.log('DEBUG - /refund called:', req.body);
+  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || 'https://casino-of-meme.com');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
   const { playerAddress, amount } = req.body;
 
   if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
-    console.log('Invalid refund parameters:', { playerAddress, amount });
+    console.log('DEBUG - Invalid refund parameters:', { playerAddress, amount });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
+    console.log('DEBUG - Getting casino ATA...');
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    console.log('DEBUG - Getting player ATA...');
     const playerATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
+    const connection = await getConnection();
+    console.log('DEBUG - Checking casino ATA...');
     let casinoAccountExists = false;
     try {
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
+      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
+      console.log('DEBUG - Casino ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -993,24 +1055,24 @@ app.post('/refund', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
 
-    // Verifica il saldo del casinò con caching
+    console.log('DEBUG - Checking casino COM balance...');
     const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com');
     if (casinoBalance < amount) {
-      console.log('Insufficient COM balance in casino ATA:', { balance: casinoBalance, required: amount });
+      console.log('DEBUG - Insufficient COM balance in casino ATA:', { balance: casinoBalance, required: amount });
       return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
     }
 
-    // Verifica se l'ATA del giocatore esiste, altrimenti crealo
+    console.log('DEBUG - Checking player ATA...');
     let playerAccountExists = false;
     try {
       await getAccount(connection, playerATA);
       playerAccountExists = true;
-      console.log('Player ATA exists:', playerATA.toBase58());
+      console.log('DEBUG - Player ATA exists:', playerATA.toBase58());
     } catch (err) {
-      console.log('Player ATA does not exist, creating...');
+      console.log('DEBUG - Player ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1025,40 +1087,42 @@ app.post('/refund', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created player ATA:', playerATA.toBase58());
+      console.log('DEBUG - Created player ATA:', playerATA.toBase58());
     }
 
-    // Crea la transazione di rimborso
+    console.log('DEBUG - Creating refund transaction...');
     const transaction = new Transaction().add(
       createTransferInstruction(
         casinoATA,
         playerATA,
         wallet.publicKey,
-        amount * 1e6 // Converti in token base (COM usa 6 decimali)
+        amount * 1e6
       )
     );
 
+    console.log('DEBUG - Getting latest blockhash...');
     const { blockhash } = await getCachedBlockhash(connection);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
     transaction.partialSign(wallet);
 
+    console.log('DEBUG - Sending refund transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Confirming refund transaction:', signature);
     await connection.confirmTransaction(signature);
-    console.log(`Refunded ${amount} COM to ${playerAddress}`);
+    console.log(`DEBUG - Refunded ${amount} COM to ${playerAddress}`);
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error processing refund:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to process refund: ${err.message}` });
+    console.error('DEBUG - Error processing refund:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: `Failed to process refund: ${err.message}` });
   }
 });
 
 // Endpoint per creare una transazione
 app.post('/create-transaction', async (req, res) => {
+  console.log('DEBUG - /create-transaction called:', req.body);
   const { playerAddress, betAmount, type } = req.body;
-
-  console.log('DEBUG - /create-transaction called with:', { playerAddress, betAmount, type });
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !type) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, type });
@@ -1066,6 +1130,7 @@ app.post('/create-transaction', async (req, res) => {
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     let userPublicKey;
     try {
       userPublicKey = new PublicKey(playerAddress);
@@ -1075,13 +1140,14 @@ app.post('/create-transaction', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid Solana address' });
     }
 
+    const connection = await getConnection();
     const transaction = new Transaction();
 
     if (type === 'sol') {
       const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
       console.log('DEBUG - Bet in lamports:', betInLamports);
 
-      // Verifica il saldo dell'utente con caching
+      console.log('DEBUG - Checking user SOL balance...');
       const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
       console.log('DEBUG - User balance:', userBalance, 'SOL');
       if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
@@ -1100,6 +1166,7 @@ app.post('/create-transaction', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction type' });
     }
 
+    console.log('DEBUG - Getting latest blockhash...');
     const { blockhash } = await getCachedBlockhash(connection);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = userPublicKey;
@@ -1119,16 +1186,15 @@ app.post('/create-transaction', async (req, res) => {
 
     res.json({ success: true, transaction: serializedTransaction });
   } catch (err) {
-    console.error('Error in create-transaction:', err.message, err.stack);
+    console.error('DEBUG - Error in create-transaction:', err.message, err.stack);
     res.status(500).json({ success: false, error: `Failed to create transaction: ${err.message}` });
   }
 });
 
 // Endpoint per ottenere solo il recentBlockhash
 app.post('/get-recent-blockhash', async (req, res) => {
+  console.log('DEBUG - /get-recent-blockhash called:', req.body);
   const { playerAddress } = req.body;
-
-  console.log('DEBUG - /get-recent-blockhash called with:', { playerAddress });
 
   if (!playerAddress) {
     console.log('DEBUG - Invalid parameters:', { playerAddress });
@@ -1136,6 +1202,7 @@ app.post('/get-recent-blockhash', async (req, res) => {
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     let userPublicKey;
     try {
       userPublicKey = new PublicKey(playerAddress);
@@ -1145,6 +1212,8 @@ app.post('/get-recent-blockhash', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid Solana address' });
     }
 
+    const connection = await getConnection();
+    console.log('DEBUG - Getting latest blockhash...');
     const { blockhash } = await getCachedBlockhash(connection);
     console.log('DEBUG - Recent blockhash:', blockhash);
 
@@ -1153,43 +1222,56 @@ app.post('/get-recent-blockhash', async (req, res) => {
       recentBlockhash: blockhash,
     });
   } catch (err) {
-    console.error('Error in get-recent-blockhash:', err.message, err.stack);
+    console.error('DEBUG - Error in get-recent-blockhash:', err.message, err.stack);
     res.status(500).json({ success: false, error: `Failed to get recent blockhash: ${err.message}` });
   }
 });
 
 // Endpoint per processare le transazioni di tutti i minigiochi
 app.post('/process-transaction', async (req, res) => {
+  console.log('DEBUG - /process-transaction called:', req.body);
   const { playerAddress, betAmount, signedTransaction, gameType } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction || !gameType) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction, gameType });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
   const validGameTypes = ['memeSlots', 'coinFlip', 'crazyWheel', 'solanaCardDuel'];
   if (!validGameTypes.includes(gameType)) {
+    console.log('DEBUG - Invalid gameType:', gameType);
     return res.status(400).json({ success: false, error: 'Invalid gameType' });
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
 
+    const connection = await getConnection();
+    console.log('DEBUG - Checking user SOL balance...');
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
+    console.log('DEBUG - User balance:', userBalance, 'Required:', betInLamports / LAMPORTS_PER_SOL);
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
+      console.log('DEBUG - Insufficient SOL balance:', userBalance);
       return res.status(400).json({ success: false, error: 'Insufficient SOL balance' });
     }
 
+    console.log('DEBUG - Processing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
     if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures');
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    console.log('DEBUG - Sending transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Confirming transaction:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
@@ -1202,7 +1284,7 @@ app.post('/process-transaction', async (req, res) => {
 
     res.json({ success: true, redirectTo: endpointMap[gameType] });
   } catch (err) {
-    console.error('Error in process-transaction:', err);
+    console.error('DEBUG - Error in process-transaction:', err.message, err.stack);
     res.status(500).json({ success: false, error: `Failed to process transaction: ${err.message}` });
   }
 });
@@ -1214,31 +1296,28 @@ const retry = async (fn, retries = 3, delay = 1000) => {
       return await fn();
     } catch (err) {
       if (i === retries - 1) throw err;
-      console.log(`Retry attempt ${i + 1}/${retries} failed, retrying in ${delay}ms...`, err.message);
+      console.log(`DEBUG - Retry attempt ${i + 1}/${retries} failed, retrying in ${delay}ms...`, err.message);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 };
 
 app.post('/distribute-winnings-sol', async (req, res) => {
+  console.log('DEBUG - /distribute-winnings-sol called:', req.body);
   const { playerAddress, amount } = req.body;
 
-  console.log('DEBUG - /distribute-winnings-sol called:', { playerAddress, amount });
-
-  // Validazione degli input
   if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, amount });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
   }
 
-  // Ritardo di 5 secondi per le richieste con amount = 0.02 SOL (probabile ricompensa della missione)
   if (amount === 0.02) {
     console.log('DEBUG - Detected amount of 0.02 SOL (possible mission reward), delaying by 5 seconds...');
     await new Promise(resolve => setTimeout(resolve, 5000));
   }
 
   try {
-    console.log('DEBUG - Validating player address...');
+    console.log('DEBUG - Validating player address:', playerAddress);
     let userPublicKey;
     try {
       userPublicKey = new PublicKey(playerAddress);
@@ -1247,15 +1326,16 @@ app.post('/distribute-winnings-sol', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid Solana address' });
     }
 
-    // Controllo del saldo con retry
+    const connection = await getConnection();
+    console.log('DEBUG - Checking casino SOL balance...');
     let casinoSolBalance;
-    const requiredBalance = amount + 0.01; // Importo + fee minime
+    const requiredBalance = amount + 0.01;
     const maxAttempts = 3;
     let attempt = 0;
     while (attempt < maxAttempts) {
       attempt++;
       console.log(`DEBUG - Checking casino SOL balance (attempt ${attempt}/${maxAttempts})...`);
-      casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true); // Forza refresh
+      casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true);
       console.log('DEBUG - Casino balance check:', {
         casinoSolBalance,
         requiredBalance,
@@ -1267,7 +1347,7 @@ app.post('/distribute-winnings-sol', async (req, res) => {
       }
 
       console.log(`DEBUG - Insufficient SOL balance (attempt ${attempt}/${maxAttempts}): ${casinoSolBalance} SOL available, ${requiredBalance.toFixed(4)} SOL required. Retrying in 2 seconds...`);
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Aspetta 2 secondi prima di riprovare
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
     if (casinoSolBalance < requiredBalance) {
@@ -1300,7 +1380,7 @@ app.post('/distribute-winnings-sol', async (req, res) => {
     try {
       transaction.partialSign(wallet);
     } catch (err) {
-      console.error('DEBUG - Error signing transaction:', err);
+      console.error('DEBUG - Error signing transaction:', err.message);
       throw new Error('Failed to sign transaction');
     }
 
@@ -1322,33 +1402,38 @@ app.post('/distribute-winnings-sol', async (req, res) => {
   }
 });
 
-
-
 // Endpoint per unirsi a una partita di Poker PvP
 app.post('/join-poker-game', async (req, res) => {
+  console.log('DEBUG - /join-poker-game called:', req.body);
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
-    console.log('Invalid parameters:', { playerAddress, betAmount, signedTransaction });
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
     return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
   }
 
   if (betAmount < MIN_BET) {
-    console.log(`Bet ${betAmount} COM is below minimum ${MIN_BET} COM`);
+    console.log(`DEBUG - Bet ${betAmount} COM is below minimum ${MIN_BET} COM`);
     return res.status(400).json({ success: false, error: `Bet must be at least ${MIN_BET} COM` });
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
+    console.log('DEBUG - Getting user ATA...');
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    console.log('DEBUG - Getting casino ATA...');
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica se l'ATA del casinò esiste, altrimenti crealo
+    const connection = await getConnection();
+    console.log('DEBUG - Checking casino ATA existence...');
     let casinoAccountExists = false;
     try {
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
+      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
+      console.log('DEBUG - Casino ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1363,67 +1448,75 @@ app.post('/join-poker-game', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA');
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
 
-    // Verifica il saldo COM dell'utente con caching
+    console.log('DEBUG - Checking user COM balance...');
     const userBalance = await getCachedBalance(connection, userPublicKey, 'com');
+    console.log('DEBUG - User balance:', userBalance, 'Required:', betAmount);
     if (userBalance < betAmount) {
-      console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance} < ${betAmount}`);
+      console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${betAmount}`);
       return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
 
-    // Valida e processa la transazione firmata
+    console.log('DEBUG - Processing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
     if (!transaction.verifySignatures()) {
-      console.log('Invalid transaction signatures for:', playerAddress);
+      console.log('DEBUG - Invalid transaction signatures for:', playerAddress);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
+    console.log('DEBUG - Sending transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Confirming transaction:', signature);
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
-      console.log('Transaction failed:', confirmation.value.err);
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-    console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
+    console.log(`DEBUG - Transferred ${betAmount} COM from ${playerAddress} to casino`);
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error in join-poker-game:', err.message, err.stack);
+    console.error('DEBUG - Error in join-poker-game:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to join game: ' + err.message });
   }
 });
 
 // Endpoint per gestire le mosse in Poker PvP
 app.post('/make-poker-move', async (req, res) => {
+  console.log('DEBUG - /make-poker-move called:', req.body);
   const { playerAddress, gameId, move, amount, signedTransaction } = req.body;
 
   if (!playerAddress || !gameId || !move || amount === undefined || isNaN(amount) || amount < 0) {
-    console.log('Invalid parameters:', { playerAddress, gameId, move, amount });
+    console.log('DEBUG - Invalid parameters:', { playerAddress, gameId, move, amount });
     return res.status(400).json({ success: false, error: 'Invalid required fields' });
   }
 
   if (amount > 0 && !signedTransaction) {
-    console.log('Missing signed transaction for move:', move);
+    console.log('DEBUG - Missing signed transaction for move:', move);
     return res.status(400).json({ success: false, error: 'Missing signed transaction' });
   }
 
   try {
+    console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
+    console.log('DEBUG - Getting user ATA...');
     const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    console.log('DEBUG - Getting casino ATA...');
     const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
 
-    // Verifica e crea ATA del casinò
+    const connection = await getConnection();
+    console.log('DEBUG - Checking casino ATA...');
     let casinoAccountExists = false;
     try {
       await getAccount(connection, casinoATA);
       casinoAccountExists = true;
-      console.log('Casino ATA exists:', casinoATA.toBase58());
+      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
-      console.log('Casino ATA does not exist, creating...');
+      console.log('DEBUG - Casino ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1438,17 +1531,17 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created casino ATA:', casinoATA.toBase58());
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
 
-    // Verifica e crea ATA del giocatore
+    console.log('DEBUG - Checking player ATA...');
     let playerAccountExists = false;
     try {
       await getAccount(connection, userATA);
       playerAccountExists = true;
-      console.log('Player ATA exists:', userATA.toBase58());
+      console.log('DEBUG - Player ATA exists:', userATA.toBase58());
     } catch (err) {
-      console.log('Player ATA does not exist, creating...');
+      console.log('DEBUG - Player ATA does not exist, creating...');
       const transaction = new Transaction().add(
         createAssociatedTokenAccountInstruction(
           wallet.publicKey,
@@ -1463,53 +1556,57 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
-      console.log('Created player ATA:', userATA.toBase58());
+      console.log('DEBUG - Created player ATA:', userATA.toBase58());
     }
 
     if (amount > 0) {
+      console.log('DEBUG - Checking user COM balance for move:', move);
       const userBalance = await getCachedBalance(connection, userPublicKey, 'com');
+      console.log('DEBUG - User balance:', userBalance, 'Required:', amount);
       if (userBalance < amount) {
-        console.log(`Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
+        console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
       }
 
-      // Valida e processa la transazione firmata
+      console.log('DEBUG - Processing signed transaction for move:', move);
       const transactionBuffer = Buffer.from(signedTransaction, 'base64');
       const transaction = Transaction.from(transactionBuffer);
 
       if (!transaction.verifySignatures()) {
-        console.log('Invalid transaction signatures for:', playerAddress);
+        console.log('DEBUG - Invalid transaction signatures for:', playerAddress);
         return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
       }
 
+      console.log('DEBUG - Sending transaction for move:', move);
       const signature = await connection.sendRawTransaction(transaction.serialize());
+      console.log('DEBUG - Confirming transaction:', signature);
       const confirmation = await connection.confirmTransaction(signature, 'confirmed');
       if (confirmation.value.err) {
-        console.log('Transaction failed:', confirmation.value.err);
+        console.log('DEBUG - Transaction failed:', confirmation.value.err);
         return res.status(500).json({ success: false, error: 'Transaction failed' });
       }
-      console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
+      console.log(`DEBUG - Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
     }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error in make-poker-move:', err.message, err.stack);
+    console.error('DEBUG - Error in make-poker-move:', err.message, err.stack);
     res.status(500).json({ success: false, error: `Failed to process move: ${err.message}` });
   }
 });
 
 // Endpoint per la leaderboard
 app.get('/leaderboard', async (req, res) => {
-  console.log('Received request for /leaderboard');
+  console.log('DEBUG - /leaderboard called');
   try {
-    console.log('Fetching leaderboard...');
+    console.log('DEBUG - Fetching leaderboard...');
     const leaderboard = await Player.find()
       .sort({ totalWinnings: -1 })
       .limit(10)
       .maxTimeMS(5000);
-    console.log('Leaderboard fetched:', leaderboard);
+    console.log('DEBUG - Leaderboard fetched:', leaderboard);
     if (!leaderboard || leaderboard.length === 0) {
-      console.log('Leaderboard is empty');
+      console.log('DEBUG - Leaderboard is empty');
       res.json([]);
     } else {
       const leaderboardWithUnit = leaderboard.map(player => ({
@@ -1520,11 +1617,15 @@ app.get('/leaderboard', async (req, res) => {
       res.json(leaderboardWithUnit);
     }
   } catch (err) {
-    console.error('Error fetching leaderboard:', err.message);
-    console.error('Error stack:', err.stack);
+    console.error('DEBUG - Error fetching leaderboard:', err.message, err.stack);
     res.status(500).json({ error: 'Error fetching leaderboard' });
   }
 });
+
+
+
+
+
 
 
 // Gestione delle connessioni WebSocket
@@ -1616,870 +1717,871 @@ io.on('connection', (socket) => {
         bettingRoundComplete: false,
         turnTimer: null,
         timeLeft: 30,
+        actionsCompleted: 0, // Aggiunto per tracciare le azioni completate
       };
 
-      try {
-        const game = new Game({
-          gameId,
-          players: players.map(p => ({
-            id: p.id,
-            address: p.address,
-            bet: p.bet,
-          })),
-          pot: players[0].bet + players[1].bet,
-          status: 'waiting',
-        });
-        await game.save();
-        console.log(`Saved game ${gameId} to database`);
-      } catch (err) {
-        console.error(`Error saving game ${gameId}:`, err);
-        socket.emit('error', { message: 'Error starting game' });
-        await refundBetsForGame(gameId);
-        if (callback) callback({ success: false, error: 'Error starting game' });
-        return;
-      }
-
-      players.forEach(player => {
-        const playerSocket = io.sockets.sockets.get(player.id);
-        if (playerSocket) {
-          playerSocket.join(gameId);
-          console.log(`Player ${player.address} joined room ${gameId}`);
-        } else {
-          console.error(`Socket for player ${player.address} not found`);
-        }
+    try {
+      console.log('DEBUG - Saving game to database:', gameId);
+      const game = new Game({
+        gameId,
+        players: players.map(p => ({
+          id: p.id,
+          address: p.address,
+          bet: p.bet,
+        })),
+        pot: players[0].bet + players[1].bet,
+        status: 'waiting',
       });
-
-      io.emit('waitingPlayers', {
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
-      });
-      console.log(`Game ${gameId} started with players:`, players.map(p => p.address));
-
-      startGame(gameId);
-    }
-  });
-
-  socket.on('leaveWaitingList', ({ playerAddress }) => {
-    const playerIndex = waitingPlayers.findIndex(p => p.address === playerAddress && p.id === socket.id);
-    if (playerIndex !== -1) {
-      const player = waitingPlayers[playerIndex];
-      waitingPlayers.splice(playerIndex, 1);
-      console.log(`Player ${playerAddress} left the waiting list`);
-
-      socket.emit('refund', {
-        message: 'You left the waiting list. Your bet has been refunded.',
-        amount: player.bet,
-        isRefund: true,
-      });
-
-      io.emit('waitingPlayers', {
-        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
-      });
-      socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
-    } else {
-      socket.emit('error', { message: 'You are not in the waiting list.' });
-      console.log(`Player ${playerAddress} not found in waiting list`);
-    }
-  });
-
-  socket.on('reconnectPlayer', async ({ playerAddress, gameId }) => {
-    const game = games[gameId];
-    if (game) {
-      const player = game.players.find(p => p.address === playerAddress);
-      if (player) {
-        const oldSocketId = player.id;
-        player.id = socket.id;
-        console.log(`Player ${playerAddress} reconnected. Updated socket.id from ${oldSocketId} to ${socket.id}`);
-        socket.join(gameId);
-        if (game.currentTurn === oldSocketId) {
-          game.currentTurn = socket.id;
-          console.log(`Updated currentTurn to new socket.id: ${socket.id}`);
-        }
-        try {
-          await Game.updateOne(
-            { gameId, 'players.address': playerAddress },
-            { $set: { 'players.$.id': socket.id } }
-          );
-          console.log(`Updated socket.id for ${playerAddress} in game ${gameId} database`);
-        } catch (err) {
-          console.error(`Error updating socket.id for ${playerAddress} in game ${gameId}:`, err);
-        }
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } else {
-        console.error(`Player ${playerAddress} not found in game ${gameId}`);
-      }
-    } else {
-      console.error(`Game ${gameId} not found during reconnection`);
-    }
-  });
-
-  socket.on('makeMove', async ({ gameId, move, amount }) => {
-    const game = games[gameId];
-    if (!game || game.currentTurn !== socket.id) {
-      console.log(`Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
-      return;
-    }
-
-    if (game.turnTimer) {
-      clearInterval(game.turnTimer);
-    }
-    game.timeLeft = 30;
-
-    const playerAddress = game.players.find(p => p.id === socket.id)?.address;
-    const opponent = game.players.find(p => p.id !== socket.id);
-    if (!playerAddress || !opponent) {
-      console.log(`Player or opponent not found: playerAddress=${playerAddress}, opponent=${opponent}`);
+      await game.save();
+      console.log(`DEBUG - Saved game ${gameId} to database`);
+    } catch (err) {
+      console.error(`DEBUG - Error saving game ${gameId}:`, err.message, err.stack);
+      socket.emit('error', { message: 'Error starting game' });
       await refundBetsForGame(gameId);
+      if (callback) callback({ success: false, error: 'Error starting game' });
       return;
     }
-    const currentPlayerBet = game.playerBets[playerAddress] || 0;
-    console.log(`Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
 
-    if (move === 'fold') {
-      game.status = 'finished';
-      game.opponentCardsVisible = true;
-      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
-      game.dealerMessage = 'The dealer announces the winner!';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot, isRefund: false });
-      await updateLeaderboard(opponent.address, game.pot);
-      try {
-        await Game.updateOne({ gameId }, { status: 'finished' });
-        await Game.deleteOne({ gameId });
-        console.log(`Deleted game ${gameId} from database`);
-      } catch (err) {
-        console.error(`Error updating/deleting game ${gameId}:`, err);
-      }
-      delete games[gameId];
-    } else if (move === 'check') {
-      if (game.currentBet > currentPlayerBet) {
-        game.message = 'You cannot check, you must call or raise!';
-        game.dealerMessage = 'The dealer reminds: You must call or raise!';
-        console.log(`Check not allowed: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    players.forEach(player => {
+      const playerSocket = io.sockets.sockets.get(player.id);
+      if (playerSocket) {
+        playerSocket.join(gameId);
+        console.log(`DEBUG - Player ${player.address} joined room ${gameId}`);
       } else {
-        game.message = 'You checked.';
-        game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
-        console.log(`Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
-        game.actionsCompleted += 1;
-        console.log(`Actions completed: ${game.actionsCompleted}`);
-
-        if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
-          game.bettingRoundComplete = true;
-          game.actionsCompleted = 0;
-          console.log(`Betting round complete in phase ${game.gamePhase}, advancing game phase`);
-          advanceGamePhase(gameId);
-        } else {
-          game.currentTurn = opponent.id;
-          game.bettingRoundComplete = false;
-          console.log(`Passing turn to opponent: ${opponent.id}`);
-          startTurnTimer(gameId, opponent.id);
-        }
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+        console.error(`DEBUG - Socket for player ${player.address} not found`);
       }
-    } else if (move === 'call') {
-      const amountToCall = game.currentBet - currentPlayerBet;
-      game.pot += amountToCall;
-      game.playerBets[playerAddress] = game.currentBet;
-      game.message = `You called ${amountToCall.toFixed(2)} COM.`;
-      game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
-      console.log(`Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
+    });
+
+    console.log('DEBUG - Emitting updated waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet })));
+    io.emit('waitingPlayers', {
+      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
+    });
+    console.log(`DEBUG - Game ${gameId} started with players:`, players.map(p => p.address));
+
+    startGame(gameId);
+  }
+});
+
+socket.on('leaveWaitingList', ({ playerAddress }) => {
+  console.log('DEBUG - leaveWaitingList called for:', playerAddress);
+  const playerIndex = waitingPlayers.findIndex(p => p.address === playerAddress && p.id === socket.id);
+  if (playerIndex !== -1) {
+    const player = waitingPlayers[playerIndex];
+    waitingPlayers.splice(playerIndex, 1);
+    console.log(`DEBUG - Player ${playerAddress} left the waiting list`);
+
+    socket.emit('refund', {
+      message: 'You left the waiting list. Your bet has been refunded.',
+      amount: player.bet,
+      isRefund: true,
+    });
+
+    console.log('DEBUG - Emitting updated waitingPlayers after leave:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet })));
+    io.emit('waitingPlayers', {
+      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
+    });
+    socket.emit('leftWaitingList', { message: 'You have left the waiting list.' });
+  } else {
+    socket.emit('error', { message: 'You are not in the waiting list.' });
+    console.log(`DEBUG - Player ${playerAddress} not found in waiting list`);
+  }
+});
+
+socket.on('reconnectPlayer', async ({ playerAddress, gameId }) => {
+  console.log('DEBUG - reconnectPlayer called:', { playerAddress, gameId, socketId: socket.id });
+  const game = games[gameId];
+  if (game) {
+    const player = game.players.find(p => p.address === playerAddress);
+    if (player) {
+      const oldSocketId = player.id;
+      player.id = socket.id;
+      console.log(`DEBUG - Player ${playerAddress} reconnected. Updated socket.id from ${oldSocketId} to ${socket.id}`);
+      socket.join(gameId);
+      if (game.currentTurn === oldSocketId) {
+        game.currentTurn = socket.id;
+        console.log(`DEBUG - Updated currentTurn to new socket.id: ${socket.id}`);
+      }
+      try {
+        await Game.updateOne(
+          { gameId, 'players.address': playerAddress },
+          { $set: { 'players.$.id': socket.id } }
+        );
+        console.log(`DEBUG - Updated socket.id for ${playerAddress} in game ${gameId} database`);
+      } catch (err) {
+        console.error(`DEBUG - Error updating socket.id for ${playerAddress} in game ${gameId}:`, err.message, err.stack);
+      }
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } else {
+      console.error(`DEBUG - Player ${playerAddress} not found in game ${gameId}`);
+    }
+  } else {
+    console.error(`DEBUG - Game ${gameId} not found during reconnection`);
+  }
+});
+
+socket.on('makeMove', async ({ gameId, move, amount }) => {
+  console.log('DEBUG - makeMove called:', { gameId, move, amount, socketId: socket.id });
+  const game = games[gameId];
+  if (!game || game.currentTurn !== socket.id) {
+    console.log(`DEBUG - Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
+    socket.emit('error', { message: 'Invalid move or not your turn' });
+    return;
+  }
+
+  if (game.turnTimer) {
+    clearInterval(game.turnTimer);
+    console.log('DEBUG - Cleared turn timer for game:', gameId);
+  }
+  game.timeLeft = 30;
+
+  const playerAddress = game.players.find(p => p.id === socket.id)?.address;
+  const opponent = game.players.find(p => p.id !== socket.id);
+  if (!playerAddress || !opponent) {
+    console.log(`DEBUG - Player or opponent not found: playerAddress=${playerAddress}, opponent=${opponent}`);
+    await refundBetsForGame(gameId);
+    socket.emit('error', { message: 'Player or opponent not found' });
+    return;
+  }
+  const currentPlayerBet = game.playerBets[playerAddress] || 0;
+  console.log(`DEBUG - Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
+
+  if (move === 'fold') {
+    game.status = 'finished';
+    game.opponentCardsVisible = true;
+    game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
+    game.dealerMessage = 'The dealer announces the winner!';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot, isRefund: false });
+    await updateLeaderboard(opponent.address, game.pot);
+    try {
+      await Game.updateOne({ gameId }, { status: 'finished' });
+      await Game.deleteOne({ gameId });
+      console.log(`DEBUG - Deleted game ${gameId} from database`);
+    } catch (err) {
+      console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
+    }
+    delete games[gameId];
+  } else if (move === 'check') {
+    if (game.currentBet > currentPlayerBet) {
+      game.message = 'You cannot check, you must call or raise!';
+      game.dealerMessage = 'The dealer reminds: You must call or raise!';
+      console.log(`DEBUG - Check not allowed: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } else {
+      game.message = 'You checked.';
+      game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
+      console.log(`DEBUG - Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
       game.actionsCompleted += 1;
-      console.log(`Actions completed: ${game.actionsCompleted}`);
+      console.log(`DEBUG - Actions completed: ${game.actionsCompleted}`);
 
       if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
         game.bettingRoundComplete = true;
         game.actionsCompleted = 0;
-        console.log(`Betting round complete in phase ${game.gamePhase}, advancing game phase`);
+        console.log(`DEBUG - Betting round complete in phase ${game.gamePhase}, advancing game phase`);
         advanceGamePhase(gameId);
       } else {
         game.currentTurn = opponent.id;
         game.bettingRoundComplete = false;
-        console.log(`Passing turn to opponent: ${opponent.id}`);
+        console.log(`DEBUG - Passing turn to opponent: ${opponent.id}`);
         startTurnTimer(gameId, opponent.id);
       }
-      try {
-        await Game.updateOne({ gameId }, { pot: game.pot });
-        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
-      } catch (err) {
-        console.error(`Error updating pot for game ${gameId}:`, err);
-      }
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-    } else if (move === 'bet' || move === 'raise') {
-      const minBet = MIN_BET;
-      const newBet = move === 'bet' ? amount : game.currentBet + amount;
-      if (newBet <= game.currentBet || amount < minBet) {
-        game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
-        game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
-        console.log(`Invalid ${move}: newBet=${newBet}, currentBet=${game.currentBet}, minBet=${minBet}`);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-        return;
-      }
-      const additionalBet = newBet - currentPlayerBet;
-      game.pot += additionalBet;
-      game.playerBets[playerAddress] = newBet;
-      game.currentBet = new       game.currentBet;
-      game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
-      game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
-      console.log(`${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
-      game.actionsCompleted = 1; // Resetta a 1, poiché l'avversario deve rispondere
+    }
+  } else if (move === 'call') {
+    const amountToCall = game.currentBet - currentPlayerBet;
+    game.pot += amountToCall;
+    game.playerBets[playerAddress] = game.currentBet;
+    game.message = `You called ${amountToCall.toFixed(2)} COM.`;
+    game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
+    console.log(`DEBUG - Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
+    game.actionsCompleted += 1;
+    console.log(`DEBUG - Actions completed: ${game.actionsCompleted}`);
+
+    if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+      game.bettingRoundComplete = true;
+      game.actionsCompleted = 0;
+      console.log(`DEBUG - Betting round complete in phase ${game.gamePhase}, advancing game phase`);
+      advanceGamePhase(gameId);
+    } else {
       game.currentTurn = opponent.id;
       game.bettingRoundComplete = false;
-      try {
-        await Game.updateOne({ gameId }, { pot: game.pot });
-        console.log(`Updated pot for game ${gameId} to ${game.pot}`);
-      } catch (err) {
-        console.error(`Error updating pot for game ${gameId}:`, err);
-      }
+      console.log(`DEBUG - Passing turn to opponent: ${opponent.id}`);
       startTurnTimer(gameId, opponent.id);
+    }
+    try {
+      await Game.updateOne({ gameId }, { pot: game.pot });
+      console.log(`DEBUG - Updated pot for game ${gameId} to ${game.pot}`);
+    } catch (err) {
+      console.error(`DEBUG - Error updating pot for game ${gameId}:`, err.message, err.stack);
+    }
+    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+  } else if (move === 'bet' || move === 'raise') {
+    const minBet = MIN_BET;
+    const newBet = move === 'bet' ? amount : game.currentBet + amount;
+    if (newBet <= game.currentBet || amount < minBet) {
+      game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
+      game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
+      console.log(`DEBUG - Invalid ${move}: newBet=${newBet}, currentBet=${game.currentBet}, minBet=${minBet}`);
       io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      return;
     }
-  });
-
-
-  socket.on('disconnect', async () => {
-    console.log('A player disconnected:', socket.id);
-
-    // Decrementa il conteggio dei visitatori
-    visitorCount = Math.max(0, visitorCount - 1); // Assicura che non scenda sotto 0
-    console.log(`Visitor disconnected. Total visitors: ${visitorCount}`);
-
-    // Trasmetti il conteggio aggiornato a tutti i client
-    io.emit('visitorCount', visitorCount);
-
-
-
-    for (const gameId in games) {
-      const game = games[gameId];
-      const playerIndex = game.players.findIndex(p => p.id === socket.id);
-      if (playerIndex !== -1) {
-        const opponent = game.players.find(p => p.id !== socket.id);
-        if (opponent) {
-          console.log(`Player ${socket.id} disconnected, waiting 30s before ending game ${gameId}`);
-          setTimeout(async () => {
-            if (!games[gameId]) return; // Gioco già terminato
-            if (game.turnTimer) clearInterval(game.turnTimer);
-            game.status = 'finished';
-            game.opponentCardsVisible = true;
-            game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
-            game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
-            io.to(gameId).emit('gameState', removeCircularReferences(game));
-            io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-            await updateLeaderboard(opponent.address, game.pot);
-            try {
-              await Game.updateOne({ gameId }, { status: 'finished' });
-              await Game.deleteOne({ gameId });
-              console.log(`Deleted game ${gameId} from database`);
-            } catch (err) {
-              console.error(`Error updating/deleting game ${gameId}:`, err);
-            }
-            delete games[gameId];
-          }, 30000); // Attendi 30 secondi
-        } else {
-          await refundBetsForGame(gameId);
-        }
-      }
+    const additionalBet = newBet - currentPlayerBet;
+    game.pot += additionalBet;
+    game.playerBets[playerAddress] = newBet;
+    game.currentBet = newBet;
+    game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+    game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+    console.log(`DEBUG - ${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
+    game.actionsCompleted = 1;
+    game.currentTurn = opponent.id;
+    game.bettingRoundComplete = false;
+    try {
+      await Game.updateOne({ gameId }, { pot: game.pot });
+      console.log(`DEBUG - Updated pot for game ${gameId} to ${game.pot}`);
+    } catch (err) {
+      console.error(`DEBUG - Error updating pot for game ${gameId}:`, err.message, err.stack);
     }
-  });
+    startTurnTimer(gameId, opponent.id);
+    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+  }
 });
 
-const startTurnTimer = async (gameId, playerId) => {
-  const game = games[gameId];
-  if (!game) {
-    console.error(`Game ${gameId} not found in startTurnTimer`);
-    await refundBetsForGame(gameId);
-    return;
-  }
+socket.on('disconnect', async () => {
+  console.log('DEBUG - A player disconnected:', socket.id);
+  visitorCount = Math.max(0, visitorCount - 1);
+  console.log(`DEBUG - Visitor disconnected. Total visitors: ${visitorCount}`);
+  io.emit('visitorCount', visitorCount);
 
-  const player = game.players.find(p => p.id === playerId);
-  if (!player) {
-    console.error(`Player with socket.id ${playerId} not found in game ${gameId}`);
-    const opponent = game.players.find(p => p.id !== playerId);
-    if (opponent) {
-      game.status = 'finished';
-      game.opponentCardsVisible = true;
-      game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
-      game.dealerMessage = 'The dealer announces: A player is no longer available.';
-      io.to(gameId).emit('gameState', removeCircularReferences(game));
-      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
-      await updateLeaderboard(opponent.address, game.pot);
-      try {
-        await Game.updateOne({ gameId }, { status: 'finished' });
-        await Game.deleteOne({ gameId });
-        console.log(`Deleted game ${gameId} from database`);
-      } catch (err) {
-        console.error(`Error updating/deleting game ${gameId}:`, err);
-      }
-      delete games[gameId];
-    } else {
-      await refundBetsForGame(gameId);
-    }
-    return;
-  }
-
-  game.currentTurn = playerId;
-  game.timeLeft = 30;
-
-  // Cancella qualsiasi timer precedente
-  if (game.turnTimer) {
-    console.log(`Clearing previous timer for game ${gameId}`);
-    clearTimeout(game.turnTimer);
-    game.turnTimer = null;
-  }
-
-  io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-  console.log(`Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
-
-  const clientsInRoom = io.sockets.adapter.rooms.get(gameId);
-  console.log(`Clients in room ${gameId}:`, clientsInRoom ? Array.from(clientsInRoom) : 'No clients');
-
-  const runTimer = async () => {
-    try {
-      if (!games[gameId]) {
-        console.log(`Game ${gameId} no longer exists, stopping timer`);
-        await refundBetsForGame(gameId);
-        return;
-      }
-
-      if (game.status !== 'playing') {
-        console.log(`Game ${gameId} is not in playing state, stopping timer`);
-        clearTimeout(game.turnTimer);
-        game.turnTimer = null;
-        return;
-      }
-
-      game.timeLeft -= 1;
-      console.log(`Game ${gameId} timer tick: timeLeft = ${game.timeLeft}, currentTurn = ${game.currentTurn}`);
-
-      const playerSocket = io.sockets.sockets.get(game.currentTurn);
-      if (!playerSocket || !playerSocket.rooms.has(gameId)) {
-        console.error(`Player with socket.id ${game.currentTurn} is not connected or not in room ${gameId}`);
-        const opponent = game.players.find(p => p.id !== game.currentTurn);
-        if (opponent) {
+  for (const gameId in games) {
+    const game = games[gameId];
+    const playerIndex = game.players.findIndex(p => p.id === socket.id);
+    if (playerIndex !== -1) {
+      const opponent = game.players.find(p => p.id !== socket.id);
+      if (opponent) {
+        console.log(`DEBUG - Player ${socket.id} disconnected, waiting 30s before ending game ${gameId}`);
+        setTimeout(async () => {
+          if (!games[gameId]) return;
+          if (game.turnTimer) clearInterval(game.turnTimer);
           game.status = 'finished';
           game.opponentCardsVisible = true;
-          game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
-          game.dealerMessage = 'The dealer announces: A player is no longer available.';
+          game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected.`;
+          game.dealerMessage = 'The dealer announces: A player disconnected, the game ends.';
           io.to(gameId).emit('gameState', removeCircularReferences(game));
           io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
           await updateLeaderboard(opponent.address, game.pot);
           try {
             await Game.updateOne({ gameId }, { status: 'finished' });
             await Game.deleteOne({ gameId });
-            console.log(`Deleted game ${gameId} from database`);
+            console.log(`DEBUG - Deleted game ${gameId} from database`);
           } catch (err) {
-            console.error(`Error updating/deleting game ${gameId}:`, err);
+            console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
           }
           delete games[gameId];
-        } else {
-          await refundBetsForGame(gameId);
-        }
-        return;
+        }, 30000);
+      } else {
+        await refundBetsForGame(gameId);
       }
+    }
+  }
+});
+});
 
-      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+const startTurnTimer = async (gameId, playerId) => {
+const game = games[gameId];
+if (!game) {
+  console.error(`DEBUG - Game ${gameId} not found in startTurnTimer`);
+  await refundBetsForGame(gameId);
+  return;
+}
 
-      if (game.timeLeft <= 0) {
-        const playerAddress = game.players.find(p => p.id === playerId)?.address;
-        const opponent = game.players.find(p => p.id !== playerId);
-        if (!playerAddress || !opponent) {
-          console.error(`Player or opponent not found in game ${gameId}`);
-          await refundBetsForGame(gameId);
-          return;
-        }
+const player = game.players.find(p => p.id === playerId);
+if (!player) {
+  console.error(`DEBUG - Player with socket.id ${playerId} not found in game ${gameId}`);
+  const opponent = game.players.find(p => p.id !== playerId);
+  if (opponent) {
+    game.status = 'finished';
+    game.opponentCardsVisible = true;
+    game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
+    game.dealerMessage = 'The dealer announces: A player is no longer available.';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+    await updateLeaderboard(opponent.address, game.pot);
+    try {
+      await Game.updateOne({ gameId }, { status: 'finished' });
+      await Game.deleteOne({ gameId });
+      console.log(`DEBUG - Deleted game ${gameId} from database`);
+    } catch (err) {
+      console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
+    }
+    delete games[gameId];
+  } else {
+    await refundBetsForGame(gameId);
+  }
+  return;
+}
+
+game.currentTurn = playerId;
+game.timeLeft = 30;
+
+if (game.turnTimer) {
+  console.log(`DEBUG - Clearing previous timer for game ${gameId}`);
+  clearTimeout(game.turnTimer);
+  game.turnTimer = null;
+}
+
+io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+console.log(`DEBUG - Turn timer started for game ${gameId}, player ${playerId}, timeLeft: ${game.timeLeft}`);
+
+const clientsInRoom = io.sockets.adapter.rooms.get(gameId);
+console.log(`DEBUG - Clients in room ${gameId}:`, clientsInRoom ? Array.from(clientsInRoom) : 'No clients');
+
+const runTimer = async () => {
+  try {
+    if (!games[gameId]) {
+      console.log(`DEBUG - Game ${gameId} no longer exists, stopping timer`);
+      await refundBetsForGame(gameId);
+      return;
+    }
+
+    if (game.status !== 'playing') {
+      console.log(`DEBUG - Game ${gameId} is not in playing state, stopping timer`);
+      clearTimeout(game.turnTimer);
+      game.turnTimer = null;
+      return;
+    }
+
+    game.timeLeft -= 1;
+    console.log(`DEBUG - Game ${gameId} timer tick: timeLeft = ${game.timeLeft}, currentTurn = ${game.currentTurn}`);
+
+    const playerSocket = io.sockets.sockets.get(game.currentTurn);
+    if (!playerSocket || !playerSocket.rooms.has(gameId)) {
+      console.error(`DEBUG - Player with socket.id ${game.currentTurn} is not connected or not in room ${gameId}`);
+      const opponent = game.players.find(p => p.id !== game.currentTurn);
+      if (opponent) {
         game.status = 'finished';
         game.opponentCardsVisible = true;
-        game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
-        game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+        game.message = `${opponent.address.slice(0, 8)}... wins! Opponent disconnected or invalid.`;
+        game.dealerMessage = 'The dealer announces: A player is no longer available.';
         io.to(gameId).emit('gameState', removeCircularReferences(game));
         io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
         await updateLeaderboard(opponent.address, game.pot);
         try {
           await Game.updateOne({ gameId }, { status: 'finished' });
           await Game.deleteOne({ gameId });
-          console.log(`Deleted game ${gameId} from database`);
+          console.log(`DEBUG - Deleted game ${gameId} from database`);
         } catch (err) {
-          console.error(`Error updating/deleting game ${gameId}:`, err);
+          console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
         }
         delete games[gameId];
       } else {
-        game.turnTimer = setTimeout(runTimer, 1000);
+        await refundBetsForGame(gameId);
       }
-    } catch (err) {
-      console.error(`Error in turn timer for game ${gameId}:`, err);
-      await refundBetsForGame(gameId);
+      return;
     }
-  };
 
-  game.turnTimer = setTimeout(runTimer, 1000);
+    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+
+    if (game.timeLeft <= 0) {
+      const playerAddress = game.players.find(p => p.id === playerId)?.address;
+      const opponent = game.players.find(p => p.id !== playerId);
+      if (!playerAddress || !opponent) {
+        console.error(`DEBUG - Player or opponent not found in game ${gameId}`);
+        await refundBetsForGame(gameId);
+        return;
+      }
+      game.status = 'finished';
+      game.opponentCardsVisible = true;
+      game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... timed out and folded.`;
+      game.dealerMessage = 'The dealer announces: A player timed out and folded.';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot });
+      await updateLeaderboard(opponent.address, game.pot);
+      try {
+        await Game.updateOne({ gameId }, { status: 'finished' });
+        await Game.deleteOne({ gameId });
+        console.log(`DEBUG - Deleted game ${gameId} from database`);
+      } catch (err) {
+        console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
+      }
+      delete games[gameId];
+    } else {
+      game.turnTimer = setTimeout(runTimer, 1000);
+    }
+  } catch (err) {
+    console.error(`DEBUG - Error in turn timer for game ${gameId}:`, err.message, err.stack);
+    await refundBetsForGame(gameId);
+  }
+};
+
+game.turnTimer = setTimeout(runTimer, 1000);
 };
 
 // In startGame
 const startGame = async (gameId) => {
-  const game = games[gameId];
-  if (!game) {
-    console.error(`Game ${gameId} not found in startGame`);
-    await refundBetsForGame(gameId);
-    return;
-  }
-  console.log(`Starting game ${gameId} with players:`, game.players.map(p => ({ address: p.address, socketId: p.id })));
+const game = games[gameId];
+if (!game) {
+  console.error(`DEBUG - Game ${gameId} not found in startGame`);
+  await refundBetsForGame(gameId);
+  return;
+}
+console.log(`DEBUG - Starting game ${gameId} with players:`, game.players.map(p => ({ address: p.address, socketId: p.id })));
 
-  game.message = 'The dealer is dealing the cards...';
-  game.dealerMessage = 'The dealer is dealing the cards to the players.';
+game.message = 'The dealer is dealing the cards...';
+game.dealerMessage = 'The dealer is dealing the cards to the players.';
+io.to(gameId).emit('gameState', removeCircularReferences(game));
+
+try {
+  await Game.updateOne({ gameId }, { status: 'playing' });
+  console.log(`DEBUG - Updated game ${gameId} status to playing`);
+} catch (err) {
+  console.error(`DEBUG - Error updating game ${gameId} status:`, err.message, err.stack);
+  await refundBetsForGame(gameId);
+  return;
+}
+
+try {
+  const player1Cards = [drawCard(), drawCard()];
+  const player2Cards = [drawCard(), drawCard()];
+  console.log(`DEBUG - Player 1 cards:`, player1Cards);
+  console.log(`DEBUG - Player 2 cards:`, player2Cards);
+
+  if (!player1Cards.every(card => card && card.value && card.suit && card.image) ||
+      !player2Cards.every(card => card && card.value && card.suit && card.image)) {
+    throw new Error('Invalid cards drawn');
+  }
+
+  game.playerCards[game.players[0].address] = player1Cards;
+  game.playerCards[game.players[1].address] = player2Cards;
+
+  const player1Socket = io.sockets.sockets.get(game.players[0].id);
+  const player2Socket = io.sockets.sockets.get(game.players[1].id);
+  if (!player1Socket || !player2Socket) {
+    throw new Error('One or more players disconnected before game start');
+  }
+
+  game.currentTurn = game.players[0].id;
+  game.pot = game.players[0].bet + game.players[1].bet;
+  game.playerBets[game.players[0].address] = 0;
+  game.playerBets[game.players[1].address] = 0;
+  game.currentBet = 0;
+  game.status = 'playing';
+  game.message = 'Pre-Flop: Place your bets.';
+  game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
+  game.actionsCompleted = 0;
+
+  console.log(`DEBUG - Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
+  startTurnTimer(gameId, game.players[0].id);
+  io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+} catch (err) {
+  console.error(`DEBUG - Error in startGame ${gameId}:`, err.message, err.stack);
+  game.message = 'Error starting game. Refunding bets...';
   io.to(gameId).emit('gameState', removeCircularReferences(game));
-
-  try {
-    await Game.updateOne({ gameId }, { status: 'playing' });
-    console.log(`Updated game ${gameId} status to playing`);
-  } catch (err) {
-    console.error(`Error updating game ${gameId} status:`, err.message, err.stack);
-    await refundBetsForGame(gameId);
-    return;
-  }
-
-  try {
-    const player1Cards = [drawCard(), drawCard()];
-    const player2Cards = [drawCard(), drawCard()];
-    console.log(`Player 1 cards:`, player1Cards);
-    console.log(`Player 2 cards:`, player2Cards);
-
-    if (!player1Cards.every(card => card && card.value && card.suit && card.image) ||
-        !player2Cards.every(card => card && card.value && card.suit && card.image)) {
-      throw new Error('Invalid cards drawn');
-    }
-
-    game.playerCards[game.players[0].address] = player1Cards;
-    game.playerCards[game.players[1].address] = player2Cards;
-
-    const player1Socket = io.sockets.sockets.get(game.players[0].id);
-    const player2Socket = io.sockets.sockets.get(game.players[1].id);
-    if (!player1Socket || !player2Socket) {
-      throw new Error('One or more players disconnected before game start');
-    }
-
-    game.currentTurn = game.players[0].id;
-    game.pot = game.players[0].bet + game.players[1].bet;
-    game.playerBets[game.players[0].address] = 0;
-    game.playerBets[game.players[1].address] = 0;
-    game.currentBet = 0;
-    game.status = 'playing';
-    game.message = 'Pre-Flop: Place your bets.';
-    game.dealerMessage = `The dealer says: Cards dealt! ${game.players[0].address.slice(0, 8)}... starts the betting.`;
-    game.actionsCompleted = 0;
-
-    console.log(`Game ${gameId} started. Current turn assigned to: ${game.currentTurn}`);
-    startTurnTimer(gameId, game.players[0].id);
-    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-  } catch (err) {
-    console.error(`Error in startGame ${gameId}:`, err.message, err.stack);
-    game.message = 'Error starting game. Refunding bets...';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-    await refundBetsForGame(gameId);
-  }
+  await refundBetsForGame(gameId);
+}
 };
 
 const drawCard = () => {
-  const cardNumber = Math.floor(Math.random() * 13) + 1;
-  const suits = ['spades', 'hearts', 'diamonds', 'clubs'];
-  const suitChars = ['S', 'H', 'D', 'C'];
-  const suitIndex = Math.floor(Math.random() * 4);
-  const suit = suits[suitIndex];
-  const suitChar = suitChars[suitIndex];
-  let cardName;
-  if (cardNumber === 1) cardName = 'A';
-  else if (cardNumber === 10) cardName = '0';
-  else if (cardNumber === 11) cardName = 'J';
-  else if (cardNumber === 12) cardName = 'Q';
-  else if (cardNumber === 13) cardName = 'K';
-  else cardName = cardNumber.toString();
+const cardNumber = Math.floor(Math.random() * 13) + 1;
+const suits = ['spades', 'hearts', 'diamonds', 'clubs'];
+const suitChars = ['S', 'H', 'D', 'C'];
+const suitIndex = Math.floor(Math.random() * 4);
+const suit = suits[suitIndex];
+const suitChar = suitChars[suitIndex];
+let cardName;
+if (cardNumber === 1) cardName = 'A';
+else if (cardNumber === 10) cardName = '0';
+else if (cardNumber === 11) cardName = 'J';
+else if (cardNumber === 12) cardName = 'Q';
+else if (cardNumber === 13) cardName = 'K';
+else cardName = cardNumber.toString();
 
-  const value = cardNumber === 1 ? 14 : cardNumber;
-  const image = `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`;
+const value = cardNumber === 1 ? 14 : cardNumber;
+const image = `https://deckofcardsapi.com/static/img/${cardName}${suitChar}.png`;
 
-  console.log(`Drawn card: ${cardName}${suitChar} (Value: ${value}, Suit: ${suit})`);
-  return { value, suit, image };
+console.log(`DEBUG - Drawn card: ${cardName}${suitChar} (Value: ${value}, Suit: ${suit})`);
+return { value, suit, image };
 };
 
 const advanceGamePhase = async (gameId) => {
-  const game = games[gameId];
-  if (!game) {
-    console.error(`Game ${gameId} not found in advanceGamePhase`);
-    await refundBetsForGame(gameId);
-    return;
-  }
+const game = games[gameId];
+if (!game) {
+  console.error(`DEBUG - Game ${gameId} not found in advanceGamePhase`);
+  await refundBetsForGame(gameId);
+  return;
+}
 
-  if (game.status !== 'playing') {
-    console.log(`Game ${gameId} is not in playing state, aborting phase advance`);
-    return;
-  }
+if (game.status !== 'playing') {
+  console.log(`DEBUG - Game ${gameId} is not in playing state, aborting phase advance`);
+  return;
+}
 
-  if (game.turnTimer) {
-    clearTimeout(game.turnTimer);
-    game.turnTimer = null;
-    console.log(`Cleared timer for game ${gameId} before advancing phase`);
-  }
+if (game.turnTimer) {
+  clearTimeout(game.turnTimer);
+  game.turnTimer = null;
+  console.log(`DEBUG - Cleared timer for game ${gameId} before advancing phase`);
+}
 
-  const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
-  const nextPlayer = game.players.find(p => p.id === game.currentTurn);
+const lastPlayer = game.players.find(p => p.id !== game.currentTurn);
+const nextPlayer = game.players.find(p => p.id === game.currentTurn);
 
-  if (!lastPlayer || !nextPlayer) {
-    console.error(`Players not found in game ${gameId}`);
-    await refundBetsForGame(gameId);
-    return;
-  }
+if (!lastPlayer || !nextPlayer) {
+  console.error(`DEBUG - Players not found in game ${gameId}`);
+  await refundBetsForGame(gameId);
+  return;
+}
 
-  game.actionsCompleted = 0;
-  game.bettingRoundComplete = false;
+game.actionsCompleted = 0;
+game.bettingRoundComplete = false;
 
-  if (game.gamePhase === 'pre-flop') {
-    game.message = 'The dealer is dealing the Flop...';
-    game.dealerMessage = 'The dealer is dealing the Flop cards.';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-    setTimeout(() => {
-      try {
-        const newCards = Array(3).fill().map(() => drawCard());
-        if (!newCards.every(card => card && card.value && card.suit && card.image)) {
-          throw new Error('Invalid flop cards drawn');
-        }
-        game.tableCards = newCards;
-        game.gamePhase = 'flop';
-        game.message = 'Flop: Place your bets.';
-        game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-        game.currentTurn = lastPlayer.id;
-        game.currentBet = 0;
-        game.playerBets[lastPlayer.address] = 0;
-        game.playerBets[nextPlayer.address] = 0;
-        console.log(`Advancing to Flop, turn passed to: ${lastPlayer.id}`);
-        startTurnTimer(gameId, lastPlayer.id);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } catch (err) {
-        console.error(`Error advancing to flop in game ${gameId}:`, err);
-        game.message = 'Error dealing flop. Refunding bets...';
-        io.to(gameId).emit('gameState', removeCircularReferences(game));
-        refundBetsForGame(gameId);
+if (game.gamePhase === 'pre-flop') {
+  game.message = 'The dealer is dealing the Flop...';
+  game.dealerMessage = 'The dealer is dealing the Flop cards.';
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
+  setTimeout(() => {
+    try {
+      const newCards = Array(3).fill().map(() => drawCard());
+      if (!newCards.every(card => card && card.value && card.suit && card.image)) {
+        throw new Error('Invalid flop cards drawn');
       }
-    }, 1000);
-  } else if (game.gamePhase === 'flop') {
-    game.message = 'The dealer is dealing the Turn...';
-    game.dealerMessage = 'The dealer is dealing the Turn card.';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-    setTimeout(() => {
-      try {
-        const newCard = drawCard();
-        if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
-          throw new Error('Invalid turn card drawn');
-        }
-        game.tableCards.push(newCard);
-        game.gamePhase = 'turn';
-        game.message = 'Turn: Place your bets.';
-        game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-        game.currentTurn = lastPlayer.id;
-        game.currentBet = 0;
-        game.playerBets[lastPlayer.address] = 0;
-        game.playerBets[nextPlayer.address] = 0;
-        console.log(`Advancing to Turn, turn passed to: ${lastPlayer.id}`);
-        startTurnTimer(gameId, lastPlayer.id);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } catch (err) {
-        console.error(`Error advancing to turn in game ${gameId}:`, err);
-        game.message = 'Error dealing turn. Refunding bets...';
-        io.to(gameId).emit('gameState', removeCircularReferences(game));
-        refundBetsForGame(gameId);
+      game.tableCards = newCards;
+      game.gamePhase = 'flop';
+      game.message = 'Flop: Place your bets.';
+      game.dealerMessage = `The dealer reveals the Flop: ${newCards.map(c => `${c.value} of ${c.suit}`).join(', ')}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+      game.currentTurn = lastPlayer.id;
+      game.currentBet = 0;
+      game.playerBets[lastPlayer.address] = 0;
+      game.playerBets[nextPlayer.address] = 0;
+      console.log(`DEBUG - Advancing to Flop, turn passed to: ${lastPlayer.id}`);
+      startTurnTimer(gameId, lastPlayer.id);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } catch (err) {
+      console.error(`DEBUG - Error advancing to flop in game ${gameId}:`, err.message, err.stack);
+      game.message = 'Error dealing flop. Refunding bets...';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      refundBetsForGame(gameId);
+    }
+  }, 1000);
+} else if (game.gamePhase === 'flop') {
+  game.message = 'The dealer is dealing the Turn...';
+  game.dealerMessage = 'The dealer is dealing the Turn card.';
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
+  setTimeout(() => {
+    try {
+      const newCard = drawCard();
+      if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
+        throw new Error('Invalid turn card drawn');
       }
-    }, 1000);
-  } else if (game.gamePhase === 'turn') {
-    game.message = 'The dealer is dealing the River...';
-    game.dealerMessage = 'The dealer is dealing the River card.';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-    setTimeout(() => {
-      try {
-        const newCard = drawCard();
-        if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
-          throw new Error('Invalid river card drawn');
-        }
-        game.tableCards.push(newCard);
-        game.gamePhase = 'river';
-        game.message = 'River: Place your bets.';
-        game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
-        game.currentTurn = lastPlayer.id;
-        game.currentBet = 0;
-        game.playerBets[lastPlayer.address] = 0;
-        game.playerBets[nextPlayer.address] = 0;
-        console.log(`Advancing to River, turn passed to: ${lastPlayer.id}`);
-        startTurnTimer(gameId, lastPlayer.id);
-        io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
-      } catch (err) {
-        console.error(`Error advancing to river in game ${gameId}:`, err);
-        game.message = 'Error dealing river. Refunding bets...';
-        io.to(gameId).emit('gameState', removeCircularReferences(game));
-        refundBetsForGame(gameId);
+      game.tableCards.push(newCard);
+      game.gamePhase = 'turn';
+      game.message = 'Turn: Place your bets.';
+      game.dealerMessage = `The dealer reveals the Turn: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+      game.currentTurn = lastPlayer.id;
+      game.currentBet = 0;
+      game.playerBets[lastPlayer.address] = 0;
+      game.playerBets[nextPlayer.address] = 0;
+      console.log(`DEBUG - Advancing to Turn, turn passed to: ${lastPlayer.id}`);
+      startTurnTimer(gameId, lastPlayer.id);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } catch (err) {
+      console.error(`DEBUG - Error advancing to turn in game ${gameId}:`, err.message, err.stack);
+      game.message = 'Error dealing turn. Refunding bets...';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      refundBetsForGame(gameId);
+    }
+  }, 1000);
+} else if (game.gamePhase === 'turn') {
+  game.message = 'The dealer is dealing the River...';
+  game.dealerMessage = 'The dealer is dealing the River card.';
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
+  setTimeout(() => {
+    try {
+      const newCard = drawCard();
+      if (!newCard || !newCard.value || !newCard.suit || !newCard.image) {
+        throw new Error('Invalid river card drawn');
       }
-    }, 1000);
-  } else if (game.gamePhase === 'river') {
-    game.gamePhase = 'showdown';
-    game.message = 'Showdown: Evaluating hands...';
-    game.dealerMessage = 'The dealer is evaluating the hands...';
-    io.to(gameId).emit('gameState', removeCircularReferences(game));
-    setTimeout(() => {
-      try {
-        endGame(gameId);
-      } catch (err) {
-        console.error(`Error advancing to showdown in game ${gameId}:`, err);
-        game.message = 'Error evaluating hands. Refunding bets...';
-        io.to(gameId).emit('gameState', removeCircularReferences(game));
-        refundBetsForGame(gameId);
-      }
-    }, 1000);
-  }
+      game.tableCards.push(newCard);
+      game.gamePhase = 'river';
+      game.message = 'River: Place your bets.';
+      game.dealerMessage = `The dealer reveals the River: ${newCard.value} of ${newCard.suit}. ${lastPlayer.address.slice(0, 8)}... is up.`;
+      game.currentTurn = lastPlayer.id;
+      game.currentBet = 0;
+      game.playerBets[lastPlayer.address] = 0;
+      game.playerBets[nextPlayer.address] = 0;
+      console.log(`DEBUG - Advancing to River, turn passed to: ${lastPlayer.id}`);
+      startTurnTimer(gameId, lastPlayer.id);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } catch (err) {
+      console.error(`DEBUG - Error advancing to river in game ${gameId}:`, err.message, err.stack);
+      game.message = 'Error dealing river. Refunding bets...';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      refundBetsForGame(gameId);
+    }
+  }, 1000);
+} else if (game.gamePhase === 'river') {
+  game.gamePhase = 'showdown';
+  game.message = 'Showdown: Evaluating hands...';
+  game.dealerMessage = 'The dealer is evaluating the hands...';
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
+  setTimeout(() => {
+    try {
+      endGame(gameId);
+    } catch (err) {
+      console.error(`DEBUG - Error advancing to showdown in game ${gameId}:`, err.message, err.stack);
+      game.message = 'Error evaluating hands. Refunding bets...';
+      io.to(gameId).emit('gameState', removeCircularReferences(game));
+      refundBetsForGame(gameId);
+    }
+  }, 1000);
+}
 };
 
 const getCombinations = (array, k) => {
-  const result = [];
-  const combine = (start, combo) => {
-    if (combo.length === k) {
-      result.push([...combo]);
-      return;
-    }
-    for (let i = start; i < array.length; i++) {
-      combine(i + 1, [...combo, array[i]]);
-    }
-  };
-  combine(0, []);
-  return result;
+const result = [];
+const combine = (start, combo) => {
+  if (combo.length === k) {
+    result.push([...combo]);
+    return;
+  }
+  for (let i = start; i < array.length; i++) {
+    combine(i + 1, [...combo, array[i]]);
+  }
+};
+combine(0, []);
+return result;
 };
 
 const evaluatePokerHand = (hand) => {
-  const combinations = getCombinations(hand, 5);
-  let bestRank = -1;
-  let bestDescription = '';
-  let bestHighCards = [];
-  let bestHand = null;
+const combinations = getCombinations(hand, 5);
+let bestRank = -1;
+let bestDescription = '';
+let bestHighCards = [];
+let bestHand = null;
 
-  for (const combo of combinations) {
-    const values = combo.map(card => card.value).sort((a, b) => b - a);
-    const suits = combo.map(card => card.suit);
-    const isFlush = suits.every(suit => suit === suits[0]);
-    const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
-    const isLowStraight = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
-    const valueCounts = {};
-    values.forEach(val => {
-      valueCounts[val] = (valueCounts[val] || 0) + 1;
-    });
-    const counts = Object.values(valueCounts).sort((a, b) => b - a);
+for (const combo of combinations) {
+  const values = combo.map(card => card.value).sort((a, b) => b - a);
+  const suits = combo.map(card => card.suit);
+  const isFlush = suits.every(suit => suit === suits[0]);
+  const isStraight = values.every((val, i) => i === 0 || val === values[i - 1] - 1);
+  const isLowStraight = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
+  const valueCounts = {};
+  values.forEach(val => {
+    valueCounts[val] = (valueCounts[val] || 0) + 1;
+  });
+  const counts = Object.values(valueCounts).sort((a, b) => b - a);
 
-    let rank = -1;
-    let description = '';
-    let highCards = [];
+  let rank = -1;
+  let description = '';
+  let highCards = [];
 
-    if (isFlush && (isStraight || isLowStraight)) {
-      rank = 8;
-      description = 'Straight Flush';
-      highCards = isLowStraight ? [5] : [values[0]];
-    } else if (counts[0] === 4) {
-      rank = 7;
-      description = 'Four of a Kind';
-      highCards = [parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 4))];
-    } else if (counts[0] === 3 && counts[1] === 2) {
-      rank = 6;
-      description = 'Full House';
-      highCards = [
-        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
-        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2)),
-      ];
-    } else if (isFlush) {
-      rank = 5;
-      description = 'Flush';
-      highCards = values;
-    } else if (isStraight || isLowStraight) {
-      rank = 4;
-      description = 'Straight';
-      highCards = isLowStraight ? [5] : [values[0]];
-    } else if (counts[0] === 3) {
-      rank = 3;
-      description = 'Three of a Kind';
-      highCards = [
-        parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
-        ...values.filter(val => val !== parseInt(Object.keys(valueCounts).find(v => valueCounts[v] === 3))),
-      ];
-    } else if (counts[0] === 2 && counts[1] === 2) {
-      rank = 2;
-      description = 'Two Pair';
-      const pairs = Object.keys(valueCounts).filter(val => valueCounts[val] === 2).map(Number).sort((a, b) => b - a);
-      const kicker = values.find(val => !pairs.includes(val));
-      highCards = [...pairs, kicker];
-    } else if (counts[0] === 2) {
-      rank = 1;
-      description = 'One Pair';
-      const pairValue = parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2));
-      highCards = [
-        pairValue,
-        ...values.filter(val => val !== pairValue),
-      ];
-    } else {
-      rank = 0;
-      description = 'High Card';
-      highCards = values;
-    }
+  if (isFlush && (isStraight || isLowStraight)) {
+    rank = 8;
+    description = 'Straight Flush';
+    highCards = isLowStraight ? [5] : [values[0]];
+  } else if (counts[0] === 4) {
+    rank = 7;
+    description = 'Four of a Kind';
+    highCards = [parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 4))];
+  } else if (counts[0] === 3 && counts[1] === 2) {
+    rank = 6;
+    description = 'Full House';
+    highCards = [
+      parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
+      parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2)),
+    ];
+  } else if (isFlush) {
+    rank = 5;
+    description = 'Flush';
+    highCards = values;
+  } else if (isStraight || isLowStraight) {
+    rank = 4;
+    description = 'Straight';
+    highCards = isLowStraight ? [5] : [values[0]];
+  } else if (counts[0] === 3) {
+    rank = 3;
+    description = 'Three of a Kind';
+    highCards = [
+      parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 3)),
+      ...values.filter(val => val !== parseInt(Object.keys(valueCounts).find(v => valueCounts[v] === 3))),
+    ];
+  } else if (counts[0] === 2 && counts[1] === 2) {
+    rank = 2;
+    description = 'Two Pair';
+    const pairs = Object.keys(valueCounts).filter(val => valueCounts[val] === 2).map(Number).sort((a, b) => b - a);
+    const kicker = values.find(val => !pairs.includes(val));
+    highCards = [...pairs, kicker];
+  } else if (counts[0] === 2) {
+    rank = 1;
+    description = 'One Pair';
+    const pairValue = parseInt(Object.keys(valueCounts).find(val => valueCounts[val] === 2));
+    highCards = [
+      pairValue,
+      ...values.filter(val => val !== pairValue),
+    ];
+  } else {
+    rank = 0;
+    description = 'High Card';
+    highCards = values;
+  }
 
-    if (rank > bestRank) {
-      bestRank = rank;
-      bestDescription = description;
-      bestHighCards = highCards;
-      bestHand = combo;
-    } else if (rank === bestRank) {
-      for (let i = 0; i < bestHighCards.length; i++) {
-        if (bestHighCards[i] < highCards[i]) {
-          bestRank = rank;
-          bestDescription = description;
-          bestHighCards = highCards;
-          bestHand = combo;
-          break;
-        } else if (bestHighCards[i] > highCards[i]) {
-          break;
-        }
+  if (rank > bestRank) {
+    bestRank = rank;
+    bestDescription = description;
+    bestHighCards = highCards;
+    bestHand = combo;
+  } else if (rank === bestRank) {
+    for (let i = 0; i < bestHighCards.length; i++) {
+      if (bestHighCards[i] < highCards[i]) {
+        bestRank = rank;
+        bestDescription = description;
+        bestHighCards = highCards;
+        bestHand = combo;
+        break;
+      } else if (bestHighCards[i] > highCards[i]) {
+        break;
       }
     }
   }
+}
 
-  console.log('Best hand:', bestHand);
-  console.log('Best evaluation:', { rank: bestRank, description: bestDescription, highCards: bestHighCards });
-  return { rank: bestRank, description: bestDescription, highCards: bestHighCards };
+console.log('DEBUG - Best hand:', bestHand);
+console.log('DEBUG - Best evaluation:', { rank: bestRank, description: bestDescription, highCards: bestHighCards });
+return { rank: bestRank, description: bestDescription, highCards: bestHighCards };
 };
 
 const endGame = async (gameId) => {
-  const game = games[gameId];
-  if (!game) {
-    console.error(`Game ${gameId} not found in endGame`);
-    await refundBetsForGame(gameId);
-    return;
-  }
+const game = games[gameId];
+if (!game) {
+  console.error(`DEBUG - Game ${gameId} not found in endGame`);
+  await refundBetsForGame(gameId);
+  return;
+}
 
-  if (game.turnTimer) {
-    clearInterval(game.turnTimer);
-  }
+if (game.turnTimer) {
+  clearInterval(game.turnTimer);
+  console.log('DEBUG - Cleared turn timer for game:', gameId);
+}
 
-  const player1 = game.players[0];
-  const player2 = game.players[1];
-  const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
-  const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
-  const player1Evaluation = evaluatePokerHand(player1Hand);
-  const player2Evaluation = evaluatePokerHand(player2Hand);
+const player1 = game.players[0];
+const player2 = game.players[1];
+const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
+const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
+const player1Evaluation = evaluatePokerHand(player1Hand);
+const player2Evaluation = evaluatePokerHand(player2Hand);
 
-  console.log(`Player 1 (${player1.address}) hand:`, player1Hand);
-  console.log(`Player 1 evaluation:`, player1Evaluation);
-  console.log(`Player 2 (${player2.address}) hand:`, player2Hand);
-  console.log(`Player 2 evaluation:`, player2Evaluation);
+console.log(`DEBUG - Player 1 (${player1.address}) hand:`, player1Hand);
+console.log(`DEBUG - Player 1 evaluation:`, player1Evaluation);
+console.log(`DEBUG - Player 2 (${player2.address}) hand:`, player2Hand);
+console.log(`DEBUG - Player 2 evaluation:`, player2Evaluation);
 
-  let winner;
-  let isTie = false;
-  if (player1Evaluation.rank > player2Evaluation.rank) {
-    winner = player1;
-    game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
-    game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
-  } else if (player2Evaluation.rank > player1Evaluation.rank) {
-    winner = player2;
-    game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
-    game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
-  } else {
-    let tieBreaker = false;
-    for (let i = 0; i < player1Evaluation.highCards.length; i++) {
-      if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
-        winner = player1;
-        game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
-        game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
-        tieBreaker = true;
-        break;
-      } else if (player2Evaluation.highCards[i] > player1Evaluation.highCards[i]) {
-        winner = player2;
-        game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
-        game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
-        tieBreaker = true;
-        break;
-      }
-    }
-    if (!tieBreaker) {
-      isTie = true;
-      game.message = "It's a tie! The pot is split.";
-      game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
+let winner;
+let isTie = false;
+if (player1Evaluation.rank > player2Evaluation.rank) {
+  winner = player1;
+  game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+  game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+} else if (player2Evaluation.rank > player1Evaluation.rank) {
+  winner = player2;
+  game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+  game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+} else {
+  let tieBreaker = false;
+  for (let i = 0; i < player1Evaluation.highCards.length; i++) {
+    if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
+      winner = player1;
+      game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+      game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+      tieBreaker = true;
+      break;
+    } else if (player2Evaluation.highCards[i] > player1Evaluation.highCards[i]) {
+      winner = player2;
+      game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+      game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+      tieBreaker = true;
+      break;
     }
   }
-
-  game.status = 'finished';
-  game.opponentCardsVisible = true;
-  io.to(gameId).emit('gameState', removeCircularReferences(game));
-
-  console.log(`Distributing winnings for game ${gameId}:`, { pot: game.pot, isTie });
-
-  if (isTie) {
-    const splitAmount = game.pot / 2;
-    console.log(`Splitting pot: ${game.pot} COM into ${splitAmount} COM for each player`);
-    io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount, isRefund: false });
-    io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount, isRefund: false });
-    await updateLeaderboard(player1.address, splitAmount);
-    await updateLeaderboard(player2.address, splitAmount);
-  } else {
-    console.log(`Distributing full pot: ${game.pot} COM to winner ${winner.address}`);
-    io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot, isRefund: false });
-    await updateLeaderboard(winner.address, game.pot);
+  if (!tieBreaker) {
+    isTie = true;
+    game.message = "It's a tie! The pot is split.";
+    game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
   }
+}
 
-  try {
-    await Game.updateOne({ gameId }, { status: 'finished' });
-    await Game.deleteOne({ gameId });
-    console.log(`Deleted game ${gameId} from database`);
-  } catch (err) {
-    console.error(`Error updating/deleting game ${gameId}:`, err);
-  }
+game.status = 'finished';
+game.opponentCardsVisible = true;
+io.to(gameId).emit('gameState', removeCircularReferences(game));
 
-  delete games[gameId];
+console.log(`DEBUG - Distributing winnings for game ${gameId}:`, { pot: game.pot, isTie });
+
+if (isTie) {
+  const splitAmount = game.pot / 2;
+  console.log(`DEBUG - Splitting pot: ${game.pot} COM into ${splitAmount} COM for each player`);
+  io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount, isRefund: false });
+  io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount, isRefund: false });
+  await updateLeaderboard(player1.address, splitAmount);
+  await updateLeaderboard(player2.address, splitAmount);
+} else {
+  console.log(`DEBUG - Distributing full pot: ${game.pot} COM to winner ${winner.address}`);
+  io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot, isRefund: false });
+  await updateLeaderboard(winner.address, game.pot);
+}
+
+try {
+  await Game.updateOne({ gameId }, { status: 'finished' });
+  await Game.deleteOne({ gameId });
+  console.log(`DEBUG - Deleted game ${gameId} from database`);
+} catch (err) {
+  console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
+}
+
+delete games[gameId];
 };
 
 const updateLeaderboard = async (playerAddress, winnings) => {
-  try {
-    console.log(`Updating leaderboard for ${playerAddress} with ${winnings.toFixed(2)} COM`);
-    let player = await Player.findOne({ address: playerAddress });
-    if (!player) {
-      player = new Player({ address: playerAddress, totalWinnings: winnings });
-    } else {
-      player.totalWinnings += winnings;
-    }
-    await player.save();
-    console.log(`Leaderboard updated for ${playerAddress}: ${player.totalWinnings.toFixed(2)} COM`);
-  } catch (err) {
-    console.error(`Error updating leaderboard for ${playerAddress}:`, err.message);
+console.log(`DEBUG - Updating leaderboard for ${playerAddress} with ${winnings.toFixed(2)} COM`);
+try {
+  let player = await Player.findOne({ address: playerAddress });
+  if (!player) {
+    player = new Player({ address: playerAddress, totalWinnings: winnings });
+  } else {
+    player.totalWinnings += winnings;
   }
+  await player.save();
+  console.log(`DEBUG - Leaderboard updated for ${playerAddress}: ${player.totalWinnings.toFixed(2)} COM`);
+} catch (err) {
+  console.error(`DEBUG - Error updating leaderboard for ${playerAddress}:`, err.message, err.stack);
+}
 };
 
 // Gestione dei crash non gestiti
 process.on('uncaughtException', async (err) => {
-  console.error('Uncaught Exception:', err);
-  await refundAllActiveGames();
-  process.exit(1);
+console.error('DEBUG - Uncaught Exception:', err.message, err.stack);
+await refundAllActiveGames();
+// Non terminare il processo per mantenere il server in esecuzione
 });
 
-// Gestione delle promesse non gestite
 process.on('unhandledRejection', async (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  await refundAllActiveGames();
-  process.exit(1);
+console.error('DEBUG - Unhandled Rejection at:', promise, 'reason:', reason);
+await refundAllActiveGames();
+// Non terminare il processo
 });
 
-// Gestione della terminazione del server
 process.on('SIGTERM', async () => {
-  console.log('Server shutting down...');
-  await refundAllActiveGames();
-  server.close(() => {
-    mongoose.connection.close(() => {
-      console.log('MongoDB connection closed');
-      redisClient.quit(() => {
-        console.log('Redis connection closed');
-        process.exit(0);
-      });
+console.log('DEBUG - Server shutting down...');
+await refundAllActiveGames();
+server.close(() => {
+  mongoose.connection.close(() => {
+    console.log('DEBUG - MongoDB connection closed');
+    redisClient.quit(() => {
+      console.log('DEBUG - Redis connection closed');
+      process.exit(0);
     });
   });
 });
+});
 
 const PORT = process.env.PORT || 3001;
-console.log(`PORT environment variable: ${process.env.PORT}`);
+console.log(`DEBUG - PORT environment variable: ${process.env.PORT}`);
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});  
+console.log(`DEBUG - Server running on port ${PORT}`);
+});
