@@ -246,33 +246,6 @@ async function getCachedMintInfo(connection, mintAddress) {
   }
 }
 
-
-
-
-// Cache per tenere traccia delle firme delle transazioni già processate
-async function addTransactionSignatureToCache(signature) {
-  const cacheKey = `tx:${signature}`;
-  try {
-    await redisClient.setEx(cacheKey, 24 * 60 * 60, 'processed'); // Cache per 24 ore
-    console.log(`DEBUG - Transaction signature ${signature} added to cache`);
-  } catch (err) {
-    console.error('DEBUG - Redis error adding transaction signature:', err);
-  }
-}
-
-async function hasTransactionSignatureInCache(signature) {
-  const cacheKey = `tx:${signature}`;
-  try {
-    const exists = await redisClient.exists(cacheKey);
-    console.log(`DEBUG - Transaction signature ${signature} ${exists ? 'found' : 'not found'} in cache`);
-    return exists;
-  } catch (err) {
-    console.error('DEBUG - Redis error checking transaction signature:', err);
-    return false;
-  }
-}
-
-
 // Funzione per rimuovere riferimenti circolari
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
   if (obj && typeof obj === 'object') {
@@ -338,29 +311,17 @@ const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 app.post('/play-meme-slots', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
-  console.log('DEBUG - /play-meme-slots called with:', { playerAddress, betAmount, signedTransaction });
-
-  // Validazione degli input
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
-  let userPublicKey;
   try {
-    userPublicKey = new PublicKey(playerAddress);
-    console.log('DEBUG - Validated player address:', userPublicKey.toBase58());
-  } catch (err) {
-    console.error('DEBUG - Invalid player address:', err.message);
-    return res.status(400).json({ success: false, error: 'Invalid player address' });
-  }
+    const userPublicKey = new PublicKey(playerAddress);
+    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+    console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
-  const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-  console.log('DEBUG - Bet details:', { betAmount, betInLamports });
-
-  try {
-    // Verifica il saldo SOL dell'utente con caching
-    console.log('DEBUG - Checking user SOL balance...');
+    // Verifica il saldo SOL con caching
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
     console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
@@ -369,213 +330,122 @@ app.post('/play-meme-slots', async (req, res) => {
     }
 
     // Valida e processa la transazione firmata
-    console.log('DEBUG - Parsing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
-    console.log('DEBUG - Verifying transaction signatures...');
     if (!transaction.verifySignatures()) {
-      console.log('DEBUG - Invalid transaction signatures:', transaction.signatures);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
-    // Calcola la firma della transazione
-    const signature = bs58.encode(transaction.signatures[0].signature);
-    console.log('DEBUG - Transaction signature:', signature);
-
-    // Controlla se la transazione è già stata processata
-    console.log('DEBUG - Checking if transaction is already processed...');
-    const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-    if (alreadyProcessed) {
-      console.log('DEBUG - Transaction already processed, skipping...');
-      return res.status(400).json({
-        success: false,
-        error: 'This transaction has already been processed',
-      });
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    // Invia la transazione con retry
-    console.log('DEBUG - Sending bet transaction...');
-    let result;
-    try {
-      result = await retry(
-        () => connection.sendRawTransaction(transaction.serialize()),
-        3,
-        1000,
-        transaction
-      );
-      console.log('DEBUG - Transaction sent, signature:', result);
-
-      console.log('DEBUG - Confirming transaction...');
-      const confirmation = await connection.confirmTransaction(result, 'confirmed');
-      if (confirmation.value.err) {
-        console.log('DEBUG - Transaction failed:', confirmation.value.err);
-        return res.status(500).json({ success: false, error: 'Transaction failed during confirmation' });
-      }
-      console.log('DEBUG - Transaction confirmed:', result);
-    } catch (err) {
-      if (err.name === 'SendTransactionError') {
-        const logs = await err.getLogs(connection);
-        console.error('DEBUG - SendTransactionError Logs:', logs);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to process transaction: ${err.message}`,
-          logs: logs,
-        });
-      }
-      console.error('DEBUG - Error sending transaction:', err.message, err.stack);
-      return res.status(500).json({
-        success: false,
-        error: `Failed to send transaction: ${err.message}`,
-      });
-    }
-
-    // Aggiungi la firma alla cache
-    console.log('DEBUG - Adding transaction signature to cache...');
-    await addTransactionSignatureToCache(result);
 
     // Genera il risultato della slot
-    console.log('DEBUG - Generating slot result...');
-    let resultArray;
+    let result;
     const winLines = [
       [0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24],
       [0, 5, 10, 15, 20], [1, 6, 11, 16, 21], [2, 7, 12, 17, 22], [3, 8, 13, 18, 23], [4, 9, 14, 19, 24],
       [0, 6, 12, 18, 24], [4, 8, 12, 16, 20],
     ];
 
-    try {
-      if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
-        resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
-        let attempts = 0;
-        while (attempts < 20) {
-          let hasWin = false;
-          for (const line of winLines) {
-            const symbolsInLine = line.map(index => resultArray[index].name);
-            let currentSymbol = symbolsInLine[0];
-            let streak = 1;
-            for (let j = 1; j < symbolsInLine.length; j++) {
-              if (symbolsInLine[j].toLowerCase() === currentSymbol.toLowerCase()) {
-                streak++;
-                if (streak >= 3) {
-                  hasWin = true;
-                  break;
-                }
-              } else {
-                currentSymbol = symbolsInLine[j];
-                streak = 1;
+    if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
+      result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+      let attempts = 0;
+      while (attempts < 20) {
+        let hasWin = false;
+        for (const line of winLines) {
+          const symbolsInLine = line.map(index => result[index].name);
+          let currentSymbol = symbolsInLine[0];
+          let streak = 1;
+          for (let j = 1; j < symbolsInLine.length; j++) {
+            if (symbolsInLine[j].toLowerCase() === currentSymbol.toLowerCase()) {
+              streak++;
+              if (streak >= 3) {
+                hasWin = true;
+                break;
               }
+            } else {
+              currentSymbol = symbolsInLine[j];
+              streak = 1;
             }
-            if (hasWin) break;
           }
-          if (!hasWin) break;
-          resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
-          attempts++;
+          if (hasWin) break;
         }
-      } else {
-        resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
-        const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
-        const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
-        const streakOptions = [
-          { streak: 3, probability: 0.9 },
-          { streak: 4, probability: 0.09 },
-          { streak: 5, probability: 0.01 },
-        ];
-        const totalProbability = streakOptions.reduce((sum, option) => sum + option.probability, 0);
-        let random = Math.random() * totalProbability;
-        let selectedStreak = 3;
-        for (const option of streakOptions) {
-          if (random < option.probability) {
-            selectedStreak = option.streak;
-            break;
-          }
-          random -= option.probability;
-        }
-        for (let i = 0; i < selectedStreak; i++) {
-          resultArray[winningLine[i]] = winningSymbol;
-        }
+        if (!hasWin) break;
+        result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+        attempts++;
       }
-
-      console.log('DEBUG - Slot result generated:', resultArray.map(item => item.name));
-    } catch (err) {
-      console.error('DEBUG - Error generating slot result:', err.message, err.stack);
-      return res.status(500).json({
-        success: false,
-        error: `Failed to generate slot result: ${err.message}`,
-      });
+    } else {
+      result = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+      const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
+      const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
+      const streakOptions = [
+        { streak: 3, probability: 0.9 },
+        { streak: 4, probability: 0.09 },
+        { streak: 5, probability: 0.01 },
+      ];
+      const totalProbability = streakOptions.reduce((sum, option) => sum + option.probability, 0);
+      let random = Math.random() * totalProbability;
+      let selectedStreak = 3;
+      for (const option of streakOptions) {
+        if (random < option.probability) {
+          selectedStreak = option.streak;
+          break;
+        }
+        random -= option.probability;
+      }
+      for (let i = 0; i < selectedStreak; i++) {
+        result[winningLine[i]] = winningSymbol;
+      }
     }
 
     // Calcola le vincite
-    console.log('DEBUG - Calculating winnings...');
     const winningLinesFound = [];
     const winningIndices = new Set();
     let totalWin = 0;
 
-    try {
-      for (let i = 0; i < winLines.length; i++) {
-        const line = winLines[i];
-        const symbolsInLine = line.map(index => resultArray[index].name);
-        let currentSymbol = symbolsInLine[0];
-        let streak = 1;
-        let streakStart = 0;
+    for (let i = 0; i < winLines.length; i++) {
+      const line = winLines[i];
+      const symbolsInLine = line.map(index => result[index].name);
+      let currentSymbol = symbolsInLine[0];
+      let streak = 1;
+      let streakStart = 0;
 
-        for (let j = 1; j < symbolsInLine.length; j++) {
-          if (symbolsInLine[j] === currentSymbol) {
-            streak++;
-          } else {
-            if (streak >= 3) {
-              winningLinesFound.push(i);
-              for (let k = streakStart; k < streakStart + streak; k++) {
-                winningIndices.add(line[k]);
-              }
-              let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
-              if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
-              totalWin += winAmount;
-              console.log(`DEBUG - Winning line ${i}: ${streak} ${currentSymbol}, winAmount=${winAmount}`);
+      for (let j = 1; j < symbolsInLine.length; j++) {
+        if (symbolsInLine[j] === currentSymbol) {
+          streak++;
+        } else {
+          if (streak >= 3) {
+            winningLinesFound.push(i);
+            for (let k = streakStart; k < streakStart + streak; k++) {
+              winningIndices.add(line[k]);
             }
-            currentSymbol = symbolsInLine[j];
-            streak = 1;
-            streakStart = j;
+            let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
+            if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
+            totalWin += winAmount;
           }
-        }
-
-        if (streak >= 3) {
-          winningLinesFound.push(i);
-          for (let k = streakStart; k < streakStart + streak; k++) {
-            winningIndices.add(line[k]);
-          }
-          let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
-          if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
-          totalWin += winAmount;
-          console.log(`DEBUG - Winning line ${i}: ${streak} ${currentSymbol}, winAmount=${winAmount}`);
+          currentSymbol = symbolsInLine[j];
+          streak = 1;
+          streakStart = j;
         }
       }
 
-      console.log('DEBUG - Total winnings:', totalWin);
-    } catch (err) {
-      console.error('DEBUG - Error calculating winnings:', err.message, err.stack);
-      return res.status(500).json({
-        success: false,
-        error: `Failed to calculate winnings: ${err.message}`,
-      });
+      if (streak >= 3) {
+        winningLinesFound.push(i);
+        for (let k = streakStart; k < streakStart + streak; k++) {
+          winningIndices.add(line[k]);
+        }
+        let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
+        if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
+        totalWin += winAmount;
+      }
     }
 
     // Distribuisci le vincite
     if (totalWin > 0) {
-      console.log('DEBUG - Checking casino SOL balance for winnings distribution...');
-      const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true); // Forza refresh
-      const requiredBalance = totalWin + 0.01; // Importo + fee minime
-      if (casinoSolBalance < requiredBalance) {
-        console.log('DEBUG - Insufficient SOL balance in casino wallet for winnings:', {
-          casinoSolBalance,
-          requiredBalance,
-        });
-        return res.status(400).json({
-          success: false,
-          error: `Insufficient SOL balance in casino wallet: ${casinoSolBalance} SOL available, ${requiredBalance.toFixed(4)} SOL required`,
-        });
-      }
-
-      console.log('DEBUG - Creating winnings transaction...');
       const transaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: wallet.publicKey,
@@ -584,83 +454,26 @@ app.post('/play-meme-slots', async (req, res) => {
         })
       );
 
-      console.log('DEBUG - Getting latest blockhash for winnings transaction...');
       const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
 
-      console.log('DEBUG - Signing winnings transaction...');
-      try {
-        transaction.partialSign(wallet);
-        console.log('DEBUG - Winnings transaction signed successfully');
-      } catch (err) {
-        console.error('DEBUG - Error signing winnings transaction:', err.message, err.stack);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to sign winnings transaction: ${err.message}`,
-        });
-      }
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const winSignature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Win transaction signature:', winSignature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessedWin = await hasTransactionSignatureInCache(winSignature);
-      if (alreadyProcessedWin) {
-        console.log('DEBUG - Win transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This win transaction has already been processed',
-        });
-      }
-
-      console.log('DEBUG - Sending winnings transaction...');
-      try {
-        const winResult = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        console.log('DEBUG - Winnings transaction sent, signature:', winResult);
-
-        console.log('DEBUG - Confirming winnings transaction...');
-        await connection.confirmTransaction(winResult);
-        console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
-
-        // Aggiungi la firma alla cache
-        await addTransactionSignatureToCache(winResult);
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to distribute winnings: ${err.message}`,
-            logs: logs,
-          });
-        }
-        console.error('DEBUG - Error distributing winnings:', err.message, err.stack);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to distribute winnings: ${err.message}`,
-        });
-      }
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature);
+      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
-    // Invia la risposta al frontend
     res.json({
       success: true,
-      result: resultArray.map(item => ({ name: item.name, image: item.image })),
+      result: result.map(item => ({ name: item.name, image: item.image })),
       winningLines: winningLinesFound,
       winningIndices: Array.from(winningIndices),
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-meme-slots:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
+    console.error('Error in play-meme-slots:', err);
+    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
   }
 });
 
@@ -695,50 +508,12 @@ app.post('/play-coin-flip', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
-    // Calcola la firma della transazione
-    const signature = bs58.encode(transaction.signatures[0].signature);
-    console.log('DEBUG - Transaction signature:', signature);
-
-    // Controlla se la transazione è già stata processata
-    const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-    if (alreadyProcessed) {
-      console.log('DEBUG - Transaction already processed, skipping...');
-      return res.status(400).json({
-        success: false,
-        error: 'This transaction has already been processed',
-      });
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    // Invia la transazione con retry
-    let result;
-    try {
-      result = await retry(
-        () => connection.sendRawTransaction(transaction.serialize()),
-        3,
-        1000,
-        transaction
-      );
-      const confirmation = await connection.confirmTransaction(result, 'confirmed');
-      if (confirmation.value.err) {
-        console.log('DEBUG - Transaction failed:', confirmation.value.err);
-        return res.status(500).json({ success: false, error: 'Transaction failed' });
-      }
-      console.log('DEBUG - Transaction confirmed:', result);
-    } catch (err) {
-      if (err.name === 'SendTransactionError') {
-        const logs = await err.getLogs(connection);
-        console.error('DEBUG - SendTransactionError Logs:', logs);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to process transaction: ${err.message}`,
-          logs: logs,
-        });
-      }
-      throw err;
-    }
-
-    // Aggiungi la firma alla cache
-    await addTransactionSignatureToCache(result);
 
     // Genera il risultato del Coin Flip
     let flipResult;
@@ -766,45 +541,9 @@ app.post('/play-coin-flip', async (req, res) => {
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
 
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const winSignature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Win transaction signature:', winSignature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessedWin = await hasTransactionSignatureInCache(winSignature);
-      if (alreadyProcessedWin) {
-        console.log('DEBUG - Win transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This win transaction has already been processed',
-        });
-      }
-
-      try {
-        const winResult = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(winResult);
-        console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
-
-        // Aggiungi la firma alla cache
-        await addTransactionSignatureToCache(winResult);
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to distribute winnings: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature);
+      console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
     }
 
     res.json({
@@ -927,50 +666,12 @@ app.post('/play-solana-card-duel', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
-    // Calcola la firma della transazione
-    const signature = bs58.encode(transaction.signatures[0].signature);
-    console.log('DEBUG - Transaction signature:', signature);
-
-    // Controlla se la transazione è già stata processata
-    const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-    if (alreadyProcessed) {
-      console.log('DEBUG - Transaction already processed, skipping...');
-      return res.status(400).json({
-        success: false,
-        error: 'This transaction has already been processed',
-      });
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    // Invia la transazione con retry
-    let result;
-    try {
-      result = await retry(
-        () => connection.sendRawTransaction(transaction.serialize()),
-        3,
-        1000,
-        transaction
-      );
-      const confirmation = await connection.confirmTransaction(result, 'confirmed');
-      if (confirmation.value.err) {
-        console.log('DEBUG - Transaction failed:', confirmation.value.err);
-        return res.status(500).json({ success: false, error: 'Transaction failed' });
-      }
-      console.log('DEBUG - Transaction confirmed:', result);
-    } catch (err) {
-      if (err.name === 'SendTransactionError') {
-        const logs = await err.getLogs(connection);
-        console.error('DEBUG - SendTransactionError Logs:', logs);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to process transaction: ${err.message}`,
-          logs: logs,
-        });
-      }
-      throw err;
-    }
-
-    // Aggiungi la firma alla cache
-    await addTransactionSignatureToCache(result);
 
     res.json({
       success: true,
@@ -1167,48 +868,9 @@ app.post('/distribute-winnings', async (req, res) => {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature for casino ATA creation:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
-      }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(result);
-        console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to create casino ATA: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
+      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+      await connection.confirmTransaction(signature);
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
 
     console.log('DEBUG - Checking casino COM balance...');
@@ -1248,48 +910,9 @@ app.post('/distribute-winnings', async (req, res) => {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature for winner ATA creation:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
-      }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(result);
-        console.log('DEBUG - Created winner ATA:', winnerATA.toBase58());
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to create winner ATA: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
+      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+      await connection.confirmTransaction(signature);
+      console.log('DEBUG - Created winner ATA:', winnerATA.toBase58());
     }
 
     console.log('DEBUG - Verifying mint COM...');
@@ -1318,51 +941,13 @@ app.post('/distribute-winnings', async (req, res) => {
     transaction.feePayer = wallet.publicKey;
     transaction.partialSign(wallet);
 
-    // Calcola la firma della transazione
-    const serializedTransaction = transaction.serialize();
-    const signature = bs58.encode(transaction.signatures[0].signature);
-    console.log('DEBUG - Transaction signature:', signature);
-
-    // Controlla se la transazione è già stata processata
-    const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-    if (alreadyProcessed) {
-      console.log('DEBUG - Transaction already processed, skipping...');
-      return res.status(400).json({
-        success: false,
-        error: 'This transaction has already been processed',
-      });
-    }
-
     console.log('DEBUG - Sending transaction...');
-    let result;
-    try {
-      result = await retry(
-        () => connection.sendRawTransaction(serializedTransaction),
-        3,
-        1000,
-        transaction
-      );
-      console.log('DEBUG - Transaction sent, signature:', result);
-      console.log('DEBUG - Confirming transaction...');
-      await connection.confirmTransaction(result, 'confirmed');
-      console.log(`DEBUG - Sent ${amount} COM to the Winner ${winnerAddress}, signature: ${result}`);
-    } catch (err) {
-      if (err.name === 'SendTransactionError') {
-        const logs = await err.getLogs(connection);
-        console.error('DEBUG - SendTransactionError Logs:', logs);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to distribute winnings: ${err.message}`,
-          logs: logs,
-        });
-      }
-      throw err;
-    }
+    const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()), 3, 1000);
+    console.log('DEBUG - Confirming transaction...');
+    await connection.confirmTransaction(signature, 'confirmed');
+    console.log(`DEBUG - Sent ${amount} COM to the Winner ${winnerAddress}, signature: ${signature}`);
 
-    // Aggiungi la firma alla cache
-    await addTransactionSignatureToCache(result);
-
-    res.json({ success: true, transactionSignature: result });
+    res.json({ success: true, transactionSignature: signature });
   } catch (err) {
     console.error('DEBUG - Error distributing winnings:', err.message, err.stack);
     return res.status(500).json({
@@ -1406,48 +991,9 @@ app.post('/refund', async (req, res) => {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature for casino ATA creation:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
-      }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(result);
-        console.log('Created casino ATA:', casinoATA.toBase58());
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to create casino ATA: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log('Created casino ATA:', casinoATA.toBase58());
     }
 
     // Verifica il saldo del casinò con caching
@@ -1477,48 +1023,9 @@ app.post('/refund', async (req, res) => {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature for player ATA creation:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
-      }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(result);
-        console.log('Created player ATA:', playerATA.toBase58());
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to create player ATA: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log('Created player ATA:', playerATA.toBase58());
     }
 
     // Crea la transazione di rimborso
@@ -1536,47 +1043,9 @@ app.post('/refund', async (req, res) => {
     transaction.feePayer = wallet.publicKey;
     transaction.partialSign(wallet);
 
-    // Calcola la firma della transazione
-    const serializedTransaction = transaction.serialize();
-    const signature = bs58.encode(transaction.signatures[0].signature);
-    console.log('DEBUG - Transaction signature:', signature);
-
-    // Controlla se la transazione è già stata processata
-    const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-    if (alreadyProcessed) {
-      console.log('DEBUG - Transaction already processed, skipping...');
-      return res.status(400).json({
-        success: false,
-        error: 'This transaction has already been processed',
-      });
-    }
-
-    // Invia la transazione con retry
-    let result;
-    try {
-      result = await retry(
-        () => connection.sendRawTransaction(serializedTransaction),
-        3,
-        1000,
-        transaction
-      );
-      await connection.confirmTransaction(result);
-      console.log(`Refunded ${amount} COM to ${playerAddress}`);
-    } catch (err) {
-      if (err.name === 'SendTransactionError') {
-        const logs = await err.getLogs(connection);
-        console.error('DEBUG - SendTransactionError Logs:', logs);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to process refund: ${err.message}`,
-          logs: logs,
-        });
-      }
-      throw err;
-    }
-
-    // Aggiungi la firma alla cache
-    await addTransactionSignatureToCache(result);
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction(signature);
+    console.log(`Refunded ${amount} COM to ${playerAddress}`);
 
     res.json({ success: true });
   } catch (err) {
@@ -1738,39 +1207,13 @@ app.post('/process-transaction', async (req, res) => {
   }
 });
 
-const retry = async (fn, retries = 3, delay = 1000, transaction = null) => {
+// Endpoint per distribuire vincite in SOL
+const retry = async (fn, retries = 3, delay = 1000) => {
   for (let i = 0; i < retries; i++) {
     try {
-      // Prima di ogni tentativo, aggiorna il recentBlockhash se la transazione è fornita
-      if (transaction) {
-        const { blockhash } = await getCachedBlockhash(connection);
-        console.log('DEBUG - Updating recentBlockhash for retry:', blockhash);
-        transaction.recentBlockhash = blockhash;
-
-        // Non rimuovere le firme esistenti, mantieni quelle già presenti
-        // Rifirma la transazione con il nuovo blockhash
-        try {
-          transaction.partialSign(wallet);
-          console.log('DEBUG - Transaction re-signed with new blockhash');
-        } catch (err) {
-          console.error('DEBUG - Error re-signing transaction in retry:', err.message, err.stack);
-          throw err;
-        }
-      }
-
-      const result = await fn();
-      return result;
+      return await fn();
     } catch (err) {
-      if (err.message.includes('This transaction has already been processed')) {
-        console.log('DEBUG - Transaction already processed, aborting retry');
-        throw err; // Non ritentare se la transazione è già stata processata
-      }
-
-      if (i === retries - 1) {
-        console.error('DEBUG - Retry attempts exhausted:', err.message, err.stack);
-        throw err;
-      }
-
+      if (i === retries - 1) throw err;
       console.log(`Retry attempt ${i + 1}/${retries} failed, retrying in ${delay}ms...`, err.message);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
@@ -1840,51 +1283,15 @@ app.post('/distribute-winnings-sol', async (req, res) => {
       throw new Error('Failed to sign transaction');
     }
 
-    // Calcola la firma della transazione prima dell'invio
-    const serializedTransaction = transaction.serialize();
-    const signature = bs58.encode(transaction.signatures[0].signature);
-    console.log('DEBUG - Transaction signature:', signature);
-
-    // Controlla se la transazione è già stata processata
-    const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-    if (alreadyProcessed) {
-      console.log('DEBUG - Transaction already processed, skipping...');
-      return res.status(400).json({
-        success: false,
-        error: 'This transaction has already been processed',
-      });
-    }
-
     console.log('DEBUG - Sending transaction...');
-    try {
-      const result = await retry(
-        () => connection.sendRawTransaction(serializedTransaction),
-        3,
-        1000,
-        transaction // Passa la transazione per aggiornare il blockhash nei ritentativi
-      );
-      console.log('DEBUG - Transaction sent, signature:', result);
+    const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()), 3, 1000);
+    console.log('DEBUG - Transaction sent, signature:', signature);
 
-      console.log('DEBUG - Confirming transaction...');
-      await connection.confirmTransaction(result, 'confirmed');
-      console.log(`DEBUG - Distributed ${amount} SOL to ${playerAddress}, signature: ${result}`);
+    console.log('DEBUG - Confirming transaction...');
+    await connection.confirmTransaction(signature, 'confirmed');
+    console.log(`DEBUG - Distributed ${amount} SOL to ${playerAddress}, signature: ${signature}`);
 
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
-
-      res.json({ success: true, transactionSignature: result });
-    } catch (err) {
-      if (err.name === 'SendTransactionError') {
-        const logs = await err.getLogs(connection);
-        console.error('DEBUG - SendTransactionError Logs:', logs);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to distribute SOL winnings: ${err.message}`,
-          logs: logs,
-        });
-      }
-      throw err; // Rilancia l'errore per la gestione generale
-    }
+    res.json({ success: true, transactionSignature: signature });
   } catch (err) {
     console.error('DEBUG - Error distributing SOL winnings:', err.message, err.stack);
     return res.status(500).json({
@@ -1931,48 +1338,9 @@ app.post('/join-poker-game', async (req, res) => {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature for casino ATA creation:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
-      }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(result);
-        console.log('Created casino ATA');
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to create casino ATA: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log('Created casino ATA');
     }
 
     // Verifica il saldo COM dell'utente con caching
@@ -1991,51 +1359,12 @@ app.post('/join-poker-game', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
-    // Calcola la firma della transazione
-    const signature = bs58.encode(transaction.signatures[0].signature);
-    console.log('DEBUG - Transaction signature:', signature);
-
-    // Controlla se la transazione è già stata processata
-    const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-    if (alreadyProcessed) {
-      console.log('DEBUG - Transaction already processed, skipping...');
-      return res.status(400).json({
-        success: false,
-        error: 'This transaction has already been processed',
-      });
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
-
-    // Invia la transazione con retry
-    let result;
-    try {
-      result = await retry(
-        () => connection.sendRawTransaction(transaction.serialize()),
-        3,
-        1000,
-        transaction
-      );
-      const confirmation = await connection.confirmTransaction(result, 'confirmed');
-      if (confirmation.value.err) {
-        console.log('Transaction failed:', confirmation.value.err);
-        return res.status(500).json({ success: false, error: 'Transaction failed' });
-      }
-      console.log('DEBUG - Transaction confirmed:', result);
-    } catch (err) {
-      if (err.name === 'SendTransactionError') {
-        const logs = await err.getLogs(connection);
-        console.error('DEBUG - SendTransactionError Logs:', logs);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to process transaction: ${err.message}`,
-          logs: logs,
-        });
-      }
-      throw err;
-    }
-
-    // Aggiungi la firma alla cache
-    await addTransactionSignatureToCache(result);
-
     console.log(`Transferred ${betAmount} COM from ${playerAddress} to casino`);
 
     res.json({ success: true });
@@ -2084,48 +1413,9 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature for casino ATA creation:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
-      }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(result);
-        console.log('Created casino ATA:', casinoATA.toBase58());
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to create casino ATA: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log('Created casino ATA:', casinoATA.toBase58());
     }
 
     // Verifica e crea ATA del giocatore
@@ -2148,48 +1438,9 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-
-      // Calcola la firma della transazione
-      const serializedTransaction = transaction.serialize();
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature for player ATA creation:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
-      }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(serializedTransaction),
-          3,
-          1000,
-          transaction
-        );
-        await connection.confirmTransaction(result);
-        console.log('Created player ATA:', userATA.toBase58());
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to create player ATA: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature);
+      console.log('Created player ATA:', userATA.toBase58());
     }
 
     if (amount > 0) {
@@ -2208,51 +1459,12 @@ app.post('/make-poker-move', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
       }
 
-      // Calcola la firma della transazione
-      const signature = bs58.encode(transaction.signatures[0].signature);
-      console.log('DEBUG - Transaction signature:', signature);
-
-      // Controlla se la transazione è già stata processata
-      const alreadyProcessed = await hasTransactionSignatureInCache(signature);
-      if (alreadyProcessed) {
-        console.log('DEBUG - Transaction already processed, skipping...');
-        return res.status(400).json({
-          success: false,
-          error: 'This transaction has already been processed',
-        });
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+      if (confirmation.value.err) {
+        console.log('Transaction failed:', confirmation.value.err);
+        return res.status(500).json({ success: false, error: 'Transaction failed' });
       }
-
-      // Invia la transazione con retry
-      let result;
-      try {
-        result = await retry(
-          () => connection.sendRawTransaction(transaction.serialize()),
-          3,
-          1000,
-          transaction
-        );
-        const confirmation = await connection.confirmTransaction(result, 'confirmed');
-        if (confirmation.value.err) {
-          console.log('Transaction failed:', confirmation.value.err);
-          return res.status(500).json({ success: false, error: 'Transaction failed' });
-        }
-        console.log('DEBUG - Transaction confirmed:', result);
-      } catch (err) {
-        if (err.name === 'SendTransactionError') {
-          const logs = await err.getLogs(connection);
-          console.error('DEBUG - SendTransactionError Logs:', logs);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to process transaction: ${err.message}`,
-            logs: logs,
-          });
-        }
-        throw err;
-      }
-
-      // Aggiungi la firma alla cache
-      await addTransactionSignatureToCache(result);
-
       console.log(`Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
     }
 
@@ -3247,4 +2459,4 @@ const PORT = process.env.PORT || 3001;
 console.log(`PORT environment variable: ${process.env.PORT}`);
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-});
+}); 
