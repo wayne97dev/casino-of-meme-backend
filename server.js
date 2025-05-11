@@ -1220,29 +1220,54 @@ const retry = async (fn, retries = 3, delay = 1000) => {
   }
 };
 
+const ongoingDistributions = new Set();
+
 app.post('/distribute-winnings-sol', async (req, res) => {
   const { playerAddress, amount } = req.body;
 
-  console.log('DEBUG - /distribute-winnings-sol called:', { playerAddress, amount });
+  console.log('DEBUG - /distribute-winnings-sol called:', { playerAddress, amount, headers: req.headers });
 
-  // Validazione degli input
-  if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, amount });
-    return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
+  // Gestione della concorrenza
+  const distributionKey = `${playerAddress}-${amount}`;
+  if (ongoingDistributions.has(distributionKey)) {
+    console.log('DEBUG - Distribution already in progress for:', distributionKey);
+    return res.status(429).json({ success: false, error: 'Distribution already in progress' });
   }
 
+  ongoingDistributions.add(distributionKey);
+
   try {
+    // Validazione degli input
+    if (!playerAddress || !amount || isNaN(amount) || amount <= 0) {
+      console.log('DEBUG - Invalid parameters:', { playerAddress, amount });
+      return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
+    }
+
+    // Validazione più rigorosa di playerAddress
     console.log('DEBUG - Validating player address...');
     let userPublicKey;
     try {
+      if (!playerAddress || typeof playerAddress !== 'string') {
+        throw new Error('playerAddress must be a non-empty string');
+      }
       userPublicKey = new PublicKey(playerAddress);
     } catch (err) {
       console.log('DEBUG - Invalid player address:', err.message);
-      return res.status(400).json({ success: false, error: 'Invalid Solana address' });
+      return res.status(400).json({ success: false, error: 'Invalid Solana address: ' + err.message });
     }
 
     console.log('DEBUG - Checking casino SOL balance...');
-    const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true); // Forza refresh
+    let casinoSolBalance;
+    try {
+      casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true); // Forza refresh
+      console.log('DEBUG - Casino SOL balance:', casinoSolBalance);
+    } catch (err) {
+      console.error('DEBUG - Failed to fetch casino balance:', err);
+      return res.status(500).json({
+        success: false,
+        error: `Failed to verify casino wallet balance: ${err.message}`,
+      });
+    }
     const requiredBalance = amount + 0.01; // Importo + fee minime
     console.log('DEBUG - Casino balance check:', {
       casinoSolBalance,
@@ -1266,11 +1291,17 @@ app.post('/distribute-winnings-sol', async (req, res) => {
         fromPubkey: wallet.publicKey,
         toPubkey: userPublicKey,
         lamports: Math.round(amount * LAMPORTS_PER_SOL),
+      }),
+      // Aggiungi prezzo per unità di calcolo per la priorità
+      new TransactionInstruction({
+        keys: [],
+        programId: new PublicKey('ComputeBudget111111111111111111111111111111'),
+        data: Buffer.from(Uint8Array.of(3, ...new BN(100000).toArray('le', 8))), // 100,000 micro-lamports per compute unit
       })
     );
 
     console.log('DEBUG - Getting latest blockhash...');
-    const { blockhash } = await getCachedBlockhash(connection);
+    const { blockhash } = await connection.getLatestBlockhash(); // Fetch fresh blockhash
     console.log('DEBUG - Blockhash:', blockhash);
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = wallet.publicKey;
@@ -1284,11 +1315,39 @@ app.post('/distribute-winnings-sol', async (req, res) => {
     }
 
     console.log('DEBUG - Sending transaction...');
-    const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()), 3, 1000);
+    const retry = async (fn, retries = 3, delay = 1000) => {
+      let currentConnection = connection;
+      for (let i = 0; i < retries; i++) {
+        try {
+          return await fn(currentConnection);
+        } catch (err) {
+          if (i === retries - 1) throw err;
+          console.log(`Retry attempt ${i + 1}/${retries} failed, retrying in ${delay}ms...`, err.message);
+          if (i === 1) {
+            console.log('Switching to fallback RPC...');
+            currentConnection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+          }
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    };
+
+    let signature;
+    try {
+      signature = await retry(conn => conn.sendRawTransaction(transaction.serialize()), 3, 1000);
+    } catch (err) {
+      console.error('DEBUG - Transaction send failed:', err);
+      throw new Error(`Transaction submission failed: ${err.message}`);
+    }
     console.log('DEBUG - Transaction sent, signature:', signature);
 
     console.log('DEBUG - Confirming transaction...');
-    await connection.confirmTransaction(signature, 'confirmed');
+    try {
+      await connection.confirmTransaction(signature, 'confirmed');
+    } catch (err) {
+      console.error('DEBUG - Transaction confirmation failed:', err);
+      throw new Error(`Transaction confirmation failed: ${err.message}`);
+    }
     console.log(`DEBUG - Distributed ${amount} SOL to ${playerAddress}, signature: ${signature}`);
 
     res.json({ success: true, transactionSignature: signature });
@@ -1298,6 +1357,8 @@ app.post('/distribute-winnings-sol', async (req, res) => {
       success: false,
       error: `Failed to distribute SOL winnings: ${err.message || 'Unknown error'}`,
     });
+  } finally {
+    ongoingDistributions.delete(distributionKey);
   }
 });
 
