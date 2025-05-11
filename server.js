@@ -604,6 +604,7 @@ app.get('/get-crazy-wheel', (req, res) => {
 });
 
 // Endpoint per Crazy Wheel
+// Endpoint per Crazy Wheel
 app.post('/play-crazy-wheel', async (req, res) => {
   console.log('DEBUG - /play-crazy-wheel called:', req.body);
   const { playerAddress, bets, signedTransaction } = req.body;
@@ -660,7 +661,77 @@ app.post('/play-crazy-wheel', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
-    res.json({ success: true });
+    // Logica per selezionare il risultato della ruota con probabilità pesata
+    const segmentWeights = {
+      '1': 0.80, // 80% di probabilità per il segmento 1
+      '2': 0.05, // 5% per il segmento 2
+      '5': 0.04, // 4% per il segmento 5
+      '10': 0.03, // 3% per il segmento 10
+      'Coin Flip': 0.03, // 3% per Coin Flip
+      'Pachinko': 0.02, // 2% per Pachinko
+      'Cash Hunt': 0.02, // 2% per Cash Hunt
+      'Crazy Time': 0.01, // 1% per Crazy Time
+    };
+
+    // Selezione pesata del risultato
+    const randomValue = Math.random();
+    let cumulativeProbability = 0;
+    let selectedSegment = null;
+    for (const segment in segmentWeights) {
+      cumulativeProbability += segmentWeights[segment];
+      if (randomValue <= cumulativeProbability) {
+        selectedSegment = segment;
+        break;
+      }
+    }
+
+    // Trova il segmento corrispondente nella ruota per il frontend
+    const resultSegment = crazyTimeWheel.find(
+      (s) => s.value.toString() === selectedSegment || s.value === selectedSegment
+    ) || crazyTimeWheel[0]; // Fallback al primo segmento se qualcosa va storto
+    console.log('DEBUG - Selected segment:', resultSegment);
+
+    // Calcolo delle vincite
+    let totalWin = 0;
+    if (bets[selectedSegment]) {
+      const betAmount = bets[selectedSegment];
+      let multiplier = 1;
+      if (selectedSegment === '1') multiplier = 1;
+      else if (selectedSegment === '2') multiplier = 2;
+      else if (selectedSegment === '5') multiplier = 5;
+      else if (selectedSegment === '10') multiplier = 10;
+      else if (['Coin Flip', 'Pachinko', 'Cash Hunt', 'Crazy Time'].includes(selectedSegment)) {
+        multiplier = 10; // Imposta un moltiplicatore di default per i bonus
+      }
+      totalWin = betAmount * multiplier;
+      console.log(`DEBUG - Win calculated: bet=${betAmount}, multiplier=${multiplier}, totalWin=${totalWin}`);
+    }
+
+    // Distribuzione delle vincite in SOL
+    if (totalWin > 0) {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: userPublicKey,
+          lamports: Math.round(totalWin * LAMPORTS_PER_SOL),
+        })
+      );
+
+      const { blockhash } = await getCachedBlockhash(connection);
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+
+      const winSignature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(winSignature);
+      console.log(`DEBUG - Distributed ${totalWin} SOL to ${playerAddress}`);
+    }
+
+    res.json({
+      success: true,
+      result: resultSegment,
+      totalWin,
+    });
   } catch (err) {
     console.error('DEBUG - Error in play-crazy-wheel:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to process transaction' });
