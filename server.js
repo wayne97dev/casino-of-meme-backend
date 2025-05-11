@@ -111,7 +111,7 @@ connectRedis().catch(err => {
 });
 
 // Connessione a Solana
-const connection = new Connection('https://rpc.helius.xyz/?api-key=fa5d0fbf-c064-4cdc-9e68-0a931504f2ba', 'confirmed');
+const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
 
 // Carica la private key in formato base58
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
