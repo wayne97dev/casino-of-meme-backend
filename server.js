@@ -338,17 +338,29 @@ const crazyTimeWheel = shuffleArray([...crazyTimeWheelBase]);
 app.post('/play-meme-slots', async (req, res) => {
   const { playerAddress, betAmount, signedTransaction } = req.body;
 
+  console.log('DEBUG - /play-meme-slots called with:', { playerAddress, betAmount, signedTransaction });
+
+  // Validazione degli input
   if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
     console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
     return res.status(400).json({ success: false, error: 'Invalid parameters' });
   }
 
+  let userPublicKey;
   try {
-    const userPublicKey = new PublicKey(playerAddress);
-    const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
-    console.log('DEBUG - Bet details:', { betAmount, betInLamports });
+    userPublicKey = new PublicKey(playerAddress);
+    console.log('DEBUG - Validated player address:', userPublicKey.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Invalid player address:', err.message);
+    return res.status(400).json({ success: false, error: 'Invalid player address' });
+  }
 
-    // Verifica il saldo SOL con caching
+  const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
+  console.log('DEBUG - Bet details:', { betAmount, betInLamports });
+
+  try {
+    // Verifica il saldo SOL dell'utente con caching
+    console.log('DEBUG - Checking user SOL balance...');
     const userBalance = await getCachedBalance(connection, userPublicKey, 'sol');
     console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
@@ -357,10 +369,13 @@ app.post('/play-meme-slots', async (req, res) => {
     }
 
     // Valida e processa la transazione firmata
+    console.log('DEBUG - Parsing signed transaction...');
     const transactionBuffer = Buffer.from(signedTransaction, 'base64');
     const transaction = Transaction.from(transactionBuffer);
 
+    console.log('DEBUG - Verifying transaction signatures...');
     if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures:', transaction.signatures);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
@@ -369,6 +384,7 @@ app.post('/play-meme-slots', async (req, res) => {
     console.log('DEBUG - Transaction signature:', signature);
 
     // Controlla se la transazione è già stata processata
+    console.log('DEBUG - Checking if transaction is already processed...');
     const alreadyProcessed = await hasTransactionSignatureInCache(signature);
     if (alreadyProcessed) {
       console.log('DEBUG - Transaction already processed, skipping...');
@@ -379,6 +395,7 @@ app.post('/play-meme-slots', async (req, res) => {
     }
 
     // Invia la transazione con retry
+    console.log('DEBUG - Sending bet transaction...');
     let result;
     try {
       result = await retry(
@@ -387,9 +404,13 @@ app.post('/play-meme-slots', async (req, res) => {
         1000,
         transaction
       );
+      console.log('DEBUG - Transaction sent, signature:', result);
+
+      console.log('DEBUG - Confirming transaction...');
       const confirmation = await connection.confirmTransaction(result, 'confirmed');
       if (confirmation.value.err) {
-        return res.status(500).json({ success: false, error: 'Transaction failed' });
+        console.log('DEBUG - Transaction failed:', confirmation.value.err);
+        return res.status(500).json({ success: false, error: 'Transaction failed during confirmation' });
       }
       console.log('DEBUG - Transaction confirmed:', result);
     } catch (err) {
@@ -402,13 +423,19 @@ app.post('/play-meme-slots', async (req, res) => {
           logs: logs,
         });
       }
-      throw err;
+      console.error('DEBUG - Error sending transaction:', err.message, err.stack);
+      return res.status(500).json({
+        success: false,
+        error: `Failed to send transaction: ${err.message}`,
+      });
     }
 
     // Aggiungi la firma alla cache
+    console.log('DEBUG - Adding transaction signature to cache...');
     await addTransactionSignatureToCache(result);
 
     // Genera il risultato della slot
+    console.log('DEBUG - Generating slot result...');
     let resultArray;
     const winLines = [
       [0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14], [15, 16, 17, 18, 19], [20, 21, 22, 23, 24],
@@ -416,101 +443,139 @@ app.post('/play-meme-slots', async (req, res) => {
       [0, 6, 12, 18, 24], [4, 8, 12, 16, 20],
     ];
 
-    if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
-      resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
-      let attempts = 0;
-      while (attempts < 20) {
-        let hasWin = false;
-        for (const line of winLines) {
-          const symbolsInLine = line.map(index => resultArray[index].name);
-          let currentSymbol = symbolsInLine[0];
-          let streak = 1;
-          for (let j = 1; j < symbolsInLine.length; j++) {
-            if (symbolsInLine[j].toLowerCase() === currentSymbol.toLowerCase()) {
-              streak++;
-              if (streak >= 3) {
-                hasWin = true;
-                break;
-              }
-            } else {
-              currentSymbol = symbolsInLine[j];
-              streak = 1;
-            }
-          }
-          if (hasWin) break;
-        }
-        if (!hasWin) break;
+    try {
+      if (Math.random() < COMPUTER_WIN_CHANCE.memeSlots) {
         resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
-        attempts++;
-      }
-    } else {
-      resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
-      const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
-      const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
-      const streakOptions = [
-        { streak: 3, probability: 0.9 },
-        { streak: 4, probability: 0.09 },
-        { streak: 5, probability: 0.01 },
-      ];
-      const totalProbability = streakOptions.reduce((sum, option) => sum + option.probability, 0);
-      let random = Math.random() * totalProbability;
-      let selectedStreak = 3;
-      for (const option of streakOptions) {
-        if (random < option.probability) {
-          selectedStreak = option.streak;
-          break;
+        let attempts = 0;
+        while (attempts < 20) {
+          let hasWin = false;
+          for (const line of winLines) {
+            const symbolsInLine = line.map(index => resultArray[index].name);
+            let currentSymbol = symbolsInLine[0];
+            let streak = 1;
+            for (let j = 1; j < symbolsInLine.length; j++) {
+              if (symbolsInLine[j].toLowerCase() === currentSymbol.toLowerCase()) {
+                streak++;
+                if (streak >= 3) {
+                  hasWin = true;
+                  break;
+                }
+              } else {
+                currentSymbol = symbolsInLine[j];
+                streak = 1;
+              }
+            }
+            if (hasWin) break;
+          }
+          if (!hasWin) break;
+          resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+          attempts++;
         }
-        random -= option.probability;
+      } else {
+        resultArray = Array(25).fill().map(() => slotMemes[Math.floor(Math.random() * slotMemes.length)]);
+        const winningSymbol = slotMemes[Math.floor(Math.random() * slotMemes.length)];
+        const winningLine = winLines[Math.floor(Math.random() * winLines.length)];
+        const streakOptions = [
+          { streak: 3, probability: 0.9 },
+          { streak: 4, probability: 0.09 },
+          { streak: 5, probability: 0.01 },
+        ];
+        const totalProbability = streakOptions.reduce((sum, option) => sum + option.probability, 0);
+        let random = Math.random() * totalProbability;
+        let selectedStreak = 3;
+        for (const option of streakOptions) {
+          if (random < option.probability) {
+            selectedStreak = option.streak;
+            break;
+          }
+          random -= option.probability;
+        }
+        for (let i = 0; i < selectedStreak; i++) {
+          resultArray[winningLine[i]] = winningSymbol;
+        }
       }
-      for (let i = 0; i < selectedStreak; i++) {
-        resultArray[winningLine[i]] = winningSymbol;
-      }
+
+      console.log('DEBUG - Slot result generated:', resultArray.map(item => item.name));
+    } catch (err) {
+      console.error('DEBUG - Error generating slot result:', err.message, err.stack);
+      return res.status(500).json({
+        success: false,
+        error: `Failed to generate slot result: ${err.message}`,
+      });
     }
 
     // Calcola le vincite
+    console.log('DEBUG - Calculating winnings...');
     const winningLinesFound = [];
     const winningIndices = new Set();
     let totalWin = 0;
 
-    for (let i = 0; i < winLines.length; i++) {
-      const line = winLines[i];
-      const symbolsInLine = line.map(index => resultArray[index].name);
-      let currentSymbol = symbolsInLine[0];
-      let streak = 1;
-      let streakStart = 0;
+    try {
+      for (let i = 0; i < winLines.length; i++) {
+        const line = winLines[i];
+        const symbolsInLine = line.map(index => resultArray[index].name);
+        let currentSymbol = symbolsInLine[0];
+        let streak = 1;
+        let streakStart = 0;
 
-      for (let j = 1; j < symbolsInLine.length; j++) {
-        if (symbolsInLine[j] === currentSymbol) {
-          streak++;
-        } else {
-          if (streak >= 3) {
-            winningLinesFound.push(i);
-            for (let k = streakStart; k < streakStart + streak; k++) {
-              winningIndices.add(line[k]);
+        for (let j = 1; j < symbolsInLine.length; j++) {
+          if (symbolsInLine[j] === currentSymbol) {
+            streak++;
+          } else {
+            if (streak >= 3) {
+              winningLinesFound.push(i);
+              for (let k = streakStart; k < streakStart + streak; k++) {
+                winningIndices.add(line[k]);
+              }
+              let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
+              if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
+              totalWin += winAmount;
+              console.log(`DEBUG - Winning line ${i}: ${streak} ${currentSymbol}, winAmount=${winAmount}`);
             }
-            let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
-            if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
-            totalWin += winAmount;
+            currentSymbol = symbolsInLine[j];
+            streak = 1;
+            streakStart = j;
           }
-          currentSymbol = symbolsInLine[j];
-          streak = 1;
-          streakStart = j;
+        }
+
+        if (streak >= 3) {
+          winningLinesFound.push(i);
+          for (let k = streakStart; k < streakStart + streak; k++) {
+            winningIndices.add(line[k]);
+          }
+          let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
+          if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
+          totalWin += winAmount;
+          console.log(`DEBUG - Winning line ${i}: ${streak} ${currentSymbol}, winAmount=${winAmount}`);
         }
       }
 
-      if (streak >= 3) {
-        winningLinesFound.push(i);
-        for (let k = streakStart; k < streakStart + streak; k++) {
-          winningIndices.add(line[k]);
-        }
-        let winAmount = streak === 3 ? betAmount * 0.5 : streak === 4 ? betAmount * 3 : betAmount * 10;
-        if (currentSymbol.toLowerCase() === 'bonus') winAmount *= 2;
-        totalWin += winAmount;
-      }
+      console.log('DEBUG - Total winnings:', totalWin);
+    } catch (err) {
+      console.error('DEBUG - Error calculating winnings:', err.message, err.stack);
+      return res.status(500).json({
+        success: false,
+        error: `Failed to calculate winnings: ${err.message}`,
+      });
     }
 
     // Distribuisci le vincite
     if (totalWin > 0) {
+      console.log('DEBUG - Checking casino SOL balance for winnings distribution...');
+      const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true); // Forza refresh
+      const requiredBalance = totalWin + 0.01; // Importo + fee minime
+      if (casinoSolBalance < requiredBalance) {
+        console.log('DEBUG - Insufficient SOL balance in casino wallet for winnings:', {
+          casinoSolBalance,
+          requiredBalance,
+        });
+        return res.status(400).json({
+          success: false,
+          error: `Insufficient SOL balance in casino wallet: ${casinoSolBalance} SOL available, ${requiredBalance.toFixed(4)} SOL required`,
+        });
+      }
+
+      console.log('DEBUG - Creating winnings transaction...');
       const transaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: wallet.publicKey,
@@ -539,6 +604,7 @@ app.post('/play-meme-slots', async (req, res) => {
         });
       }
 
+      console.log('DEBUG - Sending winnings transaction...');
       try {
         const winResult = await retry(
           () => connection.sendRawTransaction(serializedTransaction),
@@ -546,6 +612,9 @@ app.post('/play-meme-slots', async (req, res) => {
           1000,
           transaction
         );
+        console.log('DEBUG - Winnings transaction sent, signature:', winResult);
+
+        console.log('DEBUG - Confirming winnings transaction...');
         await connection.confirmTransaction(winResult);
         console.log(`Distributed ${totalWin} SOL to ${playerAddress}`);
 
@@ -561,10 +630,15 @@ app.post('/play-meme-slots', async (req, res) => {
             logs: logs,
           });
         }
-        throw err;
+        console.error('DEBUG - Error distributing winnings:', err.message, err.stack);
+        return res.status(500).json({
+          success: false,
+          error: `Failed to distribute winnings: ${err.message}`,
+        });
       }
     }
 
+    // Invia la risposta al frontend
     res.json({
       success: true,
       result: resultArray.map(item => ({ name: item.name, image: item.image })),
@@ -573,8 +647,8 @@ app.post('/play-meme-slots', async (req, res) => {
       totalWin,
     });
   } catch (err) {
-    console.error('Error in play-meme-slots:', err);
-    res.status(500).json({ success: false, error: 'Failed to play meme slots' });
+    console.error('Error in play-meme-slots:', err.message, err.stack);
+    res.status(500).json({ success: false, error: `Failed to play meme slots: ${err.message}` });
   }
 });
 
