@@ -129,14 +129,35 @@ connectRedis().catch(err => {
 // Connessione a Solana
 const primaryConnection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
 const fallbackConnection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+const quickNodeConnection = new Connection('https://indulgent-frequent-shadow.solana-mainnet.quiknode.pro/4d91f8d7189fdb1c241d6b49f024fe351e98f9dd/', 'confirmed');
 
 async function getConnection() {
+  // Prova la connessione primaria (Helius)
   try {
     await primaryConnection.getSlot();
+    console.log('DEBUG - Using primary RPC (Helius)');
     return primaryConnection;
   } catch (err) {
-    console.warn('DEBUG - Primary RPC failed, using fallback:', err.message);
-    return fallbackConnection;
+    console.warn('DEBUG - Primary RPC (Helius) failed:', err.message);
+    
+    // Prova il primo fallback (Solana pubblico)
+    try {
+      await fallbackConnection.getSlot();
+      console.log('DEBUG - Using fallback RPC (Solana public)');
+      return fallbackConnection;
+    } catch (err) {
+      console.warn('DEBUG - Fallback RPC (Solana public) failed:', err.message);
+      
+      // Prova il secondo fallback (QuickNode)
+      try {
+        await quickNodeConnection.getSlot();
+        console.log('DEBUG - Using QuickNode RPC');
+        return quickNodeConnection;
+      } catch (err) {
+        console.error('DEBUG - QuickNode RPC failed:', err.message);
+        throw new Error('All RPC connections failed');
+      }
+    }
   }
 }
 
