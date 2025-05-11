@@ -111,32 +111,7 @@ connectRedis().catch(err => {
 });
 
 // Connessione a Solana
-// Connessione a Solana (Primaria: Helius)
-const primaryConnection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
-
-// Connessione a Solana (Backup: QuickNode)
-const backupConnection = new Connection('https://indulgent-frequent-shadow.solana-mainnet.quiknode.pro/4d91f8d7189fdb1c241d6b49f024fe351e98f9dd', 'confirmed');
-
-// Funzione di utilità per gestire il fallback RPC
-async function withRpcFallback(operation, operationName, ...args) {
-  try {
-    console.log(`DEBUG - Attempting ${operationName} with primary (Helius) RPC`);
-    const result = await operation(primaryConnection, ...args);
-    console.log(`DEBUG - ${operationName} succeeded with primary (Helius) RPC`);
-    return result;
-  } catch (err) {
-    console.error(`DEBUG - Primary (Helius) RPC failed for ${operationName}:`, err.message);
-    try {
-      console.log(`DEBUG - Attempting ${operationName} with backup (QuickNode) RPC`);
-      const result = await operation(backupConnection, ...args);
-      console.log(`DEBUG - ${operationName} succeeded with backup (QuickNode) RPC`);
-      return result;
-    } catch (backupErr) {
-      console.error(`DEBUG - Backup (QuickNode) RPC failed for ${operationName}:`, backupErr.message);
-      throw new Error(`Failed to perform ${operationName} with both primary and backup RPCs: ${backupErr.message}`);
-    }
-  }
-}
+const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
 
 // Carica la private key in formato base58
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
@@ -169,7 +144,7 @@ const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
 const MIN_BET = 1000; // 1000 COM
 
 // Funzioni di caching per Solana
-async function getCachedBlockhash() {
+async function getCachedBlockhash(connection) {
   const cacheKey = 'latestBlockhash';
   try {
     const cachedBlockhash = await redisClient.get(cacheKey);
@@ -182,20 +157,17 @@ async function getCachedBlockhash() {
   }
 
   try {
-    const blockhashInfo = await withRpcFallback(
-      async (conn) => await conn.getLatestBlockhash(),
-      'getLatestBlockhash'
-    );
-    await redisClient.setEx(cacheKey, 10, JSON.stringify(blockhashInfo)); // Cache per 10 secondi
-    console.log('DEBUG - Fetched and cached new blockhash:', blockhashInfo.blockhash);
-    return blockhashInfo;
+    const { blockhash } = await connection.getLatestBlockhash();
+    await redisClient.setEx(cacheKey, 10, JSON.stringify({ blockhash }));
+    console.log('DEBUG - Fetched and cached new blockhash:', blockhash);
+    return { blockhash };
   } catch (err) {
-    console.error('DEBUG - Error fetching blockhash:', err);
+    console.error('DEBUG - Error fetching blockhash from Solana:', err);
     throw err;
   }
 }
 
-async function getCachedBalance(publicKey, type = 'sol', forceRefresh = false) {
+async function getCachedBalance(connection, publicKey, type = 'sol', forceRefresh = false) {
   const cacheKey = `balance:${publicKey.toBase58()}:${type}`;
   if (!forceRefresh) {
     try {
@@ -203,6 +175,7 @@ async function getCachedBalance(publicKey, type = 'sol', forceRefresh = false) {
       if (cachedBalance) {
         const balance = parseFloat(cachedBalance);
         console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
+        // Controlla se il saldo è valido
         if (balance < 0 || isNaN(balance)) {
           console.log('DEBUG - Invalid cached balance, forcing refresh');
           forceRefresh = true;
@@ -218,20 +191,22 @@ async function getCachedBalance(publicKey, type = 'sol', forceRefresh = false) {
   try {
     let balance;
     if (type === 'sol') {
-      balance = await withRpcFallback(
-        async (conn, pubKey) => await conn.getBalance(pubKey),
-        'getBalance',
-        publicKey
-      );
-      balance = balance / LAMPORTS_PER_SOL;
-      console.log(`DEBUG - Successfully fetched SOL balance for ${publicKey.toBase58()}: ${balance}`);
+      try {
+        balance = await connection.getBalance(publicKey);
+        balance = balance / LAMPORTS_PER_SOL;
+        console.log(`DEBUG - Successfully fetched SOL balance from primary RPC for ${publicKey.toBase58()}: ${balance}`);
+      } catch (err) {
+        console.error('DEBUG - Primary RPC failed, trying fallback:', err);
+        const fallbackConnection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+        balance = await fallbackConnection.getBalance(publicKey);
+        balance = balance / LAMPORTS_PER_SOL;
+        console.log(`DEBUG - Successfully fetched SOL balance from fallback RPC for ${publicKey.toBase58()}: ${balance}`);
+      }
     } else if (type === 'com') {
       const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
-      const account = await withRpcFallback(
-        async (conn, ata) => await conn.getTokenAccountBalance(ata).catch(() => ({ value: { uiAmount: 0 } })),
-        'getTokenAccountBalance',
-        userATA
-      );
+      const account = await connection.getTokenAccountBalance(userATA).catch(() => ({
+        value: { uiAmount: 0 },
+      }));
       balance = account.value.uiAmount || 0;
       console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
     }
@@ -675,8 +650,8 @@ app.post('/play-solana-card-duel', async (req, res) => {
     const betInLamports = Math.round(betAmount * LAMPORTS_PER_SOL);
     console.log('DEBUG - Bet details:', { betAmount, betInLamports });
 
-    // Verifica il saldo SOL con caching (già usa withRpcFallback)
-    const userBalance = await getCachedBalance(userPublicKey, 'sol', req.body.forceRefresh || false);
+    // Verifica il saldo SOL con caching
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'sol', req.body.forceRefresh || false);
     console.log('DEBUG - User balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
     if (userBalance * LAMPORTS_PER_SOL < betInLamports) {
       console.log('DEBUG - Insufficient SOL balance:', { userBalance, required: betInLamports / LAMPORTS_PER_SOL });
@@ -691,80 +666,16 @@ app.post('/play-solana-card-duel', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
 
-    const { blockhash, lastValidBlockHeight } = await getCachedBlockhash();
-    transaction.recentBlockhash = blockhash;
-
-    const signature = await withRpcFallback(
-      async (conn, tx) => await retry(() => conn.sendRawTransaction(tx, { skipPreflight: false }), 3, 1000),
-      'sendRawTransaction',
-      transaction.serialize()
-    );
-    console.log('DEBUG - Transaction sent for player:', playerAddress, 'signature:', signature);
-
-    const startTime = Date.now();
-    try {
-      const confirmation = await withRpcFallback(
-        async (conn, sig, bh, lvbh) =>
-          await conn.confirmTransaction(
-            { signature: sig, blockhash: bh, lastValidBlockHeight: lvbh },
-            'confirmed',
-            { commitment: 'confirmed', timeout: 60000 }
-          ),
-        'confirmTransaction',
-        signature,
-        blockhash,
-        lastValidBlockHeight
-      );
-      console.log('DEBUG - Transaction confirmed in', (Date.now() - startTime) / 1000, 'seconds');
-      if (confirmation.value.err) {
-        console.log('DEBUG - Transaction failed:', confirmation.value.err);
-        return res.status(500).json({ success: false, error: 'Transaction failed' });
-      }
-    } catch (err) {
-      console.error('DEBUG - Transaction confirmation failed after', (Date.now() - startTime) / 1000, 'seconds:', err);
-      try {
-        const txInfo = await withRpcFallback(
-          async (conn, sig) => await conn.getTransaction(sig, { commitment: 'confirmed' }),
-          'getTransaction',
-          signature
-        );
-        if (txInfo) {
-          console.log('DEBUG - Transaction found:', txInfo.meta.err ? 'Failed' : 'Succeeded');
-          if (txInfo.meta.err) {
-            return res.status(500).json({
-              success: false,
-              error: `Transaction failed: ${JSON.stringify(txInfo.meta.err)}`,
-              transactionSignature: signature,
-            });
-          } else {
-            return res.json({
-              success: true,
-              message: 'Transaction confirmed after timeout',
-              transactionSignature: signature,
-            });
-          }
-        } else {
-          console.log('DEBUG - Transaction not found, likely dropped');
-          return res.status(500).json({
-            success: false,
-            error: `Failed to play solana card duel: Transaction was not confirmed in 60.00 seconds`,
-            transactionSignature: signature,
-          });
-        }
-      } catch (checkErr) {
-        console.error('DEBUG - Error checking transaction status:', checkErr);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to play solana card duel: ${err.message}`,
-          transactionSignature: signature,
-        });
-      }
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed' });
     }
 
     res.json({
       success: true,
       message: 'Bet placed successfully',
-      transactionSignature: signature,
     });
   } catch (err) {
     console.error('Error in play-solana-card-duel:', err);
@@ -2548,4 +2459,4 @@ const PORT = process.env.PORT || 3001;
 console.log(`PORT environment variable: ${process.env.PORT}`);
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-}); 
+});  
