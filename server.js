@@ -1096,20 +1096,26 @@ app.post('/distribute-winnings', async (req, res) => {
     const transferFeeConfig = extensions?.find(ext => ext.extension === 'transferFeeConfig');
 
     let feeAmount = BigInt(0);
-    if (transferFeeConfig) {
+    if (transferFeeConfig && transferFeeConfig.state &&
+        typeof transferFeeConfig.state.transferFeeBasisPoints === 'number' &&
+        typeof transferFeeConfig.state.maximumFee === 'string') {
       const feeBasisPoints = BigInt(transferFeeConfig.state.transferFeeBasisPoints);
       const maxFee = BigInt(transferFeeConfig.state.maximumFee);
       const amountInBaseUnits = BigInt(Math.round(amount * Math.pow(10, decimals)));
       const calculatedFee = (amountInBaseUnits * feeBasisPoints) / BigInt(10000);
       feeAmount = calculatedFee < maxFee ? calculatedFee : maxFee;
-      console.log('DEBUG - Transfer fee calculated:', { feeBasisPoints: feeBasisPoints.toString(), maxFee: maxFee.toString(), feeAmount: feeAmount.toString() });
+      console.log('DEBUG - Transfer fee calculated:', {
+        feeBasisPoints: feeBasisPoints.toString(),
+        maxFee: maxFee.toString(),
+        feeAmount: feeAmount.toString(),
+      });
     } else {
-      console.log('DEBUG - No TransferFee extension found, proceeding without fee');
+      console.log('DEBUG - No valid TransferFee extension found or incomplete, proceeding without fee');
     }
 
     console.log('DEBUG - Creating transfer transaction...');
     const transaction = new Transaction();
-    if (transferFeeConfig) {
+    if (transferFeeConfig && feeAmount > 0) {
       transaction.add(
         createTransferCheckedWithFeeInstruction(
           casinoATA,
