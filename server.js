@@ -1819,181 +1819,131 @@ app.post('/join-poker-game', async (req, res) => {
 });
 
 // Endpoint per gestire le mosse in Poker PvP
-app.post('/make-poker-move', async (req, res) => {
-  console.log('DEBUG - /make-poker-move called:', req.body);
-  const { playerAddress, gameId, move, amount, signedTransaction } = req.body;
-
-  if (!playerAddress || !gameId || !move || amount === undefined || isNaN(amount) || amount < 0) {
-    console.log('DEBUG - Invalid parameters:', { playerAddress, gameId, move, amount });
-    return res.status(400).json({ success: false, error: 'Invalid required fields' });
+socket.on('makeMove', async ({ gameId, move, amount }) => {
+  console.log('DEBUG - makeMove called:', { gameId, move, amount, socketId: socket.id });
+  const game = games[gameId];
+  if (!game || game.currentTurn !== socket.id) {
+    console.log(`DEBUG - Invalid move: gameId=${gameId}, currentTurn=${game.currentTurn}, socket.id=${socket.id}`);
+    socket.emit('error', { message: 'Invalid move or not your turn' });
+    return;
   }
 
-  if (amount > 0 && !signedTransaction) {
-    console.log('DEBUG - Missing signed transaction for move:', move);
-    return res.status(400).json({ success: false, error: 'Missing signed transaction' });
+  if (game.turnTimer) {
+    clearInterval(game.turnTimer);
+    console.log('DEBUG - Cleared turn timer for game:', gameId);
   }
+  game.timeLeft = 30;
 
-  let userPublicKey;
-  try {
-    console.log('DEBUG - Validating player address:', playerAddress);
-    userPublicKey = new PublicKey(playerAddress);
-    console.log('DEBUG - Player address validated:', userPublicKey.toBase58());
-  } catch (err) {
-    console.error('DEBUG - Invalid player address:', err.message);
-    return res.status(400).json({ success: false, error: 'Invalid player address: ' + err.message });
+  const playerAddress = game.players.find(p => p.id === socket.id)?.address;
+  const opponent = game.players.find(p => p.id !== socket.id);
+  if (!playerAddress || !opponent) {
+    console.log(`DEBUG - Player or opponent not found: playerAddress=${playerAddress}, opponent=${opponent}`);
+    await refundBetsForGame(gameId);
+    socket.emit('error', { message: 'Player or opponent not found' });
+    return;
   }
+  const currentPlayerBet = game.playerBets[playerAddress] || 0;
+  console.log(`DEBUG - Processing move: ${move}, gameId=${gameId}, playerAddress=${playerAddress}, currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}, actionsCompleted=${game.actionsCompleted}`);
 
-  let connection;
-  try {
-    console.log('DEBUG - Establishing connection to Solana RPC...');
-    connection = await getConnection();
-    if (!connection) {
-      throw new Error('Failed to establish connection to Solana RPC');
-    }
-    console.log('DEBUG - Connection established successfully');
-  } catch (err) {
-    console.error('DEBUG - Error establishing connection:', err.message, err.stack);
-    return res.status(500).json({ success: false, error: 'Failed to connect to Solana RPC: ' + err.message });
-  }
-
-  let userATA, casinoATA;
-  try {
-    console.log('DEBUG - Getting user ATA...');
-    userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey, false, TOKEN_2022_PROGRAM_ID);
-    console.log('DEBUG - User ATA:', userATA.toBase58());
-
-    console.log('DEBUG - Getting casino ATA...');
-    casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
-    console.log('DEBUG - Casino ATA:', casinoATA.toBase58());
-  } catch (err) {
-    console.error('DEBUG - Error getting ATAs:', err.message, err.stack);
-    return res.status(500).json({ success: false, error: 'Failed to get token accounts: ' + err.message });
-  }
-
-  try {
-    console.log('DEBUG - Checking casino ATA...');
-    let casinoAccountExists = false;
+  if (move === 'fold') {
+    game.status = 'finished';
+    game.opponentCardsVisible = true;
+    game.message = `${opponent.address.slice(0, 8)}... wins! ${playerAddress.slice(0, 8)}... folded.`;
+    game.dealerMessage = 'The dealer announces the winner!';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: opponent.address, amount: game.pot, isRefund: false });
+    await updateLeaderboard(opponent.address, game.pot);
     try {
-      await getAccount(connection, casinoATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
-      casinoAccountExists = true;
-      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
+      await Game.updateOne({ gameId }, { status: 'finished' });
+      await Game.deleteOne({ gameId });
+      console.log(`DEBUG - Deleted game ${gameId} from database`);
     } catch (err) {
-      console.log('DEBUG - Casino ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
-          MINT_ADDRESS,
-          TOKEN_2022_PROGRAM_ID
-        )
-      );
-      const { blockhash } = await getCachedBlockhash(connection);
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature, 'confirmed');
-      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
+      console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
     }
-  } catch (err) {
-    console.error('DEBUG - Error checking/creating casino ATA:', err.message, err.stack);
-    return res.status(500).json({ success: false, error: 'Failed to check/create casino ATA: ' + err.message });
-  }
+    delete games[gameId];
+  } else if (move === 'check') {
+    if (game.currentBet > currentPlayerBet) {
+      game.message = 'You cannot check, you must call or raise!';
+      game.dealerMessage = 'The dealer reminds: You must call or raise!';
+      console.log(`DEBUG - Check not allowed: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+    } else {
+      game.message = 'You checked.';
+      game.dealerMessage = `The dealer says: ${playerAddress.slice(0, 8)}... checked.`;
+      console.log(`DEBUG - Check successful: currentBet=${game.currentBet}, currentPlayerBet=${currentPlayerBet}`);
+      game.actionsCompleted += 1;
+      console.log(`DEBUG - Actions completed: ${game.actionsCompleted}`);
 
-  try {
-    console.log('DEBUG - Checking player ATA...');
-    let playerAccountExists = false;
-    try {
-      await getAccount(connection, userATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
-      playerAccountExists = true;
-      console.log('DEBUG - Player ATA exists:', userATA.toBase58());
-    } catch (err) {
-      console.log('DEBUG - Player ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          userATA,
-          userPublicKey,
-          MINT_ADDRESS,
-          TOKEN_2022_PROGRAM_ID
-        )
-      );
-      const { blockhash } = await getCachedBlockhash(connection);
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature, 'confirmed');
-      console.log('DEBUG - Created player ATA:', userATA.toBase58());
-    }
-  } catch (err) {
-    console.error('DEBUG - Error checking/creating player ATA:', err.message, err.stack);
-    return res.status(500).json({ success: false, error: 'Failed to check/create player ATA: ' + err.message });
-  }
-
-  if (amount > 0) {
-    let userBalance;
-    try {
-      console.log('DEBUG - Checking user COM balance for move:', move);
-      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true);
-      console.log('DEBUG - User balance:', userBalance, 'Required:', amount);
-      if (userBalance < amount) {
-        console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
-        return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
+      if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+        game.bettingRoundComplete = true;
+        game.actionsCompleted = 0;
+        console.log(`DEBUG - Betting round complete in phase ${game.gamePhase}, advancing game phase`);
+        advanceGamePhase(gameId);
+      } else {
+        game.currentTurn = opponent.id;
+        game.bettingRoundComplete = false;
+        console.log(`DEBUG - Passing turn to opponent: ${opponent.id}`);
+        startTurnTimer(gameId, opponent.id);
       }
-    } catch (err) {
-      console.error('DEBUG - Error checking user COM balance:', err.message, err.stack);
-      return res.status(500).json({ success: false, error: 'Failed to check user balance: ' + err.message });
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
     }
+  } else if (move === 'call') {
+    const amountToCall = game.currentBet - currentPlayerBet;
+    game.pot += amountToCall;
+    game.playerBets[playerAddress] = game.currentBet;
+    game.message = `You called ${amountToCall.toFixed(2)} COM.`;
+    game.dealerMessage = `The dealer confirms: ${playerAddress.slice(0, 8)}... called ${amountToCall.toFixed(2)} COM.`;
+    console.log(`DEBUG - Call successful: amountToCall=${amountToCall}, new pot=${game.pot}`);
+    game.actionsCompleted += 1;
+    console.log(`DEBUG - Actions completed: ${game.actionsCompleted}`);
 
-    let transaction;
-    try {
-      console.log('DEBUG - Processing signed transaction for move:', move);
-      const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-      transaction = Transaction.from(transactionBuffer);
-      console.log('DEBUG - Transaction deserialized successfully');
-    } catch (err) {
-      console.error('DEBUG - Error deserializing transaction:', err.message, err.stack);
-      return res.status(400).json({ success: false, error: 'Failed to deserialize transaction: ' + err.message });
+    if (game.actionsCompleted >= 2 && game.playerBets[playerAddress] === game.playerBets[opponent.address]) {
+      game.bettingRoundComplete = true;
+      game.actionsCompleted = 0;
+      console.log(`DEBUG - Betting round complete in phase ${game.gamePhase}, advancing game phase`);
+      advanceGamePhase(gameId);
+    } else {
+      game.currentTurn = opponent.id;
+      game.bettingRoundComplete = false;
+      console.log(`DEBUG - Passing turn to opponent: ${opponent.id}`);
+      startTurnTimer(gameId, opponent.id);
     }
-
     try {
-      if (!transaction.verifySignatures()) {
-        console.log('DEBUG - Invalid transaction signatures for:', playerAddress);
-        return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
-      }
-      console.log('DEBUG - Transaction signatures verified');
+      await Game.updateOne({ gameId }, { pot: game.pot });
+      console.log(`DEBUG - Updated pot for game ${gameId} to ${game.pot}`);
     } catch (err) {
-      console.error('DEBUG - Error verifying transaction signatures:', err.message, err.stack);
-      return res.status(400).json({ success: false, error: 'Failed to verify transaction signatures: ' + err.message });
+      console.error(`DEBUG - Error updating pot for game ${gameId}:`, err.message, err.stack);
     }
-
-    let signature;
+    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+  } else if (move === 'bet' || move === 'raise') {
+    const minBet = MIN_BET;
+    const newBet = move === 'bet' ? amount : game.currentBet + amount;
+    if (newBet <= game.currentBet || amount < minBet) {
+      game.message = `The bet must be at least ${minBet.toFixed(2)} COM and higher than the current bet!`;
+      game.dealerMessage = `The dealer warns: Bet must be at least ${minBet.toFixed(2)} COM and higher!`;
+      console.log(`DEBUG - Invalid ${move}: newBet=${newBet}, currentBet=${game.currentBet}, minBet=${minBet}`);
+      io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
+      return;
+    }
+    const additionalBet = newBet - currentPlayerBet;
+    game.pot += additionalBet;
+    game.playerBets[playerAddress] = newBet;
+    game.currentBet = newBet;
+    game.message = `You ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+    game.dealerMessage = `The dealer announces: ${playerAddress.slice(0, 8)}... ${move === 'bet' ? 'bet' : 'raised'} ${additionalBet.toFixed(2)} COM.`;
+    console.log(`DEBUG - ${move} successful: additionalBet=${additionalBet}, new pot=${game.pot}, new currentBet=${game.currentBet}`);
+    game.actionsCompleted = 1;
+    game.currentTurn = opponent.id;
+    game.bettingRoundComplete = false;
     try {
-      console.log('DEBUG - Sending transaction for move:', move);
-      signature = await connection.sendRawTransaction(transaction.serialize());
-      console.log('DEBUG - Transaction sent, signature:', signature);
+      await Game.updateOne({ gameId }, { pot: game.pot });
+      console.log(`DEBUG - Updated pot for game ${gameId} to ${game.pot}`);
     } catch (err) {
-      console.error('DEBUG - Error sending transaction:', err.message, err.stack);
-      return res.status(500).json({ success: false, error: 'Failed to send transaction: ' + err.message });
+      console.error(`DEBUG - Error updating pot for game ${gameId}:`, err.message, err.stack);
     }
-
-    try {
-      console.log('DEBUG - Confirming transaction:', signature);
-      const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-      if (confirmation.value.err) {
-        console.log('DEBUG - Transaction failed:', confirmation.value.err);
-        return res.status(500).json({ success: false, error: 'Transaction failed: ' + confirmation.value.err });
-      }
-      console.log(`DEBUG - Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
-    } catch (err) {
-      console.error('DEBUG - Error confirming transaction:', err.message, err.stack);
-      return res.status(500).json({ success: false, error: 'Failed to confirm transaction: ' + err.message });
-    }
+    startTurnTimer(gameId, opponent.id);
+    io.to(gameId).emit('gameState', removeCircularReferences({ ...game, timeLeft: game.timeLeft }));
   }
-
-  res.json({ success: true });
 });
 
 // Endpoint per la leaderboard
