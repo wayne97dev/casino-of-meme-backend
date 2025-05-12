@@ -226,7 +226,6 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
           console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
           return balance;
         }
-        console.log('DEBUG - Invalid cached balance, forcing refresh');
       }
     } catch (err) {
       console.warn('DEBUG - Redis error fetching balance:', err.message);
@@ -236,37 +235,24 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
   try {
     let balance;
     if (type === 'sol') {
-      try {
-        balance = await connection.getBalance(publicKey);
-        balance = balance / LAMPORTS_PER_SOL;
-        console.log(`DEBUG - Successfully fetched SOL balance for ${publicKey.toBase58()}: ${balance}`);
-      } catch (err) {
-        console.error('DEBUG - Primary RPC failed, trying fallback:', err.message);
-        const fallbackConn = await getConnection();
-        balance = await fallbackConn.getBalance(publicKey);
-        balance = balance / LAMPORTS_PER_SOL;
-        console.log(`DEBUG - Successfully fetched SOL balance from fallback for ${publicKey.toBase58()}: ${balance}`);
-      }
+      balance = await connection.getBalance(publicKey);
+      balance = balance / LAMPORTS_PER_SOL;
     } else if (type === 'com') {
-      const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
+      const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey, false, TOKEN_2022_PROGRAM_ID);
       const account = await connection.getTokenAccountBalance(userATA).catch(() => ({
         value: { uiAmount: 0 },
       }));
       balance = account.value.uiAmount || 0;
       console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
     }
-    try {
-      await redisClient.setEx(cacheKey, 30, balance.toString());
-      console.log(`DEBUG - Cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
-    } catch (err) {
-      console.warn('DEBUG - Failed to cache balance:', err.message);
-    }
+    await redisClient.setEx(cacheKey, 30, balance.toString());
     return balance;
   } catch (err) {
     console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err.message);
     throw err;
   }
 }
+
 
 async function getCachedMintInfo(connection, mintAddress) {
   const cacheKey = `mint:${mintAddress.toBase58()}`;
@@ -955,6 +941,22 @@ app.get('/com-balance/:playerAddress', async (req, res) => {
   } catch (err) {
     console.error('DEBUG - Error fetching COM balance:', err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to fetch COM balance' });
+  }
+});
+
+
+app.get('/com-balance/:address', async (req, res) => {
+  const { address } = req.params;
+
+  try {
+    const publicKey = new PublicKey(address);
+    const connection = await getConnection();
+    const balance = await getCachedBalance(connection, publicKey, 'com');
+    console.log(`DEBUG - Fetched COM balance for ${address}: ${balance}`);
+    res.json({ success: true, balance });
+  } catch (err) {
+    console.error(`DEBUG - Error fetching COM balance for ${address}:`, err.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch COM balance: ' + err.message });
   }
 });
 
