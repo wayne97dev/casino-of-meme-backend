@@ -124,6 +124,9 @@ connectRedis().catch(err => {
   console.error('DEBUG - Could not connect to Redis:', err.message);
 });
 
+const { PublicKey } = require('@solana/web3.js');
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+
 // Connessione a Solana
 const primaryConnection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
 const fallbackConnection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
@@ -213,8 +216,7 @@ async function getCachedBlockhash(connection) {
   }
 }
 
-async function getCachedBalance(connection, publicKey, type = 'sol', forceRefresh = true) {
-  // Forza sempre il refresh per evitare dati obsoleti
+async function getCachedBalance(connection, publicKey, type = 'sol', forceRefresh = false) {
   const cacheKey = `balance:${publicKey.toBase58()}:${type}`;
   if (!forceRefresh) {
     try {
@@ -225,60 +227,64 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
           console.log(`DEBUG - Using cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
           return balance;
         }
+        console.log('DEBUG - Invalid cached balance, forcing refresh');
       }
     } catch (err) {
       console.warn('DEBUG - Redis error fetching balance:', err.message);
     }
   }
+
   try {
     let balance;
     if (type === 'sol') {
       balance = await connection.getBalance(publicKey) / LAMPORTS_PER_SOL;
+      console.log(`DEBUG - Successfully fetched SOL balance for ${publicKey.toBase58()}: ${balance}`);
     } else if (type === 'com') {
+      console.log(`DEBUG - Verifying mint: ${MINT_ADDRESS.toBase58()}`);
       try {
         const { getMint } = require('@solana/spl-token');
-        const mintInfo = await getMint(connection, MINT_ADDRESS);
+        const mintInfo = await getMint(connection, MINT_ADDRESS, TOKEN_2022_PROGRAM_ID);
         console.log(`DEBUG - Mint verified: decimals=${mintInfo.decimals}, supply=${mintInfo.supply}`);
         if (mintInfo.decimals !== 6) {
           throw new Error(`Unexpected mint decimals: expected 6, found ${mintInfo.decimals}`);
         }
       } catch (err) {
-        console.error('DEBUG - Mint verification failed:', err.message);
-        return 0; // Ritorna 0 se il mint non è valido
+        console.error(`DEBUG - Invalid mint address ${MINT_ADDRESS.toBase58()}:`, err.message, err.stack);
+        throw new Error(`Invalid mint address: ${err.message}`);
       }
-      const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
+
+      console.log(`DEBUG - Calculating ATA for mint: ${MINT_ADDRESS.toBase58()}, player: ${publicKey.toBase58()}`);
+      const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey, false, TOKEN_2022_PROGRAM_ID);
+      console.log(`DEBUG - ATA: ${userATA.toBase58()}`);
       try {
-        const account = await getAccount(connection, userATA);
+        const account = await getAccount(connection, userATA, TOKEN_2022_PROGRAM_ID);
+        console.log(`DEBUG - ATA exists for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
         const balanceInfo = await connection.getTokenAccountBalance(userATA);
         balance = balanceInfo.value.uiAmount || 0;
+        console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
       } catch (err) {
-        console.error(`DEBUG - Error accessing ATA for ${publicKey.toBase58()}:`, err.message);
         if (err.name === 'TokenAccountNotFoundError' || err.name === 'TokenInvalidAccountOwnerError') {
-          console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}`);
-          try {
-            const transaction = new Transaction().add(
-              createAssociatedTokenAccountInstruction(
-                wallet.publicKey,
-                userATA,
-                publicKey,
-                MINT_ADDRESS
-              )
-            );
-            const { blockhash } = await getCachedBlockhash(connection);
-            transaction.recentBlockhash = blockhash;
-            transaction.feePayer = wallet.publicKey;
-            transaction.partialSign(wallet);
-            const signature = await connection.sendRawTransaction(transaction.serialize());
-            await connection.confirmTransaction(signature, 'confirmed');
-            console.log(`DEBUG - Created ATA for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
-            balance = 0;
-          } catch (createErr) {
-            console.error('DEBUG - Failed to create ATA:', createErr.message);
-            return 0; // Ritorna 0 se la creazione dell'ATA fallisce
-          }
+          console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}, attempting to create...`);
+          const transaction = new Transaction().add(
+            createAssociatedTokenAccountInstruction(
+              wallet.publicKey,
+              userATA,
+              publicKey,
+              MINT_ADDRESS,
+              TOKEN_2022_PROGRAM_ID
+            )
+          );
+          const { blockhash } = await getCachedBlockhash(connection);
+          transaction.recentBlockhash = blockhash;
+          transaction.feePayer = wallet.publicKey;
+          transaction.partialSign(wallet);
+          const signature = await connection.sendRawTransaction(transaction.serialize());
+          await connection.confirmTransaction(signature, 'confirmed');
+          console.log(`DEBUG - Created ATA for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
+          balance = 0;
         } else {
-          console.error('DEBUG - Unexpected error fetching ATA:', err.message);
-          return 0; // Ritorna 0 per errori non previsti
+          console.error(`DEBUG - Error fetching COM balance for ${publicKey.toBase58()}:`, err.message, err.stack);
+          throw err;
         }
       }
     }
@@ -291,7 +297,7 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
     return balance;
   } catch (err) {
     console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err.message, err.stack);
-    return 0; // Ritorna 0 per qualsiasi errore
+    throw err;
   }
 }
 
@@ -308,17 +314,18 @@ async function getCachedMintInfo(connection, mintAddress) {
   }
 
   try {
-    const mintInfo = await connection.getParsedAccountInfo(mintAddress);
-    if (!mintInfo.value) {
-      throw new Error('Failed to fetch mint info');
-    }
-    const mintData = mintInfo.value.data.parsed.info;
+    const { getMint } = require('@solana/spl-token');
+    const mintInfo = await getMint(connection, mintAddress, TOKEN_2022_PROGRAM_ID);
+    const mintData = {
+      decimals: mintInfo.decimals,
+      supply: mintInfo.supply.toString(),
+    };
     await redisClient.setEx(cacheKey, 24 * 60 * 60, JSON.stringify(mintData));
     console.log('DEBUG - Fetched and cached mint info:', mintData);
     return mintData;
   } catch (err) {
     console.error('DEBUG - Error fetching mint info from Solana:', err.message);
-    throw err;
+    throw new Error('Failed to fetch mint info');
   }
 }
 
@@ -1007,9 +1014,9 @@ app.post('/distribute-winnings', async (req, res) => {
     console.log('DEBUG - Validating winner address:', winnerAddress);
     const winnerPublicKey = new PublicKey(winnerAddress);
     console.log('DEBUG - Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
     console.log('DEBUG - Getting winner ATA...');
-    const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
+    const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey, false, TOKEN_2022_PROGRAM_ID);
 
     const connection = await getConnection();
     console.log('DEBUG - Checking casino SOL balance...');
@@ -1029,7 +1036,7 @@ app.post('/distribute-winnings', async (req, res) => {
     console.log('DEBUG - Checking casino ATA...');
     let casinoAccountExists = false;
     try {
-      const casinoAccountInfo = await getAccount(connection, casinoATA);
+      const casinoAccountInfo = await getAccount(connection, casinoATA, TOKEN_2022_PROGRAM_ID);
       casinoAccountExists = true;
       console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
       if (casinoAccountInfo.isFrozen) {
@@ -1043,7 +1050,8 @@ app.post('/distribute-winnings', async (req, res) => {
           wallet.publicKey,
           casinoATA,
           wallet.publicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1071,7 +1079,7 @@ app.post('/distribute-winnings', async (req, res) => {
     console.log('DEBUG - Checking winner ATA...');
     let winnerAccountExists = false;
     try {
-      const winnerAccountInfo = await getAccount(connection, winnerATA);
+      const winnerAccountInfo = await getAccount(connection, winnerATA, TOKEN_2022_PROGRAM_ID);
       winnerAccountExists = true;
       console.log('DEBUG - Winner ATA exists:', winnerATA.toBase58());
       if (winnerAccountInfo.isFrozen) {
@@ -1085,7 +1093,8 @@ app.post('/distribute-winnings', async (req, res) => {
           wallet.publicKey,
           winnerATA,
           winnerPublicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1113,7 +1122,9 @@ app.post('/distribute-winnings', async (req, res) => {
         casinoATA,
         winnerATA,
         wallet.publicKey,
-        Math.round(amount * 1e6)
+        Math.round(amount * 1e6),
+        [],
+        TOKEN_2022_PROGRAM_ID
       )
     );
 
@@ -1155,15 +1166,15 @@ app.post('/refund', async (req, res) => {
     console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     console.log('DEBUG - Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
     console.log('DEBUG - Getting player ATA...');
-    const playerATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    const playerATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey, false, TOKEN_2022_PROGRAM_ID);
 
     const connection = await getConnection();
     console.log('DEBUG - Checking casino ATA...');
     let casinoAccountExists = false;
     try {
-      await getAccount(connection, casinoATA);
+      await getAccount(connection, casinoATA, TOKEN_2022_PROGRAM_ID);
       casinoAccountExists = true;
       console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
@@ -1173,7 +1184,8 @@ app.post('/refund', async (req, res) => {
           wallet.publicKey,
           casinoATA,
           wallet.publicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1195,7 +1207,7 @@ app.post('/refund', async (req, res) => {
     console.log('DEBUG - Checking player ATA...');
     let playerAccountExists = false;
     try {
-      await getAccount(connection, playerATA);
+      await getAccount(connection, playerATA, TOKEN_2022_PROGRAM_ID);
       playerAccountExists = true;
       console.log('DEBUG - Player ATA exists:', playerATA.toBase58());
     } catch (err) {
@@ -1205,7 +1217,8 @@ app.post('/refund', async (req, res) => {
           wallet.publicKey,
           playerATA,
           userPublicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1223,7 +1236,9 @@ app.post('/refund', async (req, res) => {
         casinoATA,
         playerATA,
         wallet.publicKey,
-        amount * 1e6
+        amount * 1e6,
+        [],
+        TOKEN_2022_PROGRAM_ID
       )
     );
 
@@ -1548,15 +1563,15 @@ app.post('/join-poker-game', async (req, res) => {
     console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     console.log('DEBUG - Getting user ATA...');
-    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey, false, TOKEN_2022_PROGRAM_ID);
     console.log('DEBUG - Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
 
     const connection = await getConnection();
     console.log('DEBUG - Checking casino ATA existence...');
     let casinoAccountExists = false;
     try {
-      await getAccount(connection, casinoATA);
+      await getAccount(connection, casinoATA, TOKEN_2022_PROGRAM_ID);
       casinoAccountExists = true;
       console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
@@ -1566,7 +1581,8 @@ app.post('/join-poker-game', async (req, res) => {
           wallet.publicKey,
           casinoATA,
           wallet.publicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1631,15 +1647,15 @@ app.post('/make-poker-move', async (req, res) => {
     console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     console.log('DEBUG - Getting user ATA...');
-    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey, false, TOKEN_2022_PROGRAM_ID);
     console.log('DEBUG - Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
 
     const connection = await getConnection();
     console.log('DEBUG - Checking casino ATA...');
     let casinoAccountExists = false;
     try {
-      await getAccount(connection, casinoATA);
+      await getAccount(connection, casinoATA, TOKEN_2022_PROGRAM_ID);
       casinoAccountExists = true;
       console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
@@ -1649,7 +1665,8 @@ app.post('/make-poker-move', async (req, res) => {
           wallet.publicKey,
           casinoATA,
           wallet.publicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1664,7 +1681,7 @@ app.post('/make-poker-move', async (req, res) => {
     console.log('DEBUG - Checking player ATA...');
     let playerAccountExists = false;
     try {
-      await getAccount(connection, userATA);
+      await getAccount(connection, userATA, TOKEN_2022_PROGRAM_ID);
       playerAccountExists = true;
       console.log('DEBUG - Player ATA exists:', userATA.toBase58());
     } catch (err) {
@@ -1674,7 +1691,8 @@ app.post('/make-poker-move', async (req, res) => {
           wallet.publicKey,
           userATA,
           userPublicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
