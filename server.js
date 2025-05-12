@@ -9,6 +9,9 @@ const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER
 const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
 const bs58 = require('bs58');
 const { client: redisClient, connectRedis } = require('./config/redis'); // Importa il modulo Redis
+const { getTransferFeeConfig } = require('@solana/spl-token');
+
+
 
 const gameStates = {}; // Memorizza lo stato dei giochi per Solana Card Duel
 
@@ -269,6 +272,11 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
           console.warn(`DEBUG - Unexpected mint decimals: expected 6, found ${mintInfo.decimals}`);
           return 0;
         }
+        // Verifica estensioni Token-2022
+        const transferFeeConfig = await getTransferFeeConfig(connection, MINT_ADDRESS);
+        if (transferFeeConfig) {
+          console.log('DEBUG - Transfer Fee:', transferFeeConfig.newerTransferFee.transferFeeBasisPoints / 100, '%');
+        }
       } catch (err) {
         console.error(`DEBUG - Failed to verify mint ${MINT_ADDRESS.toBase58()}:`, err.message, err.stack);
         return 0;
@@ -287,38 +295,29 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
         if (err.name === 'TokenAccountNotFoundError' || err.name === 'TokenInvalidAccountOwnerError') {
           console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}, creating...`);
           try {
-            // Crea una transazione per l'ATA
             const transaction = new Transaction().add(
               createAssociatedTokenAccountInstruction(
-                wallet.publicKey, // Payer (wallet del casinò)
-                userATA, // Indirizzo dell'ATA
-                publicKey, // Proprietario dell'ATA (utente)
-                MINT_ADDRESS, // Mint del token
-                TOKEN_2022_PROGRAM_ID // Programma Token
+                wallet.publicKey,
+                userATA,
+                publicKey,
+                MINT_ADDRESS,
+                TOKEN_2022_PROGRAM_ID
               )
             );
 
-            // Ottieni l'ultimo blockhash
             const { blockhash } = await getCachedBlockhash(connection);
             transaction.recentBlockhash = blockhash;
             transaction.feePayer = wallet.publicKey;
-
-            // Firma la transazione con il wallet del casinò
             transaction.partialSign(wallet);
 
-            // Invia la transazione
             const signature = await connection.sendRawTransaction(transaction.serialize());
             console.log(`DEBUG - ATA creation transaction sent: ${signature}`);
-
-            // Conferma la transazione
             await connection.confirmTransaction(signature, 'confirmed');
             console.log(`DEBUG - Successfully created ATA for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
-
-            // Imposta il saldo a 0, poiché l'ATA è appena stato creato
             balance = 0;
           } catch (createErr) {
             console.error(`DEBUG - Failed to create ATA for ${publicKey.toBase58()}:`, createErr.message, createErr.stack);
-            balance = 0; // Imposta il saldo a 0 in caso di errore
+            balance = 0;
           }
         } else {
           console.error(`DEBUG - Error fetching COM balance for ${publicKey.toBase58()}:`, err.message, err.stack);
@@ -366,6 +365,13 @@ async function getCachedMintInfo(connection, mintAddress) {
     return { decimals: 6, supply: '0' }; // Ritorna valori predefiniti in caso di errore
   }
 }
+
+
+
+
+
+
+
 
 // Funzione per rimuovere riferimenti circolari
 const removeCircularReferences = (obj, seen = new WeakSet()) => {
