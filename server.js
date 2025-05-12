@@ -2013,7 +2013,7 @@ io.on('connection', (socket) => {
 
   socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
     console.log(`Player ${playerAddress} attempting to join with bet ${betAmount} COM, socket.id: ${socket.id}`);
-
+  
     if (!playerAddress || !betAmount || isNaN(betAmount)) {
       const errorMsg = 'Invalid playerAddress or betAmount';
       console.log(`Join rejected: ${errorMsg}`);
@@ -2021,7 +2021,7 @@ io.on('connection', (socket) => {
       if (callback) callback({ success: false, error: errorMsg });
       return;
     }
-
+  
     const minBet = MIN_BET;
     if (betAmount < minBet) {
       const errorMsg = `Bet must be at least ${minBet.toFixed(2)} COM`;
@@ -2037,7 +2037,7 @@ io.on('connection', (socket) => {
       if (callback) callback({ success: false, error: errorMsg });
       return;
     }
-
+  
     const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
     if (existingPlayerIndex !== -1) {
       waitingPlayers[existingPlayerIndex].id = socket.id;
@@ -2047,21 +2047,30 @@ io.on('connection', (socket) => {
       waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
       console.log(`Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
     }
-
+  
     console.log('Current waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet, socketId: p.id })));
-
+  
+    // Invia messaggio di attesa al giocatore corrente
     socket.emit('waiting', {
       message: 'You have joined the game! Waiting for another player...',
-      players: waitingPlayers
-    });
-    io.emit('waitingPlayers', {
       players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
     });
-
+  
+    // Invia aggiornamento della lista a tutti i client
+    io.emit('waitingPlayers', {
+      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })),
+      timestamp: Date.now() // Aggiungiamo un timestamp per il debug
+    });
+  
+    console.log(`DEBUG - Emitted waitingPlayers to all clients:`, {
+      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })),
+      timestamp: Date.now()
+    });
+  
     if (callback) {
       callback({ success: true, message: 'Joined waiting list successfully' });
     }
-
+  
     if (waitingPlayers.length >= 2) {
       console.log(`Enough players (${waitingPlayers.length}), starting game...`);
       const gameId = Date.now().toString();
@@ -2086,50 +2095,54 @@ io.on('connection', (socket) => {
         bettingRoundComplete: false,
         turnTimer: null,
         timeLeft: 30,
-        actionsCompleted: 0, // Aggiunto per tracciare le azioni completate
+        actionsCompleted: 0,
       };
-
-    try {
-      console.log('DEBUG - Saving game to database:', gameId);
-      const game = new Game({
-        gameId,
-        players: players.map(p => ({
-          id: p.id,
-          address: p.address,
-          bet: p.bet,
-        })),
-        pot: players[0].bet + players[1].bet,
-        status: 'waiting',
-      });
-      await game.save();
-      console.log(`DEBUG - Saved game ${gameId} to database`);
-    } catch (err) {
-      console.error(`DEBUG - Error saving game ${gameId}:`, err.message, err.stack);
-      socket.emit('error', { message: 'Error starting game' });
-      await refundBetsForGame(gameId);
-      if (callback) callback({ success: false, error: 'Error starting game' });
-      return;
-    }
-
-    players.forEach(player => {
-      const playerSocket = io.sockets.sockets.get(player.id);
-      if (playerSocket) {
-        playerSocket.join(gameId);
-        console.log(`DEBUG - Player ${player.address} joined room ${gameId}`);
-      } else {
-        console.error(`DEBUG - Socket for player ${player.address} not found`);
+  
+      try {
+        console.log('DEBUG - Saving game to database:', gameId);
+        const game = new Game({
+          gameId,
+          players: players.map(p => ({
+            id: p.id,
+            address: p.address,
+            bet: p.bet,
+          })),
+          pot: players[0].bet + players[1].bet,
+          status: 'waiting',
+        });
+        await game.save();
+        console.log(`DEBUG - Saved game ${gameId} to database`);
+      } catch (err) {
+        console.error(`DEBUG - Error saving game ${gameId}:`, err.message, err.stack);
+        socket.emit('error', { message: 'Error starting game' });
+        await refundBetsForGame(gameId);
+        if (callback) callback({ success: false, error: 'Error starting game' });
+        return;
       }
-    });
-
-    console.log('DEBUG - Emitting updated waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet })));
-    io.emit('waitingPlayers', {
-      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet }))
-    });
-    console.log(`DEBUG - Game ${gameId} started with players:`, players.map(p => p.address));
-
-    startGame(gameId);
-  }
-});
+  
+      players.forEach(player => {
+        const playerSocket = io.sockets.sockets.get(player.id);
+        if (playerSocket) {
+          playerSocket.join(gameId);
+          console.log(`DEBUG - Player ${player.address} joined room ${gameId}`);
+        } else {
+          console.error(`DEBUG - Socket for player ${player.address} not found`);
+        }
+      });
+  
+      // Invia aggiornamento della lista dei giocatori in attesa dopo l'inizio del gioco
+      io.emit('waitingPlayers', {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })),
+        timestamp: Date.now()
+      });
+      console.log(`DEBUG - Emitted updated waitingPlayers after game start:`, {
+        players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })),
+        timestamp: Date.now()
+      });
+  
+      startGame(gameId);
+    }
+  });
 
 socket.on('leaveWaitingList', ({ playerAddress }) => {
   console.log('DEBUG - leaveWaitingList called for:', playerAddress);
