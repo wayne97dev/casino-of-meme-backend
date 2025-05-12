@@ -267,11 +267,11 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
         console.log(`DEBUG - Mint verified: decimals=${mintInfo.decimals}, supply=${mintInfo.supply}`);
         if (mintInfo.decimals !== 6) {
           console.warn(`DEBUG - Unexpected mint decimals: expected 6, found ${mintInfo.decimals}`);
-          return 0; // Ritorna 0 se i decimali non corrispondono
+          return 0;
         }
       } catch (err) {
         console.error(`DEBUG - Failed to verify mint ${MINT_ADDRESS.toBase58()}:`, err.message, err.stack);
-        return 0; // Ritorna 0 se il mint non è valido
+        return 0;
       }
 
       console.log(`DEBUG - Calculating ATA for mint: ${MINT_ADDRESS.toBase58()}, player: ${publicKey.toBase58()}`);
@@ -284,34 +284,12 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
         balance = balanceInfo.value.uiAmount || 0;
         console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
       } catch (err) {
+        console.error(`DEBUG - Error fetching ATA for ${publicKey.toBase58()}:`, err.message, err.stack);
         if (err.name === 'TokenAccountNotFoundError' || err.name === 'TokenInvalidAccountOwnerError') {
           console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}`);
-          try {
-            console.log('DEBUG - Attempting to create ATA...');
-            const transaction = new Transaction().add(
-              createAssociatedTokenAccountInstruction(
-                wallet.publicKey,
-                userATA,
-                publicKey,
-                MINT_ADDRESS,
-                TOKEN_2022_PROGRAM_ID
-              )
-            );
-            const { blockhash } = await getCachedBlockhash(connection);
-            transaction.recentBlockhash = blockhash;
-            transaction.feePayer = wallet.publicKey;
-            transaction.partialSign(wallet);
-            const signature = await connection.sendRawTransaction(transaction.serialize());
-            await connection.confirmTransaction(signature, 'confirmed');
-            console.log(`DEBUG - Created ATA for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
-            balance = 0;
-          } catch (createErr) {
-            console.error('DEBUG - Failed to create ATA:', createErr.message, createErr.stack);
-            return 0; // Ritorna 0 se la creazione dell'ATA fallisce
-          }
+          balance = 0;
         } else {
-          console.error(`DEBUG - Error fetching COM balance for ${publicKey.toBase58()}:`, err.message, err.stack);
-          return 0; // Ritorna 0 per errori non previsti
+          throw err;
         }
       }
     }
@@ -324,7 +302,7 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
     return balance;
   } catch (err) {
     console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err.message, err.stack);
-    return 0; // Ritorna 0 per qualsiasi errore
+    return 0;
   }
 }
 
