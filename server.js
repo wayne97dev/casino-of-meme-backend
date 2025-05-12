@@ -1001,20 +1001,6 @@ app.post('/distribute-winnings', async (req, res) => {
     return res.status(500).json({ success: false, error: 'Failed to connect to Solana RPC: ' + err.message });
   }
 
-  let casinoATA, winnerATA;
-  try {
-    console.log('DEBUG - Getting casino ATA...');
-    casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
-    console.log('DEBUG - Casino ATA:', casinoATA.toBase58());
-
-    console.log('DEBUG - Getting winner ATA...');
-    winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey, false, TOKEN_2022_PROGRAM_ID);
-    console.log('DEBUG - Winner ATA:', winnerATA.toBase58());
-  } catch (err) {
-    console.error('DEBUG - Error getting ATAs:', err.message, err.stack);
-    return res.status(500).json({ success: false, error: 'Failed to get token accounts: ' + err.message });
-  }
-
   try {
     console.log('DEBUG - Checking casino SOL balance...');
     const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol');
@@ -1034,9 +1020,23 @@ app.post('/distribute-winnings', async (req, res) => {
     return res.status(500).json({ success: false, error: 'Failed to check casino SOL balance: ' + err.message });
   }
 
+  let casinoATA, winnerATA;
+  try {
+    console.log('DEBUG - Getting casino ATA...');
+    casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Casino ATA:', casinoATA.toBase58());
+
+    console.log('DEBUG - Getting winner ATA...');
+    winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Winner ATA:', winnerATA.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Error getting ATAs:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to get token accounts: ' + err.message });
+  }
+
   try {
     console.log('DEBUG - Checking casino COM balance...');
-    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com', true); // Forza refresh
+    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com', true);
     if (casinoBalance < amount) {
       console.log('DEBUG - Insufficient COM balance:', {
         balance: casinoBalance,
@@ -1084,24 +1084,59 @@ app.post('/distribute-winnings', async (req, res) => {
   }
 
   try {
-    // Recupera i decimali del mint
     const mintInfo = await getMint(connection, MINT_ADDRESS, 'confirmed', TOKEN_2022_PROGRAM_ID);
-    const decimals = mintInfo.decimals; // Dovrebbe essere 6
+    const decimals = mintInfo.decimals;
     console.log('DEBUG - Mint decimals:', decimals);
 
+    const accountInfo = await connection.getParsedAccountInfo(MINT_ADDRESS);
+    if (!accountInfo.value) {
+      throw new Error('Failed to fetch mint account info');
+    }
+    const extensions = accountInfo.value.data.parsed.info.extensions;
+    const transferFeeConfig = extensions?.find(ext => ext.extension === 'transferFeeConfig');
+
+    let feeAmount = BigInt(0);
+    if (transferFeeConfig) {
+      const feeBasisPoints = BigInt(transferFeeConfig.state.transferFeeBasisPoints);
+      const maxFee = BigInt(transferFeeConfig.state.maximumFee);
+      const amountInBaseUnits = BigInt(Math.round(amount * Math.pow(10, decimals)));
+      const calculatedFee = (amountInBaseUnits * feeBasisPoints) / BigInt(10000);
+      feeAmount = calculatedFee < maxFee ? calculatedFee : maxFee;
+      console.log('DEBUG - Transfer fee calculated:', { feeBasisPoints: feeBasisPoints.toString(), maxFee: maxFee.toString(), feeAmount: feeAmount.toString() });
+    } else {
+      console.log('DEBUG - No TransferFee extension found, proceeding without fee');
+    }
+
     console.log('DEBUG - Creating transfer transaction...');
-    const transaction = new Transaction().add(
-      createTransferCheckedInstruction(
-        casinoATA, // Source ATA
-        MINT_ADDRESS, // Mint
-        winnerATA, // Destination ATA
-        wallet.publicKey, // Owner
-        Math.round(amount * Math.pow(10, decimals)), // Importo in unità base (con decimali)
-        decimals, // Decimali del token
-        [], // Memo (opzionale)
-        TOKEN_2022_PROGRAM_ID // Programma
-      )
-    );
+    const transaction = new Transaction();
+    if (transferFeeConfig) {
+      transaction.add(
+        createTransferCheckedWithFeeInstruction(
+          casinoATA,
+          MINT_ADDRESS,
+          winnerATA,
+          wallet.publicKey,
+          BigInt(Math.round(amount * Math.pow(10, decimals))),
+          decimals,
+          feeAmount,
+          [],
+          TOKEN_2022_PROGRAM_ID
+        )
+      );
+    } else {
+      transaction.add(
+        createTransferCheckedInstruction(
+          casinoATA,
+          MINT_ADDRESS,
+          winnerATA,
+          wallet.publicKey,
+          BigInt(Math.round(amount * Math.pow(10, decimals))),
+          decimals,
+          [],
+          TOKEN_2022_PROGRAM_ID
+        )
+      );
+    }
 
     console.log('DEBUG - Getting latest blockhash...');
     const { blockhash } = await getCachedBlockhash(connection);
@@ -1283,13 +1318,14 @@ app.post('/refund', async (req, res) => {
     const extensions = accountInfo.value.data.parsed.info.extensions;
     const transferFeeConfig = extensions?.find(ext => ext.extension === 'transferFeeConfig');
 
-    let feeAmount = 0;
+    let feeAmount = BigInt(0);
     if (transferFeeConfig) {
-      const feeBasisPoints = transferFeeConfig.state.transferFeeBasisPoints;
-      const maxFee = Number(transferFeeConfig.state.maximumFee);
-      const amountInBaseUnits = Math.round(amount * Math.pow(10, decimals));
-      feeAmount = Math.min((amountInBaseUnits * feeBasisPoints) / 10000, maxFee);
-      console.log('DEBUG - Transfer fee calculated:', { feeBasisPoints, maxFee, feeAmount });
+      const feeBasisPoints = BigInt(transferFeeConfig.state.transferFeeBasisPoints);
+      const maxFee = BigInt(transferFeeConfig.state.maximumFee);
+      const amountInBaseUnits = BigInt(Math.round(amount * Math.pow(10, decimals)));
+      const calculatedFee = (amountInBaseUnits * feeBasisPoints) / BigInt(10000);
+      feeAmount = calculatedFee < maxFee ? calculatedFee : maxFee;
+      console.log('DEBUG - Transfer fee calculated:', { feeBasisPoints: feeBasisPoints.toString(), maxFee: maxFee.toString(), feeAmount: feeAmount.toString() });
     } else {
       console.log('DEBUG - No TransferFee extension found, proceeding without fee');
     }
@@ -1303,9 +1339,9 @@ app.post('/refund', async (req, res) => {
           MINT_ADDRESS,
           playerATA,
           wallet.publicKey,
-          Math.round(amount * Math.pow(10, decimals)),
+          BigInt(Math.round(amount * Math.pow(10, decimals))),
           decimals,
-          feeAmount,
+          feeAmount, // Passiamo feeAmount come BigInt
           [],
           TOKEN_2022_PROGRAM_ID
         )
@@ -1317,7 +1353,7 @@ app.post('/refund', async (req, res) => {
           MINT_ADDRESS,
           playerATA,
           wallet.publicKey,
-          Math.round(amount * Math.pow(10, decimals)),
+          BigInt(Math.round(amount * Math.pow(10, decimals))),
           decimals,
           [],
           TOKEN_2022_PROGRAM_ID
