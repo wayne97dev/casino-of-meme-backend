@@ -933,7 +933,6 @@ app.get('/com-balance/:address', async (req, res) => {
 
   const { address } = req.params;
 
-  // Validazione dell'indirizzo
   if (!address) {
     console.error('DEBUG - Missing address parameter');
     return res.status(400).json({ success: false, error: 'Missing address parameter' });
@@ -957,7 +956,7 @@ app.get('/com-balance/:address', async (req, res) => {
     console.log('DEBUG - Connection established successfully');
 
     console.log('DEBUG - Fetching COM balance for:', publicKey.toBase58());
-    const balance = await getCachedBalance(connection, publicKey, 'com', true); // Forza refresh per evitare problemi con Redis
+    const balance = await getCachedBalance(connection, publicKey, 'com', true); // Forza refresh
     console.log(`DEBUG - Fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
 
     res.json({ success: true, balance });
