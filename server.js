@@ -8,7 +8,7 @@ const cors = require('cors');
 const Player = require('./models/Player');
 const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance, TOKEN_2022_PROGRAM_ID,  createTransferCheckedWithFeeInstruction, } = require('@solana/spl-token');
+const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance, TOKEN_2022_PROGRAM_ID,  createTransferCheckedWithFeeInstruction, getMint } = require('@solana/spl-token');
 const bs58 = require('bs58');
 const { client: redisClient, connectRedis } = require('./config/redis'); // Importa il modulo Redis
 
@@ -1270,10 +1270,12 @@ app.post('/refund', async (req, res) => {
   }
 
   try {
+    console.log('DEBUG - Fetching mint info...');
     const mintInfo = await getMint(connection, MINT_ADDRESS, 'confirmed', TOKEN_2022_PROGRAM_ID);
     const decimals = mintInfo.decimals;
     console.log('DEBUG - Mint decimals:', decimals);
 
+    console.log('DEBUG - Fetching transfer fee config...');
     const accountInfo = await connection.getParsedAccountInfo(MINT_ADDRESS);
     if (!accountInfo.value) {
       throw new Error('Failed to fetch mint account info');
