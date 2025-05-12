@@ -243,7 +243,7 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
         }
       } catch (err) {
         console.error('DEBUG - Mint verification failed:', err.message);
-        throw new Error(`Invalid mint address: ${err.message}`);
+        return 0; // Ritorna 0 se il mint non è valido
       }
       const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
       try {
@@ -251,19 +251,46 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
         const balanceInfo = await connection.getTokenAccountBalance(userATA);
         balance = balanceInfo.value.uiAmount || 0;
       } catch (err) {
+        console.error(`DEBUG - Error accessing ATA for ${publicKey.toBase58()}:`, err.message);
         if (err.name === 'TokenAccountNotFoundError' || err.name === 'TokenInvalidAccountOwnerError') {
           console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}`);
-          return 0; // Ritorna 0 se l'ATA non esiste
+          try {
+            const transaction = new Transaction().add(
+              createAssociatedTokenAccountInstruction(
+                wallet.publicKey,
+                userATA,
+                publicKey,
+                MINT_ADDRESS
+              )
+            );
+            const { blockhash } = await getCachedBlockhash(connection);
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = wallet.publicKey;
+            transaction.partialSign(wallet);
+            const signature = await connection.sendRawTransaction(transaction.serialize());
+            await connection.confirmTransaction(signature, 'confirmed');
+            console.log(`DEBUG - Created ATA for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
+            balance = 0;
+          } catch (createErr) {
+            console.error('DEBUG - Failed to create ATA:', createErr.message);
+            return 0; // Ritorna 0 se la creazione dell'ATA fallisce
+          }
+        } else {
+          console.error('DEBUG - Unexpected error fetching ATA:', err.message);
+          return 0; // Ritorna 0 per errori non previsti
         }
-        throw err;
       }
     }
-    await redisClient.setEx(cacheKey, 30, balance.toString());
-    console.log(`DEBUG - Cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
+    try {
+      await redisClient.setEx(cacheKey, 30, balance.toString());
+      console.log(`DEBUG - Cached ${type} balance for ${publicKey.toBase58()}: ${balance}`);
+    } catch (err) {
+      console.warn('DEBUG - Failed to cache balance:', err.message);
+    }
     return balance;
   } catch (err) {
-    console.error(`DEBUG - Error fetching ${type} balance:`, err.message, err.stack);
-    throw err;
+    console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err.message, err.stack);
+    return 0; // Ritorna 0 per qualsiasi errore
   }
 }
 
