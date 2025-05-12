@@ -1325,9 +1325,13 @@ app.post('/refund', async (req, res) => {
       const amountInBaseUnits = BigInt(Math.round(amount * Math.pow(10, decimals)));
       const calculatedFee = (amountInBaseUnits * feeBasisPoints) / BigInt(10000);
       feeAmount = calculatedFee < maxFee ? calculatedFee : maxFee;
-      console.log('DEBUG - Transfer fee calculated:', { feeBasisPoints: feeBasisPoints.toString(), maxFee: maxFee.toString(), feeAmount: feeAmount.toString() });
+      console.log('DEBUG - Transfer fee calculated:', {
+        feeBasisPoints: feeBasisPoints.toString(),
+        maxFee: maxFee.toString(),
+        feeAmount: feeAmount.toString(),
+      });
     } else {
-      console.log('DEBUG - No valid TransferFee extension found, proceeding without fee');
+      console.log('DEBUG - No valid TransferFee extension found or incomplete, proceeding without fee');
     }
 
     console.log('DEBUG - Creating refund transaction...');
