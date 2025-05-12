@@ -8,7 +8,7 @@ const cors = require('cors');
 const Player = require('./models/Player');
 const Game = require('./models/Game');
 const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance } = require('@solana/spl-token');
+const { createTransferInstruction, getAssociatedTokenAddress, getAccount, createAssociatedTokenAccountInstruction, getTokenAccountBalance, TOKEN_2022_PROGRAM_ID } = require('@solana/spl-token');
 const bs58 = require('bs58');
 const { client: redisClient, connectRedis } = require('./config/redis'); // Importa il modulo Redis
 
