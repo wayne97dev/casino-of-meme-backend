@@ -1683,6 +1683,11 @@ app.post('/join-poker-game', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
   }
 
+  if (betAmount < MIN_BET) {
+    console.log(`DEBUG - Bet ${betAmount} COM is below minimum ${MIN_BET} COM`);
+    return res.status(400).json({ success: false, error: `Bet must be at least ${MIN_BET} COM` });
+  }
+
   let userPublicKey;
   try {
     console.log('DEBUG - Validating player address:', playerAddress);
@@ -1691,13 +1696,6 @@ app.post('/join-poker-game', async (req, res) => {
   } catch (err) {
     console.error('DEBUG - Invalid player address:', err.message);
     return res.status(400).json({ success: false, error: 'Invalid player address: ' + err.message });
-  }
-
-  const minBet = MIN_BET;
-  if (betAmount < minBet) {
-    const errorMsg = `Bet must be at least ${minBet.toFixed(2)} COM`;
-    console.log(`DEBUG - Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
-    return res.status(400).json({ success: false, error: errorMsg });
   }
 
   let connection;
@@ -1728,7 +1726,7 @@ app.post('/join-poker-game', async (req, res) => {
   }
 
   try {
-    console.log('DEBUG - Checking casino ATA...');
+    console.log('DEBUG - Checking casino ATA existence...');
     let casinoAccountExists = false;
     try {
       await getAccount(connection, casinoATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
@@ -1758,11 +1756,13 @@ app.post('/join-poker-game', async (req, res) => {
     return res.status(500).json({ success: false, error: 'Failed to check/create casino ATA: ' + err.message });
   }
 
+  let userBalance;
   try {
     console.log('DEBUG - Checking user COM balance...');
-    const userBalance = await getCachedBalance(connection, userPublicKey, 'com', true);
+    userBalance = await getCachedBalance(connection, userPublicKey, 'com', true); // Forza refresh
+    console.log('DEBUG - User balance:', userBalance, 'Required:', betAmount);
     if (userBalance < betAmount) {
-      console.log('DEBUG - Insufficient COM balance:', { balance: userBalance, required: betAmount });
+      console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${betAmount}`);
       return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
     }
   } catch (err) {
@@ -1783,7 +1783,7 @@ app.post('/join-poker-game', async (req, res) => {
 
   try {
     if (!transaction.verifySignatures()) {
-      console.log('DEBUG - Invalid transaction signatures');
+      console.log('DEBUG - Invalid transaction signatures for:', playerAddress);
       return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
     }
     console.log('DEBUG - Transaction signatures verified');
@@ -1807,7 +1807,7 @@ app.post('/join-poker-game', async (req, res) => {
     const confirmation = await connection.confirmTransaction(signature, 'confirmed');
     if (confirmation.value.err) {
       console.log('DEBUG - Transaction failed:', confirmation.value.err);
-      return res.status(500).json({ success: false, error: 'Transaction failed: ' + JSON.stringify(confirmation.value.err) });
+      return res.status(500).json({ success: false, error: 'Transaction failed: ' + confirmation.value.err });
     }
     console.log(`DEBUG - Transferred ${betAmount} COM from ${playerAddress} to casino`);
   } catch (err) {
@@ -1815,103 +1815,8 @@ app.post('/join-poker-game', async (req, res) => {
     return res.status(500).json({ success: false, error: 'Failed to confirm transaction: ' + err.message });
   }
 
-  // Aggiungi il giocatore alla lista d'attesa
-  const socketId = [...io.sockets.sockets.entries()].find(([_, s]) => s.handshake.auth.playerAddress === playerAddress)?.[0];
-  if (!socketId) {
-    console.error(`DEBUG - No socket found for player ${playerAddress}`);
-    return res.status(400).json({ success: false, error: 'No active WebSocket connection found' });
-  }
-
-  const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
-  if (existingPlayerIndex !== -1) {
-    waitingPlayers[existingPlayerIndex].id = socketId;
-    waitingPlayers[existingPlayerIndex].bet = betAmount;
-    console.log(`DEBUG - Updated player ${playerAddress} in waiting list: socket.id=${socketId}, bet=${betAmount}`);
-  } else {
-    waitingPlayers.push({ id: socketId, address: playerAddress, bet: betAmount });
-    console.log(`DEBUG - Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
-  }
-
-  console.log('DEBUG - Current waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet, socketId: p.id })));
-
-  io.to(socketId).emit('waiting', {
-    message: 'You have joined the game! Waiting for another player...',
-    players: waitingPlayers,
-  });
-  io.emit('waitingPlayers', {
-    players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })),
-  });
-
-  if (waitingPlayers.length >= 2) {
-    console.log(`DEBUG - Enough players (${waitingPlayers.length}), starting game...`);
-    const gameId = Date.now().toString();
-    const players = waitingPlayers.splice(0, 2);
-    games[gameId] = {
-      players,
-      tableCards: [],
-      playerCards: {},
-      currentTurn: null,
-      pot: players[0].bet + players[1].bet,
-      currentBet: 0,
-      playerBets: {
-        [players[0].address]: players[0].bet,
-        [players[1].address]: players[1].bet,
-      },
-      gamePhase: 'pre-flop',
-      status: 'waiting',
-      message: 'The dealer is preparing the game...',
-      opponentCardsVisible: false,
-      gameId,
-      dealerMessage: '',
-      bettingRoundComplete: false,
-      turnTimer: null,
-      timeLeft: 30,
-      actionsCompleted: 0,
-    };
-
-    try {
-      console.log('DEBUG - Saving game to database:', gameId);
-      const game = new Game({
-        gameId,
-        players: players.map(p => ({
-          id: p.id,
-          address: p.address,
-          bet: p.bet,
-        })),
-        pot: players[0].bet + players[1].bet,
-        status: 'waiting',
-      });
-      await game.save();
-      console.log(`DEBUG - Saved game ${gameId} to database`);
-    } catch (err) {
-      console.error(`DEBUG - Error saving game ${gameId}:`, err.message, err.stack);
-      io.to(socketId).emit('error', { message: 'Error starting game' });
-      await refundBetsForGame(gameId);
-      return res.status(500).json({ success: false, error: 'Error starting game' });
-    }
-
-    players.forEach(player => {
-      const playerSocket = io.sockets.sockets.get(player.id);
-      if (playerSocket) {
-        playerSocket.join(gameId);
-        console.log(`DEBUG - Player ${player.address} joined room ${gameId}`);
-      } else {
-        console.error(`DEBUG - Socket for player ${player.address} not found`);
-      }
-    });
-
-    console.log('DEBUG - Emitting updated waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet })));
-    io.emit('waitingPlayers', {
-      players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })),
-    });
-    console.log(`DEBUG - Game ${gameId} started with players:`, players.map(p => p.address));
-
-    startGame(gameId);
-  }
-
-  res.json({ success: true, message: 'Joined waiting list successfully' });
+  res.json({ success: true });
 });
-
 
 // Endpoint per gestire le mosse in Poker PvP
 app.post('/make-poker-move', async (req, res) => {
@@ -1988,7 +1893,7 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature, 'confirmed');
+      await connection.confirmTransaction(signature);
       console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
   } catch (err) {
@@ -2019,7 +1924,7 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature, 'confirmed');
+      await connection.confirmTransaction(signature);
       console.log('DEBUG - Created player ATA:', userATA.toBase58());
     }
   } catch (err) {
@@ -2031,7 +1936,7 @@ app.post('/make-poker-move', async (req, res) => {
     let userBalance;
     try {
       console.log('DEBUG - Checking user COM balance for move:', move);
-      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true);
+      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true); // Forza refresh
       console.log('DEBUG - User balance:', userBalance, 'Required:', amount);
       if (userBalance < amount) {
         console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
@@ -2090,9 +1995,6 @@ app.post('/make-poker-move', async (req, res) => {
 
   res.json({ success: true });
 });
-
-
-
 
 // Endpoint per la leaderboard
 app.get('/leaderboard', async (req, res) => {
@@ -3097,3 +2999,8 @@ console.log(`DEBUG - PORT environment variable: ${process.env.PORT}`);
 server.listen(PORT, () => {
 console.log(`DEBUG - Server running on port ${PORT}`);
 });
+
+
+
+
+
