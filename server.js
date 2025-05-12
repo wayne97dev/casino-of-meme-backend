@@ -21,6 +21,7 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
   'https://testdashb.vercel.app',
+  'https://casino-of-meme-1tqvl2m34-santes-projects-c6c8cd0c.vercel.app', // Aggiungi questa riga
 ];
 
 // Inizializzazione di socket.io
@@ -46,27 +47,46 @@ app.use((req, res, next) => {
 // Middleware CORS ottimizzato
 app.use((req, res, next) => {
   console.log('DEBUG - Setting CORS headers for:', req.url, 'Origin:', req.headers.origin);
-  res.header('Access-Control-Allow-Origin', req.headers.origin || 'https://casino-of-meme.com');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') {
-    console.log(`DEBUG - Handling OPTIONS request for ${req.url}`);
-    return res.sendStatus(204);
+  const origin = req.headers.origin;
+  if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    if (req.method === 'OPTIONS') {
+      console.log(`DEBUG - Handling OPTIONS request for ${req.url}`);
+      return res.sendStatus(204);
+    }
+    next();
+  } else {
+    console.log(`DEBUG - CORS blocked - Origin: ${origin} not in allowedOrigins: ${allowedOrigins}`);
+    res.status(403).send('Origin not allowed by CORS');
   }
-  next();
 });
+
+
 
 app.use(cors({
   origin: (origin, callback) => {
     console.log(`DEBUG - CORS check - Origin received: ${origin}`);
-    if (!origin || allowedOrigins.includes(origin)) {
-      console.log(`DEBUG - CORS allowed - Origin: ${origin}`);
-      callback(null, true);
-    } else {
-      console.log(`DEBUG - CORS blocked - Origin: ${origin} not in allowedOrigins: ${allowedOrigins}`);
-      callback(new Error(`Origin ${origin} not allowed by CORS`));
+    // Consenti richieste senza origine (es. richieste locali o non browser)
+    if (!origin) {
+      console.log(`DEBUG - CORS allowed - No origin (local request)`);
+      return callback(null, true);
     }
+    // Consenti origini nella lista allowedOrigins
+    if (allowedOrigins.includes(origin)) {
+      console.log(`DEBUG - CORS allowed - Origin: ${origin} in allowedOrigins`);
+      return callback(null, true);
+    }
+    // Consenti dinamicamente tutti i domini Vercel
+    if (origin.endsWith('.vercel.app')) {
+      console.log(`DEBUG - CORS allowed - Vercel domain: ${origin}`);
+      return callback(null, true);
+    }
+    // Blocca origini non consentite
+    console.log(`DEBUG - CORS blocked - Origin: ${origin} not allowed`);
+    callback(new Error(`Origin ${origin} not allowed by CORS`));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
