@@ -1893,7 +1893,7 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
+      await connection.confirmTransaction(signature, 'confirmed');
       console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
   } catch (err) {
@@ -1924,7 +1924,7 @@ app.post('/make-poker-move', async (req, res) => {
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
+      await connection.confirmTransaction(signature, 'confirmed');
       console.log('DEBUG - Created player ATA:', userATA.toBase58());
     }
   } catch (err) {
@@ -1936,7 +1936,7 @@ app.post('/make-poker-move', async (req, res) => {
     let userBalance;
     try {
       console.log('DEBUG - Checking user COM balance for move:', move);
-      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true); // Forza refresh
+      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true);
       console.log('DEBUG - User balance:', userBalance, 'Required:', amount);
       if (userBalance < amount) {
         console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
