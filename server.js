@@ -145,7 +145,7 @@ connectRedis().catch(err => {
 });
 
 
-const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 
 // Connessione a Solana
 const primaryConnection = new Connection('https://mainnet.helius-rpc.com/?api-key=40b694c8-8e12-455f-8df5-38661891b200', 'confirmed');
