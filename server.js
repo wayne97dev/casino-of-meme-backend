@@ -185,7 +185,7 @@ const waitingPlayers = [];
 let visitorCount = 0;
 
 // Indirizzo del mint COM
-const COM_MINT_ADDRESS = '8BtoThi2ZoXnF7QQK1Wjmh2JuBw9FjVvhnGMVZ2vpump';
+const COM_MINT_ADDRESS = 'H3m8rUk46TCTFd6nbieKLPDM3MqEoP7Uz8nheHduLjcY';
 console.log('DEBUG - COM_MINT_ADDRESS:', COM_MINT_ADDRESS);
 const MINT_ADDRESS = new PublicKey(COM_MINT_ADDRESS);
 
