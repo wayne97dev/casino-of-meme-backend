@@ -928,22 +928,46 @@ app.get('/rewards', async (req, res) => {
 });
 
 
-
-
 app.get('/com-balance/:address', async (req, res) => {
+  console.log('DEBUG - Received request for /com-balance/:address:', req.params);
+
   const { address } = req.params;
 
+  // Validazione dell'indirizzo
+  if (!address) {
+    console.error('DEBUG - Missing address parameter');
+    return res.status(400).json({ success: false, error: 'Missing address parameter' });
+  }
+
+  let publicKey;
   try {
-    const publicKey = new PublicKey(address);
+    publicKey = new PublicKey(address);
+    console.log('DEBUG - Valid public key:', publicKey.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Invalid public key:', err.message);
+    return res.status(400).json({ success: false, error: 'Invalid public key: ' + err.message });
+  }
+
+  try {
+    console.log('DEBUG - Establishing connection to Solana RPC...');
     const connection = await getConnection();
-    const balance = await getCachedBalance(connection, publicKey, 'com');
-    console.log(`DEBUG - Fetched COM balance for ${address}: ${balance}`);
+    if (!connection) {
+      throw new Error('Failed to establish connection to Solana RPC');
+    }
+    console.log('DEBUG - Connection established successfully');
+
+    console.log('DEBUG - Fetching COM balance for:', publicKey.toBase58());
+    const balance = await getCachedBalance(connection, publicKey, 'com', true); // Forza refresh per evitare problemi con Redis
+    console.log(`DEBUG - Fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
+
     res.json({ success: true, balance });
   } catch (err) {
-    console.error(`DEBUG - Error fetching COM balance for ${address}:`, err.message);
+    console.error(`DEBUG - Error fetching COM balance for ${publicKey.toBase58()}:`, err.message, err.stack);
     res.status(500).json({ success: false, error: 'Failed to fetch COM balance: ' + err.message });
   }
 });
+
+
 
 // Endpoint per distribuire vincite in COM (usato per Poker PvP)
 app.post('/distribute-winnings', async (req, res) => {
