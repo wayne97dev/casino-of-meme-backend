@@ -1209,7 +1209,6 @@ app.post('/refund', async (req, res) => {
         error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
       });
     }
-    console.log('DEBUG - Casino SOL balance sufficient:', casinoSolBalance);
   } catch (err) {
     console.error('DEBUG - Error checking casino SOL balance:', err.message, err.stack);
     return res.status(500).json({ success: false, error: 'Failed to check casino SOL balance: ' + err.message });
@@ -1267,7 +1266,6 @@ app.post('/refund', async (req, res) => {
       console.log('DEBUG - Insufficient COM balance in casino ATA:', { balance: casinoBalance, required: amount });
       return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
     }
-    console.log('DEBUG - Casino COM balance sufficient:', casinoBalance);
   } catch (err) {
     console.error('DEBUG - Error checking casino COM balance:', err.message, err.stack);
     return res.status(500).json({ success: false, error: 'Failed to check casino balance: ' + err.message });
@@ -1319,7 +1317,9 @@ app.post('/refund', async (req, res) => {
     const transferFeeConfig = extensions?.find(ext => ext.extension === 'transferFeeConfig');
 
     let feeAmount = BigInt(0);
-    if (transferFeeConfig) {
+    if (transferFeeConfig && transferFeeConfig.state &&
+        typeof transferFeeConfig.state.transferFeeBasisPoints === 'number' &&
+        typeof transferFeeConfig.state.maximumFee === 'string') {
       const feeBasisPoints = BigInt(transferFeeConfig.state.transferFeeBasisPoints);
       const maxFee = BigInt(transferFeeConfig.state.maximumFee);
       const amountInBaseUnits = BigInt(Math.round(amount * Math.pow(10, decimals)));
@@ -1327,12 +1327,12 @@ app.post('/refund', async (req, res) => {
       feeAmount = calculatedFee < maxFee ? calculatedFee : maxFee;
       console.log('DEBUG - Transfer fee calculated:', { feeBasisPoints: feeBasisPoints.toString(), maxFee: maxFee.toString(), feeAmount: feeAmount.toString() });
     } else {
-      console.log('DEBUG - No TransferFee extension found, proceeding without fee');
+      console.log('DEBUG - No valid TransferFee extension found, proceeding without fee');
     }
 
     console.log('DEBUG - Creating refund transaction...');
     const transaction = new Transaction();
-    if (transferFeeConfig) {
+    if (transferFeeConfig && feeAmount > 0) {
       transaction.add(
         createTransferCheckedWithFeeInstruction(
           casinoATA,
@@ -1341,7 +1341,7 @@ app.post('/refund', async (req, res) => {
           wallet.publicKey,
           BigInt(Math.round(amount * Math.pow(10, decimals))),
           decimals,
-          feeAmount, // Passiamo feeAmount come BigInt
+          feeAmount,
           [],
           TOKEN_2022_PROGRAM_ID
         )
