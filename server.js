@@ -2844,92 +2844,101 @@ return { rank: bestRank, description: bestDescription, highCards: bestHighCards 
 };
 
 const endGame = async (gameId) => {
-const game = games[gameId];
-if (!game) {
-  console.error(`DEBUG - Game ${gameId} not found in endGame`);
-  await refundBetsForGame(gameId);
-  return;
-}
+  const game = games[gameId];
+  if (!game) {
+    console.error(`DEBUG - Game ${gameId} not found in endGame`);
+    await refundBetsForGame(gameId);
+    return;
+  }
 
-if (game.turnTimer) {
-  clearInterval(game.turnTimer);
-  console.log('DEBUG - Cleared turn timer for game:', gameId);
-}
+  if (game.turnTimer) {
+    clearInterval(game.turnTimer);
+    console.log('DEBUG - Cleared turn timer for game:', gameId);
+  }
 
-const player1 = game.players[0];
-const player2 = game.players[1];
-const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
-const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
-const player1Evaluation = evaluatePokerHand(player1Hand);
-const player2Evaluation = evaluatePokerHand(player2Hand);
+  const player1 = game.players[0];
+  const player2 = game.players[1];
+  const player1Hand = [...game.playerCards[player1.address], ...game.tableCards];
+  const player2Hand = [...game.playerCards[player2.address], ...game.tableCards];
+  const player1Evaluation = evaluatePokerHand(player1Hand);
+  const player2Evaluation = evaluatePokerHand(player2Hand);
 
-console.log(`DEBUG - Player 1 (${player1.address}) hand:`, player1Hand);
-console.log(`DEBUG - Player 1 evaluation:`, player1Evaluation);
-console.log(`DEBUG - Player 2 (${player2.address}) hand:`, player2Hand);
-console.log(`DEBUG - Player 2 evaluation:`, player2Evaluation);
+  console.log(`DEBUG - Player 1 (${player1.address}) hand:`, player1Hand);
+  console.log(`DEBUG - Player 1 evaluation:`, player1Evaluation);
+  console.log(`DEBUG - Player 2 (${player2.address}) hand:`, player2Hand);
+  console.log(`DEBUG - Player 2 evaluation:`, player2Evaluation);
 
-let winner;
-let isTie = false;
-if (player1Evaluation.rank > player2Evaluation.rank) {
-  winner = player1;
-  game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
-  game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
-} else if (player2Evaluation.rank > player1Evaluation.rank) {
-  winner = player2;
-  game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
-  game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
-} else {
-  let tieBreaker = false;
-  for (let i = 0; i < player1Evaluation.highCards.length; i++) {
-    if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
-      winner = player1;
-      game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
-      game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
-      tieBreaker = true;
-      break;
-    } else if (player2Evaluation.highCards[i] > player1Evaluation.highCards[i]) {
-      winner = player2;
-      game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
-      game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
-      tieBreaker = true;
-      break;
+  let winner;
+  let isTie = false;
+  if (player1Evaluation.rank > player2Evaluation.rank) {
+    winner = player1;
+    game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+    game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description}!`;
+  } else if (player2Evaluation.rank > player1Evaluation.rank) {
+    winner = player2;
+    game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+    game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description}!`;
+  } else {
+    let tieBreaker = false;
+    for (let i = 0; i < player1Evaluation.highCards.length; i++) {
+      if (player1Evaluation.highCards[i] > player2Evaluation.highCards[i]) {
+        winner = player1;
+        game.message = `Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+        game.dealerMessage = `The dealer declares: Player 1 (${player1.address.slice(0, 8)}...) wins with a ${player1Evaluation.description} (higher cards: ${player1Evaluation.highCards.join(', ')})!`;
+        tieBreaker = true;
+        break;
+      } else if (player2Evaluation.highCards[i] > player1Evaluation.highCards[i]) {
+        winner = player2;
+        game.message = `Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+        game.dealerMessage = `The dealer declares: Player 2 (${player2.address.slice(0, 8)}...) wins with a ${player2Evaluation.description} (higher cards: ${player2Evaluation.highCards.join(', ')})!`;
+        tieBreaker = true;
+        break;
+      }
+    }
+    if (!tieBreaker) {
+      isTie = true;
+      game.message = "It's a tie! The pot is split.";
+      game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
     }
   }
-  if (!tieBreaker) {
-    isTie = true;
-    game.message = "It's a tie! The pot is split.";
-    game.dealerMessage = "The dealer declares: It's a tie! The pot is split.";
+
+  game.status = 'finished';
+  game.opponentCardsVisible = true;
+  io.to(gameId).emit('gameState', removeCircularReferences(game));
+
+  console.log(`DEBUG - Distributing winnings for game ${gameId}:`, { pot: game.pot, isTie });
+
+  // Validazione di game.pot
+  if (!game.pot || isNaN(game.pot) || game.pot <= 0) {
+    console.error(`DEBUG - Invalid pot value for game ${gameId}:`, game.pot);
+    game.message = 'Error distributing winnings: Invalid pot value. Refunding bets...';
+    io.to(gameId).emit('gameState', removeCircularReferences(game));
+    await refundBetsForGame(gameId);
+    return;
   }
-}
 
-game.status = 'finished';
-game.opponentCardsVisible = true;
-io.to(gameId).emit('gameState', removeCircularReferences(game));
+  if (isTie) {
+    const splitAmount = game.pot / 2;
+    console.log(`DEBUG - Splitting pot: ${game.pot} COM into ${splitAmount} COM for each player`);
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount, isRefund: false });
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount, isRefund: false });
+    await updateLeaderboard(player1.address, splitAmount);
+    await updateLeaderboard(player2.address, splitAmount);
+  } else {
+    console.log(`DEBUG - Distributing full pot: ${game.pot} COM to winner ${winner.address}`);
+    io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot, isRefund: false });
+    await updateLeaderboard(winner.address, game.pot);
+  }
 
-console.log(`DEBUG - Distributing winnings for game ${gameId}:`, { pot: game.pot, isTie });
+  try {
+    await Game.updateOne({ gameId }, { status: 'finished' });
+    await Game.deleteOne({ gameId });
+    console.log(`DEBUG - Deleted game ${gameId} from database`);
+  } catch (err) {
+    console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
+  }
 
-if (isTie) {
-  const splitAmount = game.pot / 2;
-  console.log(`DEBUG - Splitting pot: ${game.pot} COM into ${splitAmount} COM for each player`);
-  io.to(gameId).emit('distributeWinnings', { winnerAddress: player1.address, amount: splitAmount, isRefund: false });
-  io.to(gameId).emit('distributeWinnings', { winnerAddress: player2.address, amount: splitAmount, isRefund: false });
-  await updateLeaderboard(player1.address, splitAmount);
-  await updateLeaderboard(player2.address, splitAmount);
-} else {
-  console.log(`DEBUG - Distributing full pot: ${game.pot} COM to winner ${winner.address}`);
-  io.to(gameId).emit('distributeWinnings', { winnerAddress: winner.address, amount: game.pot, isRefund: false });
-  await updateLeaderboard(winner.address, game.pot);
-}
-
-try {
-  await Game.updateOne({ gameId }, { status: 'finished' });
-  await Game.deleteOne({ gameId });
-  console.log(`DEBUG - Deleted game ${gameId} from database`);
-} catch (err) {
-  console.error(`DEBUG - Error updating/deleting game ${gameId}:`, err.message, err.stack);
-}
-
-delete games[gameId];
+  delete games[gameId];
 };
 
 const updateLeaderboard = async (playerAddress, winnings) => {
