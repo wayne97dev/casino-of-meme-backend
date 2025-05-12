@@ -1160,6 +1160,25 @@ app.post('/refund', async (req, res) => {
     return res.status(500).json({ success: false, error: 'Failed to connect to Solana RPC: ' + err.message });
   }
 
+  try {
+    console.log('DEBUG - Checking casino SOL balance...');
+    const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true);
+    const minSolBalance = 0.01 * LAMPORTS_PER_SOL; // 0.01 SOL per coprire le fee
+    if (casinoSolBalance * LAMPORTS_PER_SOL < minSolBalance) {
+      console.log('DEBUG - Insufficient SOL balance:', {
+        balance: casinoSolBalance,
+        required: minSolBalance / LAMPORTS_PER_SOL,
+      });
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
+      });
+    }
+  } catch (err) {
+    console.error('DEBUG - Error checking casino SOL balance:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check casino SOL balance: ' + err.message });
+  }
+
   let casinoATA, playerATA;
   try {
     console.log('DEBUG - Getting casino ATA...');
@@ -1197,7 +1216,7 @@ app.post('/refund', async (req, res) => {
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
+      await connection.confirmTransaction(signature, 'confirmed');
       console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
   } catch (err) {
@@ -1207,7 +1226,7 @@ app.post('/refund', async (req, res) => {
 
   try {
     console.log('DEBUG - Checking casino COM balance...');
-    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com', true); // Forza refresh
+    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com', true);
     if (casinoBalance < amount) {
       console.log('DEBUG - Insufficient COM balance in casino ATA:', { balance: casinoBalance, required: amount });
       return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
@@ -1240,7 +1259,7 @@ app.post('/refund', async (req, res) => {
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
       const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
+      await connection.confirmTransaction(signature, 'confirmed');
       console.log('DEBUG - Created player ATA:', playerATA.toBase58());
     }
   } catch (err) {
@@ -1249,22 +1268,21 @@ app.post('/refund', async (req, res) => {
   }
 
   try {
-    // Recupera i decimali del mint
     const mintInfo = await getMint(connection, MINT_ADDRESS, 'confirmed', TOKEN_2022_PROGRAM_ID);
-    const decimals = mintInfo.decimals; // Dovrebbe essere 6
+    const decimals = mintInfo.decimals;
     console.log('DEBUG - Mint decimals:', decimals);
 
     console.log('DEBUG - Creating refund transaction...');
     const transaction = new Transaction().add(
       createTransferCheckedInstruction(
-        casinoATA, // Source ATA
-        MINT_ADDRESS, // Mint
-        playerATA, // Destination ATA
-        wallet.publicKey, // Owner
-        Math.round(amount * Math.pow(10, decimals)), // Importo in unità base (con decimali)
-        decimals, // Decimali del token
-        [], // Memo (opzionale)
-        TOKEN_2022_PROGRAM_ID // Programma
+        casinoATA,
+        MINT_ADDRESS,
+        playerATA,
+        wallet.publicKey,
+        Math.round(amount * Math.pow(10, decimals)),
+        decimals,
+        [],
+        TOKEN_2022_PROGRAM_ID
       )
     );
 
