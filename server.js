@@ -1901,43 +1901,11 @@ app.post('/make-poker-move', async (req, res) => {
     return res.status(500).json({ success: false, error: 'Failed to check/create casino ATA: ' + err.message });
   }
 
-  try {
-    console.log('DEBUG - Checking player ATA...');
-    let playerAccountExists = false;
-    try {
-      await getAccount(connection, userATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
-      playerAccountExists = true;
-      console.log('DEBUG - Player ATA exists:', userATA.toBase58());
-    } catch (err) {
-      console.log('DEBUG - Player ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          userATA,
-          userPublicKey,
-          MINT_ADDRESS,
-          TOKEN_2022_PROGRAM_ID
-        )
-      );
-      const { blockhash } = await getCachedBlockhash(connection);
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
-      await connection.confirmTransaction(signature);
-      console.log('DEBUG - Created player ATA:', userATA.toBase58());
-    }
-  } catch (err) {
-    console.error('DEBUG - Error checking/creating player ATA:', err.message, err.stack);
-    return res.status(500).json({ success: false, error: 'Failed to check/create player ATA: ' + err.message });
-  }
-
   if (amount > 0) {
     let userBalance;
     try {
       console.log('DEBUG - Checking user COM balance for move:', move);
-      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true); // Forza refresh
-      console.log('DEBUG - User balance:', userBalance, 'Required:', amount);
+      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true);
       if (userBalance < amount) {
         console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
@@ -1976,7 +1944,7 @@ app.post('/make-poker-move', async (req, res) => {
       console.log('DEBUG - Transaction sent, signature:', signature);
     } catch (err) {
       console.error('DEBUG - Error sending transaction:', err.message, err.stack);
-      return res.status(500).json({ success: false, error: 'Failed to send transaction: ' + err.message });
+      return res.status(500).json({ success: false, error: `Failed to send transaction: ${err.message}` });
     }
 
     try {
@@ -1989,7 +1957,7 @@ app.post('/make-poker-move', async (req, res) => {
       console.log(`DEBUG - Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
     } catch (err) {
       console.error('DEBUG - Error confirming transaction:', err.message, err.stack);
-      return res.status(500).json({ success: false, error: 'Failed to confirm transaction: ' + err.message });
+      return res.status(500).json({ success: false, error: `Failed to confirm transaction: ${err.message}` });
     }
   }
 
