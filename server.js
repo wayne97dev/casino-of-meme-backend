@@ -1163,7 +1163,7 @@ app.post('/refund', async (req, res) => {
   try {
     console.log('DEBUG - Checking casino SOL balance...');
     const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol', true);
-    const minSolBalance = 0.01 * LAMPORTS_PER_SOL; // 0.01 SOL per coprire le fee
+    const minSolBalance = 0.01 * LAMPORTS_PER_SOL;
     if (casinoSolBalance * LAMPORTS_PER_SOL < minSolBalance) {
       console.log('DEBUG - Insufficient SOL balance:', {
         balance: casinoSolBalance,
@@ -1268,23 +1268,57 @@ app.post('/refund', async (req, res) => {
   }
 
   try {
+    // Recupera le informazioni del mint
     const mintInfo = await getMint(connection, MINT_ADDRESS, 'confirmed', TOKEN_2022_PROGRAM_ID);
     const decimals = mintInfo.decimals;
     console.log('DEBUG - Mint decimals:', decimals);
 
+    // Recupera la configurazione delle transfer fee
+    const accountInfo = await connection.getParsedAccountInfo(MINT_ADDRESS);
+    const extensions = accountInfo.value.data.parsed.info.extensions;
+    const transferFeeConfig = extensions?.find(ext => ext.extension === 'transferFeeConfig');
+
+    let feeAmount = 0;
+    if (transferFeeConfig) {
+      const feeBasisPoints = transferFeeConfig.state.transferFeeBasisPoints;
+      const maxFee = Number(transferFeeConfig.state.maximumFee);
+      const amountInBaseUnits = Math.round(amount * Math.pow(10, decimals));
+      feeAmount = Math.min((amountInBaseUnits * feeBasisPoints) / 10000, maxFee);
+      console.log('DEBUG - Transfer fee calculated:', { feeBasisPoints, maxFee, feeAmount });
+    } else {
+      console.log('DEBUG - No TransferFee extension found, proceeding without fee');
+    }
+
     console.log('DEBUG - Creating refund transaction...');
-    const transaction = new Transaction().add(
-      createTransferCheckedInstruction(
-        casinoATA,
-        MINT_ADDRESS,
-        playerATA,
-        wallet.publicKey,
-        Math.round(amount * Math.pow(10, decimals)),
-        decimals,
-        [],
-        TOKEN_2022_PROGRAM_ID
-      )
-    );
+    const transaction = new Transaction();
+    if (transferFeeConfig) {
+      transaction.add(
+        createTransferCheckedWithFeeInstruction(
+          casinoATA, // Source ATA
+          MINT_ADDRESS, // Mint
+          playerATA, // Destination ATA
+          wallet.publicKey, // Owner
+          Math.round(amount * Math.pow(10, decimals)), // Importo in unità base (con decimali)
+          decimals, // Decimali del token
+          feeAmount, // Importo della tassa
+          [], // Memo (opzionale)
+          TOKEN_2022_PROGRAM_ID // Programma
+        )
+      );
+    } else {
+      transaction.add(
+        createTransferCheckedInstruction(
+          casinoATA,
+          MINT_ADDRESS,
+          playerATA,
+          wallet.publicKey,
+          Math.round(amount * Math.pow(10, decimals)),
+          decimals,
+          [],
+          TOKEN_2022_PROGRAM_ID
+        )
+      );
+    }
 
     console.log('DEBUG - Getting latest blockhash...');
     const { blockhash } = await getCachedBlockhash(connection);
