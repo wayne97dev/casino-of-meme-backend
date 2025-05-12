@@ -284,11 +284,44 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
         balance = balanceInfo.value.uiAmount || 0;
         console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
       } catch (err) {
-        console.error(`DEBUG - Error fetching ATA for ${publicKey.toBase58()}:`, err.message, err.stack);
         if (err.name === 'TokenAccountNotFoundError' || err.name === 'TokenInvalidAccountOwnerError') {
-          console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}`);
-          balance = 0;
+          console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}, creating...`);
+          try {
+            // Crea una transazione per l'ATA
+            const transaction = new Transaction().add(
+              createAssociatedTokenAccountInstruction(
+                wallet.publicKey, // Payer (wallet del casinò)
+                userATA, // Indirizzo dell'ATA
+                publicKey, // Proprietario dell'ATA (utente)
+                MINT_ADDRESS, // Mint del token
+                TOKEN_2022_PROGRAM_ID // Programma Token
+              )
+            );
+
+            // Ottieni l'ultimo blockhash
+            const { blockhash } = await getCachedBlockhash(connection);
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = wallet.publicKey;
+
+            // Firma la transazione con il wallet del casinò
+            transaction.partialSign(wallet);
+
+            // Invia la transazione
+            const signature = await connection.sendRawTransaction(transaction.serialize());
+            console.log(`DEBUG - ATA creation transaction sent: ${signature}`);
+
+            // Conferma la transazione
+            await connection.confirmTransaction(signature, 'confirmed');
+            console.log(`DEBUG - Successfully created ATA for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
+
+            // Imposta il saldo a 0, poiché l'ATA è appena stato creato
+            balance = 0;
+          } catch (createErr) {
+            console.error(`DEBUG - Failed to create ATA for ${publicKey.toBase58()}:`, createErr.message, createErr.stack);
+            balance = 0; // Imposta il saldo a 0 in caso di errore
+          }
         } else {
+          console.error(`DEBUG - Error fetching COM balance for ${publicKey.toBase58()}:`, err.message, err.stack);
           throw err;
         }
       }
