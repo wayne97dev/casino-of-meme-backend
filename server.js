@@ -927,22 +927,7 @@ app.get('/rewards', async (req, res) => {
   }
 });
 
-// Endpoint per il saldo COM
-app.get('/com-balance/:playerAddress', async (req, res) => {
-  console.log('DEBUG - /com-balance called:', req.params);
-  const { playerAddress } = req.params;
-  try {
-    console.log('DEBUG - Validating player address:', playerAddress);
-    const userPublicKey = new PublicKey(playerAddress);
-    const connection = await getConnection();
-    const balance = await getCachedBalance(connection, userPublicKey, 'com');
-    console.log('DEBUG - COM balance fetched:', balance);
-    res.json({ success: true, balance });
-  } catch (err) {
-    console.error('DEBUG - Error fetching COM balance:', err.message, err.stack);
-    res.status(500).json({ success: false, error: 'Failed to fetch COM balance' });
-  }
-});
+
 
 
 app.get('/com-balance/:address', async (req, res) => {
