@@ -1174,6 +1174,7 @@ app.post('/refund', async (req, res) => {
         error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
       });
     }
+    console.log('DEBUG - Casino SOL balance sufficient:', casinoSolBalance);
   } catch (err) {
     console.error('DEBUG - Error checking casino SOL balance:', err.message, err.stack);
     return res.status(500).json({ success: false, error: 'Failed to check casino SOL balance: ' + err.message });
@@ -1231,6 +1232,7 @@ app.post('/refund', async (req, res) => {
       console.log('DEBUG - Insufficient COM balance in casino ATA:', { balance: casinoBalance, required: amount });
       return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
     }
+    console.log('DEBUG - Casino COM balance sufficient:', casinoBalance);
   } catch (err) {
     console.error('DEBUG - Error checking casino COM balance:', err.message, err.stack);
     return res.status(500).json({ success: false, error: 'Failed to check casino balance: ' + err.message });
@@ -1268,13 +1270,14 @@ app.post('/refund', async (req, res) => {
   }
 
   try {
-    // Recupera le informazioni del mint
     const mintInfo = await getMint(connection, MINT_ADDRESS, 'confirmed', TOKEN_2022_PROGRAM_ID);
     const decimals = mintInfo.decimals;
     console.log('DEBUG - Mint decimals:', decimals);
 
-    // Recupera la configurazione delle transfer fee
     const accountInfo = await connection.getParsedAccountInfo(MINT_ADDRESS);
+    if (!accountInfo.value) {
+      throw new Error('Failed to fetch mint account info');
+    }
     const extensions = accountInfo.value.data.parsed.info.extensions;
     const transferFeeConfig = extensions?.find(ext => ext.extension === 'transferFeeConfig');
 
@@ -1294,15 +1297,15 @@ app.post('/refund', async (req, res) => {
     if (transferFeeConfig) {
       transaction.add(
         createTransferCheckedWithFeeInstruction(
-          casinoATA, // Source ATA
-          MINT_ADDRESS, // Mint
-          playerATA, // Destination ATA
-          wallet.publicKey, // Owner
-          Math.round(amount * Math.pow(10, decimals)), // Importo in unità base (con decimali)
-          decimals, // Decimali del token
-          feeAmount, // Importo della tassa
-          [], // Memo (opzionale)
-          TOKEN_2022_PROGRAM_ID // Programma
+          casinoATA,
+          MINT_ADDRESS,
+          playerATA,
+          wallet.publicKey,
+          Math.round(amount * Math.pow(10, decimals)),
+          decimals,
+          feeAmount,
+          [],
+          TOKEN_2022_PROGRAM_ID
         )
       );
     } else {
@@ -1330,9 +1333,9 @@ app.post('/refund', async (req, res) => {
     const signature = await connection.sendRawTransaction(transaction.serialize());
     console.log('DEBUG - Confirming refund transaction:', signature);
     await connection.confirmTransaction(signature, 'confirmed');
-    console.log(`DEBUG - Refunded ${amount} COM to ${playerAddress}`);
+    console.log(`DEBUG - Refunded ${amount} COM to ${playerAddress}, signature: ${signature}`);
 
-    res.json({ success: true });
+    res.json({ success: true, transactionSignature: signature });
   } catch (err) {
     console.error('DEBUG - Error processing refund:', err.message, err.stack);
     return res.status(500).json({ success: false, error: `Failed to process refund: ${err.message}` });
