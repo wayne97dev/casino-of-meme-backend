@@ -124,7 +124,7 @@ connectRedis().catch(err => {
   console.error('DEBUG - Could not connect to Redis:', err.message);
 });
 
-const { PublicKey } = require('@solana/web3.js');
+
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 
 // Connessione a Solana
