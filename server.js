@@ -213,7 +213,8 @@ async function getCachedBlockhash(connection) {
   }
 }
 
-async function getCachedBalance(connection, publicKey, type = 'sol', forceRefresh = false) {
+async function getCachedBalance(connection, publicKey, type = 'sol', forceRefresh = true) {
+  // Forza sempre il refresh per evitare dati obsoleti
   const cacheKey = `balance:${publicKey.toBase58()}:${type}`;
   if (!forceRefresh) {
     try {
