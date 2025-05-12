@@ -234,24 +234,55 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
   try {
     let balance;
     if (type === 'sol') {
-      try {
-        balance = await connection.getBalance(publicKey);
-        balance = balance / LAMPORTS_PER_SOL;
-        console.log(`DEBUG - Successfully fetched SOL balance for ${publicKey.toBase58()}: ${balance}`);
-      } catch (err) {
-        console.error('DEBUG - Primary RPC failed, trying fallback:', err.message);
-        const fallbackConn = await getConnection();
-        balance = await fallbackConn.getBalance(publicKey);
-        balance = balance / LAMPORTS_PER_SOL;
-        console.log(`DEBUG - Successfully fetched SOL balance from fallback for ${publicKey.toBase58()}: ${balance}`);
-      }
+      balance = await connection.getBalance(publicKey) / LAMPORTS_PER_SOL;
+      console.log(`DEBUG - Successfully fetched SOL balance for ${publicKey.toBase58()}: ${balance}`);
     } else if (type === 'com') {
+      console.log(`DEBUG - Verifying mint: ${MINT_ADDRESS.toBase58()}`);
+      try {
+        const { getMint } = require('@solana/spl-token');
+        const mintInfo = await getMint(connection, MINT_ADDRESS);
+        console.log(`DEBUG - Mint verified: decimals=${mintInfo.decimals}, supply=${mintInfo.supply}`);
+        if (mintInfo.decimals !== 6) {
+          throw new Error(`Unexpected mint decimals: expected 6, found ${mintInfo.decimals}`);
+        }
+      } catch (err) {
+        console.error(`DEBUG - Invalid mint address ${MINT_ADDRESS.toBase58()}:`, err.message, err.stack);
+        throw new Error(`Invalid mint address: ${err.message}`);
+      }
+
+      console.log(`DEBUG - Calculating ATA for mint: ${MINT_ADDRESS.toBase58()}, player: ${publicKey.toBase58()}`);
       const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, publicKey);
-      const account = await connection.getTokenAccountBalance(userATA).catch(() => ({
-        value: { uiAmount: 0 },
-      }));
-      balance = account.value.uiAmount || 0;
-      console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
+      console.log(`DEBUG - ATA: ${userATA.toBase58()}`);
+      try {
+        const account = await getAccount(connection, userATA);
+        console.log(`DEBUG - ATA exists for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
+        const balanceInfo = await connection.getTokenAccountBalance(userATA);
+        balance = balanceInfo.value.uiAmount || 0;
+        console.log(`DEBUG - Successfully fetched COM balance for ${publicKey.toBase58()}: ${balance}`);
+      } catch (err) {
+        if (err.name === 'TokenAccountNotFoundError' || err.name === 'TokenInvalidAccountOwnerError') {
+          console.log(`DEBUG - ATA not found for ${publicKey.toBase58()}, attempting to create...`);
+          const transaction = new Transaction().add(
+            createAssociatedTokenAccountInstruction(
+              wallet.publicKey,
+              userATA,
+              publicKey,
+              MINT_ADDRESS
+            )
+          );
+          const { blockhash } = await getCachedBlockhash(connection);
+          transaction.recentBlockhash = blockhash;
+          transaction.feePayer = wallet.publicKey;
+          transaction.partialSign(wallet);
+          const signature = await connection.sendRawTransaction(transaction.serialize());
+          await connection.confirmTransaction(signature, 'confirmed');
+          console.log(`DEBUG - Created ATA for ${publicKey.toBase58()}: ${userATA.toBase58()}`);
+          balance = 0; // Saldo iniziale dopo creazione
+        } else {
+          console.error(`DEBUG - Error fetching COM balance for ${publicKey.toBase58()}:`, err.message, err.stack);
+          throw err;
+        }
+      }
     }
     try {
       await redisClient.setEx(cacheKey, 30, balance.toString());
@@ -261,7 +292,7 @@ async function getCachedBalance(connection, publicKey, type = 'sol', forceRefres
     }
     return balance;
   } catch (err) {
-    console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err.message);
+    console.error(`DEBUG - Error fetching ${type} balance from Solana:`, err.message, err.stack);
     throw err;
   }
 }
@@ -947,12 +978,13 @@ app.get('/com-balance/:playerAddress', async (req, res) => {
     console.log('DEBUG - Validating player address:', playerAddress);
     const userPublicKey = new PublicKey(playerAddress);
     const connection = await getConnection();
-    const balance = await getCachedBalance(connection, userPublicKey, 'com');
+    console.log('DEBUG - Fetching balance for:', userPublicKey.toBase58());
+    const balance = await getCachedBalance(connection, userPublicKey, 'com', true); // Forza refresh
     console.log('DEBUG - COM balance fetched:', balance);
     res.json({ success: true, balance });
   } catch (err) {
     console.error('DEBUG - Error fetching COM balance:', err.message, err.stack);
-    res.status(500).json({ success: false, error: 'Failed to fetch COM balance' });
+    res.status(500).json({ success: false, error: `Failed to fetch COM balance: ${err.message}` });
   }
 });
 
