@@ -978,15 +978,44 @@ app.post('/distribute-winnings', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid winnerAddress or amount' });
   }
 
+  let winnerPublicKey;
   try {
     console.log('DEBUG - Validating winner address:', winnerAddress);
-    const winnerPublicKey = new PublicKey(winnerAddress);
-    console.log('DEBUG - Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
-    console.log('DEBUG - Getting winner ATA...');
-    const winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey);
+    winnerPublicKey = new PublicKey(winnerAddress);
+    console.log('DEBUG - Winner address validated:', winnerPublicKey.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Invalid winner address:', err.message);
+    return res.status(400).json({ success: false, error: 'Invalid winner address: ' + err.message });
+  }
 
-    const connection = await getConnection();
+  let connection;
+  try {
+    console.log('DEBUG - Establishing connection to Solana RPC...');
+    connection = await getConnection();
+    if (!connection) {
+      throw new Error('Failed to establish connection to Solana RPC');
+    }
+    console.log('DEBUG - Connection established successfully');
+  } catch (err) {
+    console.error('DEBUG - Error establishing connection:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to connect to Solana RPC: ' + err.message });
+  }
+
+  let casinoATA, winnerATA;
+  try {
+    console.log('DEBUG - Getting casino ATA...');
+    casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Casino ATA:', casinoATA.toBase58());
+
+    console.log('DEBUG - Getting winner ATA...');
+    winnerATA = await getAssociatedTokenAddress(MINT_ADDRESS, winnerPublicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Winner ATA:', winnerATA.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Error getting ATAs:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to get token accounts: ' + err.message });
+  }
+
+  try {
     console.log('DEBUG - Checking casino SOL balance...');
     const casinoSolBalance = await getCachedBalance(connection, wallet.publicKey, 'sol');
     const minSolBalance = 0.01 * LAMPORTS_PER_SOL;
@@ -1000,38 +1029,14 @@ app.post('/distribute-winnings', async (req, res) => {
         error: `Insufficient SOL balance in casino wallet for transaction fees: ${casinoSolBalance} SOL available, ${minSolBalance / LAMPORTS_PER_SOL} SOL required`,
       });
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking casino SOL balance:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check casino SOL balance: ' + err.message });
+  }
 
-    console.log('DEBUG - Checking casino ATA...');
-    let casinoAccountExists = false;
-    try {
-      const casinoAccountInfo = await getAccount(connection, casinoATA);
-      casinoAccountExists = true;
-      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
-      if (casinoAccountInfo.isFrozen) {
-        console.log('DEBUG - Casino ATA is frozen');
-        return res.status(400).json({ success: false, error: 'Casino ATA is frozen' });
-      }
-    } catch (err) {
-      console.log('DEBUG - Casino ATA does not exist, creating...');
-      const transaction = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          casinoATA,
-          wallet.publicKey,
-          MINT_ADDRESS
-        )
-      );
-      const { blockhash } = await getCachedBlockhash(connection);
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-      transaction.partialSign(wallet);
-      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
-      await connection.confirmTransaction(signature);
-      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
-    }
-
+  try {
     console.log('DEBUG - Checking casino COM balance...');
-    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com');
+    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com', true); // Forza refresh
     if (casinoBalance < amount) {
       console.log('DEBUG - Insufficient COM balance:', {
         balance: casinoBalance,
@@ -1042,17 +1047,18 @@ app.post('/distribute-winnings', async (req, res) => {
         error: `Insufficient COM balance in casino wallet: ${casinoBalance} COM available, ${amount} COM required`,
       });
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking casino COM balance:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check casino COM balance: ' + err.message });
+  }
 
+  try {
     console.log('DEBUG - Checking winner ATA...');
     let winnerAccountExists = false;
     try {
-      const winnerAccountInfo = await getAccount(connection, winnerATA);
+      await getAccount(connection, winnerATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
       winnerAccountExists = true;
       console.log('DEBUG - Winner ATA exists:', winnerATA.toBase58());
-      if (winnerAccountInfo.isFrozen) {
-        console.log('DEBUG - Winner ATA is frozen');
-        return res.status(400).json({ success: false, error: 'Winner ATA is frozen' });
-      }
     } catch (err) {
       console.log('DEBUG - Winner ATA does not exist, creating...');
       const transaction = new Transaction().add(
@@ -1060,35 +1066,40 @@ app.post('/distribute-winnings', async (req, res) => {
           wallet.publicKey,
           winnerATA,
           winnerPublicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = wallet.publicKey;
       transaction.partialSign(wallet);
-      const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()));
+      const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction(signature);
       console.log('DEBUG - Created winner ATA:', winnerATA.toBase58());
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking/creating winner ATA:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check/create winner ATA: ' + err.message });
+  }
 
-    console.log('DEBUG - Verifying mint COM...');
-    const mintData = await getCachedMintInfo(connection, MINT_ADDRESS);
-    if (mintData.decimals !== 6) {
-      console.log('DEBUG - Unexpected mint decimals:', mintData.decimals);
-      return res.status(500).json({
-        success: false,
-        error: `Unexpected mint decimals: expected 6, found ${mintData.decimals}`,
-      });
-    }
+  try {
+    // Recupera i decimali del mint
+    const mintInfo = await getMint(connection, MINT_ADDRESS, 'confirmed', TOKEN_2022_PROGRAM_ID);
+    const decimals = mintInfo.decimals; // Dovrebbe essere 6
+    console.log('DEBUG - Mint decimals:', decimals);
 
     console.log('DEBUG - Creating transfer transaction...');
     const transaction = new Transaction().add(
-      createTransferInstruction(
-        casinoATA,
-        winnerATA,
-        wallet.publicKey,
-        Math.round(amount * 1e6)
+      createTransferCheckedInstruction(
+        casinoATA, // Source ATA
+        MINT_ADDRESS, // Mint
+        winnerATA, // Destination ATA
+        wallet.publicKey, // Owner
+        Math.round(amount * Math.pow(10, decimals)), // Importo in unità base (con decimali)
+        decimals, // Decimali del token
+        [], // Memo (opzionale)
+        TOKEN_2022_PROGRAM_ID // Programma
       )
     );
 
@@ -1099,10 +1110,10 @@ app.post('/distribute-winnings', async (req, res) => {
     transaction.partialSign(wallet);
 
     console.log('DEBUG - Sending transaction...');
-    const signature = await retry(() => connection.sendRawTransaction(transaction.serialize()), 3, 1000);
+    const signature = await connection.sendRawTransaction(transaction.serialize());
     console.log('DEBUG - Confirming transaction...');
     await connection.confirmTransaction(signature, 'confirmed');
-    console.log(`DEBUG - Sent ${amount} COM to the Winner ${winnerAddress}, signature: ${signature}`);
+    console.log(`DEBUG - Sent ${amount} COM to ${winnerAddress}, signature: ${signature}`);
 
     res.json({ success: true, transactionSignature: signature });
   } catch (err) {
@@ -1126,19 +1137,48 @@ app.post('/refund', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid playerAddress or amount' });
   }
 
+  let userPublicKey;
   try {
     console.log('DEBUG - Validating player address:', playerAddress);
-    const userPublicKey = new PublicKey(playerAddress);
-    console.log('DEBUG - Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
-    console.log('DEBUG - Getting player ATA...');
-    const playerATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
+    userPublicKey = new PublicKey(playerAddress);
+    console.log('DEBUG - Player address validated:', userPublicKey.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Invalid player address:', err.message);
+    return res.status(400).json({ success: false, error: 'Invalid player address: ' + err.message });
+  }
 
-    const connection = await getConnection();
+  let connection;
+  try {
+    console.log('DEBUG - Establishing connection to Solana RPC...');
+    connection = await getConnection();
+    if (!connection) {
+      throw new Error('Failed to establish connection to Solana RPC');
+    }
+    console.log('DEBUG - Connection established successfully');
+  } catch (err) {
+    console.error('DEBUG - Error establishing connection:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to connect to Solana RPC: ' + err.message });
+  }
+
+  let casinoATA, playerATA;
+  try {
+    console.log('DEBUG - Getting casino ATA...');
+    casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Casino ATA:', casinoATA.toBase58());
+
+    console.log('DEBUG - Getting player ATA...');
+    playerATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Player ATA:', playerATA.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Error getting ATAs:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to get token accounts: ' + err.message });
+  }
+
+  try {
     console.log('DEBUG - Checking casino ATA...');
     let casinoAccountExists = false;
     try {
-      await getAccount(connection, casinoATA);
+      await getAccount(connection, casinoATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
       casinoAccountExists = true;
       console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
@@ -1148,7 +1188,8 @@ app.post('/refund', async (req, res) => {
           wallet.publicKey,
           casinoATA,
           wallet.publicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1159,18 +1200,28 @@ app.post('/refund', async (req, res) => {
       await connection.confirmTransaction(signature);
       console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking/creating casino ATA:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check/create casino ATA: ' + err.message });
+  }
 
+  try {
     console.log('DEBUG - Checking casino COM balance...');
-    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com');
+    const casinoBalance = await getCachedBalance(connection, wallet.publicKey, 'com', true); // Forza refresh
     if (casinoBalance < amount) {
       console.log('DEBUG - Insufficient COM balance in casino ATA:', { balance: casinoBalance, required: amount });
       return res.status(400).json({ success: false, error: 'Insufficient COM balance in casino wallet' });
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking casino COM balance:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check casino balance: ' + err.message });
+  }
 
+  try {
     console.log('DEBUG - Checking player ATA...');
     let playerAccountExists = false;
     try {
-      await getAccount(connection, playerATA);
+      await getAccount(connection, playerATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
       playerAccountExists = true;
       console.log('DEBUG - Player ATA exists:', playerATA.toBase58());
     } catch (err) {
@@ -1180,7 +1231,8 @@ app.post('/refund', async (req, res) => {
           wallet.publicKey,
           playerATA,
           userPublicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1191,14 +1243,28 @@ app.post('/refund', async (req, res) => {
       await connection.confirmTransaction(signature);
       console.log('DEBUG - Created player ATA:', playerATA.toBase58());
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking/creating player ATA:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check/create player ATA: ' + err.message });
+  }
+
+  try {
+    // Recupera i decimali del mint
+    const mintInfo = await getMint(connection, MINT_ADDRESS, 'confirmed', TOKEN_2022_PROGRAM_ID);
+    const decimals = mintInfo.decimals; // Dovrebbe essere 6
+    console.log('DEBUG - Mint decimals:', decimals);
 
     console.log('DEBUG - Creating refund transaction...');
     const transaction = new Transaction().add(
-      createTransferInstruction(
-        casinoATA,
-        playerATA,
-        wallet.publicKey,
-        amount * 1e6
+      createTransferCheckedInstruction(
+        casinoATA, // Source ATA
+        MINT_ADDRESS, // Mint
+        playerATA, // Destination ATA
+        wallet.publicKey, // Owner
+        Math.round(amount * Math.pow(10, decimals)), // Importo in unità base (con decimali)
+        decimals, // Decimali del token
+        [], // Memo (opzionale)
+        TOKEN_2022_PROGRAM_ID // Programma
       )
     );
 
@@ -1211,7 +1277,7 @@ app.post('/refund', async (req, res) => {
     console.log('DEBUG - Sending refund transaction...');
     const signature = await connection.sendRawTransaction(transaction.serialize());
     console.log('DEBUG - Confirming refund transaction:', signature);
-    await connection.confirmTransaction(signature);
+    await connection.confirmTransaction(signature, 'confirmed');
     console.log(`DEBUG - Refunded ${amount} COM to ${playerAddress}`);
 
     res.json({ success: true });
@@ -1664,19 +1730,48 @@ app.post('/make-poker-move', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Missing signed transaction' });
   }
 
+  let userPublicKey;
   try {
     console.log('DEBUG - Validating player address:', playerAddress);
-    const userPublicKey = new PublicKey(playerAddress);
-    console.log('DEBUG - Getting user ATA...');
-    const userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey);
-    console.log('DEBUG - Getting casino ATA...');
-    const casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey);
+    userPublicKey = new PublicKey(playerAddress);
+    console.log('DEBUG - Player address validated:', userPublicKey.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Invalid player address:', err.message);
+    return res.status(400).json({ success: false, error: 'Invalid player address: ' + err.message });
+  }
 
-    const connection = await getConnection();
+  let connection;
+  try {
+    console.log('DEBUG - Establishing connection to Solana RPC...');
+    connection = await getConnection();
+    if (!connection) {
+      throw new Error('Failed to establish connection to Solana RPC');
+    }
+    console.log('DEBUG - Connection established successfully');
+  } catch (err) {
+    console.error('DEBUG - Error establishing connection:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to connect to Solana RPC: ' + err.message });
+  }
+
+  let userATA, casinoATA;
+  try {
+    console.log('DEBUG - Getting user ATA...');
+    userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - User ATA:', userATA.toBase58());
+
+    console.log('DEBUG - Getting casino ATA...');
+    casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Casino ATA:', casinoATA.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Error getting ATAs:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to get token accounts: ' + err.message });
+  }
+
+  try {
     console.log('DEBUG - Checking casino ATA...');
     let casinoAccountExists = false;
     try {
-      await getAccount(connection, casinoATA);
+      await getAccount(connection, casinoATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
       casinoAccountExists = true;
       console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
     } catch (err) {
@@ -1686,7 +1781,8 @@ app.post('/make-poker-move', async (req, res) => {
           wallet.publicKey,
           casinoATA,
           wallet.publicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1697,11 +1793,16 @@ app.post('/make-poker-move', async (req, res) => {
       await connection.confirmTransaction(signature);
       console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking/creating casino ATA:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check/create casino ATA: ' + err.message });
+  }
 
+  try {
     console.log('DEBUG - Checking player ATA...');
     let playerAccountExists = false;
     try {
-      await getAccount(connection, userATA);
+      await getAccount(connection, userATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
       playerAccountExists = true;
       console.log('DEBUG - Player ATA exists:', userATA.toBase58());
     } catch (err) {
@@ -1711,7 +1812,8 @@ app.post('/make-poker-move', async (req, res) => {
           wallet.publicKey,
           userATA,
           userPublicKey,
-          MINT_ADDRESS
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
         )
       );
       const { blockhash } = await getCachedBlockhash(connection);
@@ -1722,41 +1824,73 @@ app.post('/make-poker-move', async (req, res) => {
       await connection.confirmTransaction(signature);
       console.log('DEBUG - Created player ATA:', userATA.toBase58());
     }
+  } catch (err) {
+    console.error('DEBUG - Error checking/creating player ATA:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check/create player ATA: ' + err.message });
+  }
 
-    if (amount > 0) {
+  if (amount > 0) {
+    let userBalance;
+    try {
       console.log('DEBUG - Checking user COM balance for move:', move);
-      const userBalance = await getCachedBalance(connection, userPublicKey, 'com');
+      userBalance = await getCachedBalance(connection, userPublicKey, 'com', true); // Forza refresh
       console.log('DEBUG - User balance:', userBalance, 'Required:', amount);
       if (userBalance < amount) {
         console.log(`DEBUG - Insufficient COM balance for ${playerAddress}: ${userBalance} < ${amount}`);
         return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
       }
+    } catch (err) {
+      console.error('DEBUG - Error checking user COM balance:', err.message, err.stack);
+      return res.status(500).json({ success: false, error: 'Failed to check user balance: ' + err.message });
+    }
 
+    let transaction;
+    try {
       console.log('DEBUG - Processing signed transaction for move:', move);
       const transactionBuffer = Buffer.from(signedTransaction, 'base64');
-      const transaction = Transaction.from(transactionBuffer);
+      transaction = Transaction.from(transactionBuffer);
+      console.log('DEBUG - Transaction deserialized successfully');
+    } catch (err) {
+      console.error('DEBUG - Error deserializing transaction:', err.message, err.stack);
+      return res.status(400).json({ success: false, error: 'Failed to deserialize transaction: ' + err.message });
+    }
 
+    try {
       if (!transaction.verifySignatures()) {
         console.log('DEBUG - Invalid transaction signatures for:', playerAddress);
         return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
       }
+      console.log('DEBUG - Transaction signatures verified');
+    } catch (err) {
+      console.error('DEBUG - Error verifying transaction signatures:', err.message, err.stack);
+      return res.status(400).json({ success: false, error: 'Failed to verify transaction signatures: ' + err.message });
+    }
 
+    let signature;
+    try {
       console.log('DEBUG - Sending transaction for move:', move);
-      const signature = await connection.sendRawTransaction(transaction.serialize());
+      signature = await connection.sendRawTransaction(transaction.serialize());
+      console.log('DEBUG - Transaction sent, signature:', signature);
+    } catch (err) {
+      console.error('DEBUG - Error sending transaction:', err.message, err.stack);
+      return res.status(500).json({ success: false, error: 'Failed to send transaction: ' + err.message });
+    }
+
+    try {
       console.log('DEBUG - Confirming transaction:', signature);
       const confirmation = await connection.confirmTransaction(signature, 'confirmed');
       if (confirmation.value.err) {
         console.log('DEBUG - Transaction failed:', confirmation.value.err);
-        return res.status(500).json({ success: false, error: 'Transaction failed' });
+        return res.status(500).json({ success: false, error: 'Transaction failed: ' + confirmation.value.err });
       }
       console.log(`DEBUG - Transferred ${amount} COM from ${playerAddress} to casino for move ${move}`);
+    } catch (err) {
+      console.error('DEBUG - Error confirming transaction:', err.message, err.stack);
+      return res.status(500).json({ success: false, error: 'Failed to confirm transaction: ' + err.message });
     }
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('DEBUG - Error in make-poker-move:', err.message, err.stack);
-    res.status(500).json({ success: false, error: `Failed to process move: ${err.message}` });
   }
+
+  res.json({ success: true });
 });
 
 // Endpoint per la leaderboard
