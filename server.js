@@ -1674,56 +1674,173 @@ app.post('/distribute-winnings-sol', async (req, res) => {
 });
 
 // Endpoint per unirsi a una partita di Poker PvP
-socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
-  console.log(`DEBUG - joinGame called for player ${playerAddress} with bet ${betAmount} COM, socket.id: ${socket.id}`);
+app.post('/join-poker-game', async (req, res) => {
+  console.log('DEBUG - /join-poker-game called:', req.body);
+  const { playerAddress, betAmount, signedTransaction } = req.body;
 
-  if (!playerAddress || !betAmount || isNaN(betAmount)) {
-    const errorMsg = 'Invalid playerAddress or betAmount';
-    console.log(`DEBUG - Join rejected: ${errorMsg}`);
-    socket.emit('error', { message: errorMsg });
-    if (callback) callback({ success: false, error: errorMsg });
-    return;
+  if (!playerAddress || !betAmount || isNaN(betAmount) || betAmount <= 0 || !signedTransaction) {
+    console.log('DEBUG - Invalid parameters:', { playerAddress, betAmount, signedTransaction });
+    return res.status(400).json({ success: false, error: 'Invalid playerAddress, betAmount, or signedTransaction' });
+  }
+
+  let userPublicKey;
+  try {
+    console.log('DEBUG - Validating player address:', playerAddress);
+    userPublicKey = new PublicKey(playerAddress);
+    console.log('DEBUG - Player address validated:', userPublicKey.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Invalid player address:', err.message);
+    return res.status(400).json({ success: false, error: 'Invalid player address: ' + err.message });
   }
 
   const minBet = MIN_BET;
   if (betAmount < minBet) {
     const errorMsg = `Bet must be at least ${minBet.toFixed(2)} COM`;
-    socket.emit('error', { message: errorMsg });
     console.log(`DEBUG - Bet ${betAmount} COM rejected: below minimum ${minBet} COM`);
-    if (callback) callback({ success: false, error: errorMsg });
-    return;
+    return res.status(400).json({ success: false, error: errorMsg });
   }
-  if (betAmount <= 0) {
-    const errorMsg = 'Bet amount must be positive';
-    socket.emit('error', { message: errorMsg });
-    console.log(`DEBUG - Bet ${betAmount} COM rejected: non-positive`);
-    if (callback) callback({ success: false, error: errorMsg });
-    return;
+
+  let connection;
+  try {
+    console.log('DEBUG - Establishing connection to Solana RPC...');
+    connection = await getConnection();
+    if (!connection) {
+      throw new Error('Failed to establish connection to Solana RPC');
+    }
+    console.log('DEBUG - Connection established successfully');
+  } catch (err) {
+    console.error('DEBUG - Error establishing connection:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to connect to Solana RPC: ' + err.message });
+  }
+
+  let userATA, casinoATA;
+  try {
+    console.log('DEBUG - Getting user ATA...');
+    userATA = await getAssociatedTokenAddress(MINT_ADDRESS, userPublicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - User ATA:', userATA.toBase58());
+
+    console.log('DEBUG - Getting casino ATA...');
+    casinoATA = await getAssociatedTokenAddress(MINT_ADDRESS, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
+    console.log('DEBUG - Casino ATA:', casinoATA.toBase58());
+  } catch (err) {
+    console.error('DEBUG - Error getting ATAs:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to get token accounts: ' + err.message });
+  }
+
+  try {
+    console.log('DEBUG - Checking casino ATA...');
+    let casinoAccountExists = false;
+    try {
+      await getAccount(connection, casinoATA, 'confirmed', TOKEN_2022_PROGRAM_ID);
+      casinoAccountExists = true;
+      console.log('DEBUG - Casino ATA exists:', casinoATA.toBase58());
+    } catch (err) {
+      console.log('DEBUG - Casino ATA does not exist, creating...');
+      const transaction = new Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          casinoATA,
+          wallet.publicKey,
+          MINT_ADDRESS,
+          TOKEN_2022_PROGRAM_ID
+        )
+      );
+      const { blockhash } = await getCachedBlockhash(connection);
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+      transaction.partialSign(wallet);
+      const signature = await connection.sendRawTransaction(transaction.serialize());
+      await connection.confirmTransaction(signature, 'confirmed');
+      console.log('DEBUG - Created casino ATA:', casinoATA.toBase58());
+    }
+  } catch (err) {
+    console.error('DEBUG - Error checking/creating casino ATA:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check/create casino ATA: ' + err.message });
+  }
+
+  try {
+    console.log('DEBUG - Checking user COM balance...');
+    const userBalance = await getCachedBalance(connection, userPublicKey, 'com', true);
+    if (userBalance < betAmount) {
+      console.log('DEBUG - Insufficient COM balance:', { balance: userBalance, required: betAmount });
+      return res.status(400).json({ success: false, error: 'Insufficient COM balance' });
+    }
+  } catch (err) {
+    console.error('DEBUG - Error checking user COM balance:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to check user balance: ' + err.message });
+  }
+
+  let transaction;
+  try {
+    console.log('DEBUG - Processing signed transaction...');
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    transaction = Transaction.from(transactionBuffer);
+    console.log('DEBUG - Transaction deserialized successfully');
+  } catch (err) {
+    console.error('DEBUG - Error deserializing transaction:', err.message, err.stack);
+    return res.status(400).json({ success: false, error: 'Failed to deserialize transaction: ' + err.message });
+  }
+
+  try {
+    if (!transaction.verifySignatures()) {
+      console.log('DEBUG - Invalid transaction signatures');
+      return res.status(400).json({ success: false, error: 'Invalid transaction signatures' });
+    }
+    console.log('DEBUG - Transaction signatures verified');
+  } catch (err) {
+    console.error('DEBUG - Error verifying transaction signatures:', err.message, err.stack);
+    return res.status(400).json({ success: false, error: 'Failed to verify transaction signatures: ' + err.message });
+  }
+
+  let signature;
+  try {
+    console.log('DEBUG - Sending transaction...');
+    signature = await connection.sendRawTransaction(transaction.serialize());
+    console.log('DEBUG - Transaction sent, signature:', signature);
+  } catch (err) {
+    console.error('DEBUG - Error sending transaction:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to send transaction: ' + err.message });
+  }
+
+  try {
+    console.log('DEBUG - Confirming transaction:', signature);
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log('DEBUG - Transaction failed:', confirmation.value.err);
+      return res.status(500).json({ success: false, error: 'Transaction failed: ' + JSON.stringify(confirmation.value.err) });
+    }
+    console.log(`DEBUG - Transferred ${betAmount} COM from ${playerAddress} to casino`);
+  } catch (err) {
+    console.error('DEBUG - Error confirming transaction:', err.message, err.stack);
+    return res.status(500).json({ success: false, error: 'Failed to confirm transaction: ' + err.message });
+  }
+
+  // Aggiungi il giocatore alla lista d'attesa
+  const socketId = [...io.sockets.sockets.entries()].find(([_, s]) => s.handshake.auth.playerAddress === playerAddress)?.[0];
+  if (!socketId) {
+    console.error(`DEBUG - No socket found for player ${playerAddress}`);
+    return res.status(400).json({ success: false, error: 'No active WebSocket connection found' });
   }
 
   const existingPlayerIndex = waitingPlayers.findIndex(p => p.address === playerAddress);
   if (existingPlayerIndex !== -1) {
-    waitingPlayers[existingPlayerIndex].id = socket.id;
+    waitingPlayers[existingPlayerIndex].id = socketId;
     waitingPlayers[existingPlayerIndex].bet = betAmount;
-    console.log(`DEBUG - Updated player ${playerAddress} in waiting list: socket.id=${socket.id}, bet=${betAmount}`);
+    console.log(`DEBUG - Updated player ${playerAddress} in waiting list: socket.id=${socketId}, bet=${betAmount}`);
   } else {
-    waitingPlayers.push({ id: socket.id, address: playerAddress, bet: betAmount });
+    waitingPlayers.push({ id: socketId, address: playerAddress, bet: betAmount });
     console.log(`DEBUG - Added player ${playerAddress} to waiting list with bet ${betAmount} COM`);
   }
 
   console.log('DEBUG - Current waitingPlayers:', waitingPlayers.map(p => ({ address: p.address, bet: p.bet, socketId: p.id })));
 
-  socket.emit('waiting', {
+  io.to(socketId).emit('waiting', {
     message: 'You have joined the game! Waiting for another player...',
     players: waitingPlayers,
   });
   io.emit('waitingPlayers', {
     players: waitingPlayers.map(p => ({ address: p.address, bet: p.bet })),
   });
-
-  if (callback) {
-    callback({ success: true, message: 'Joined waiting list successfully' });
-  }
 
   if (waitingPlayers.length >= 2) {
     console.log(`DEBUG - Enough players (${waitingPlayers.length}), starting game...`);
@@ -1768,10 +1885,9 @@ socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
       console.log(`DEBUG - Saved game ${gameId} to database`);
     } catch (err) {
       console.error(`DEBUG - Error saving game ${gameId}:`, err.message, err.stack);
-      socket.emit('error', { message: 'Error starting game' });
+      io.to(socketId).emit('error', { message: 'Error starting game' });
       await refundBetsForGame(gameId);
-      if (callback) callback({ success: false, error: 'Error starting game' });
-      return;
+      return res.status(500).json({ success: false, error: 'Error starting game' });
     }
 
     players.forEach(player => {
@@ -1792,7 +1908,10 @@ socket.on('joinGame', async ({ playerAddress, betAmount }, callback) => {
 
     startGame(gameId);
   }
+
+  res.json({ success: true, message: 'Joined waiting list successfully' });
 });
+
 
 // Endpoint per gestire le mosse in Poker PvP
 app.post('/make-poker-move', async (req, res) => {
